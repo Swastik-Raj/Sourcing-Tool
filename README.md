@@ -83,11 +83,12 @@ Every run produces three things:
    product: full candidate details, rubric breakdown, and token/cost accounting. Good for
    a quick read or sharing a summary.
 3. **Excel report** (`sourcing_results_<timestamp>.xlsx`, or `--output` path) - sheet
-   `Results`: one row per product (SKU, Product, Keyword, L-Com Price, Recommendation) plus
-   a `Manufacturer 1/2/3` block each (Name, Accuracy, Listed Price, Unit Price, Unit Price
-   Confidence, vs. L-Com Price, MOQ, URL, Email, Match Tier, Comment). Sheet `Comparison`:
-   candidates stacked against the L-Com benchmark per product. The recommended candidate is
-   filled green in both sheets; nothing is green when no candidate qualifies. Match Tier is
+   `Results`: one row per product (SKU, Product, Keyword, L-Com Unit Price, Recommendation),
+   then **Recommended Manufacturer / Email / URL / Unit Price** (filled green - who to buy
+   from; blank and uncoloured when no candidate qualifies), then a `Manufacturer 1/2/3`
+   block each (Name, Accuracy, Listed Price, Unit Price, Unit Price Confidence, vs. L-Com
+   Price, MOQ, URL, Email, Match Tier, Comment). Sheet `Comparison`: candidates stacked
+   against the L-Com benchmark per product, recommended row in green. Match Tier is
    derived from match_percent: **>=90 Auto-accepted, 80-89 Flagged for manual review, <80 Rejected.**
 
 ### Unit price, L-Com comparison & recommendation
@@ -96,10 +97,15 @@ Every run produces three things:
   (`stated` / `inferred` / `ambiguous`). The code computes `unit_price = price_total /
   quantity_covered`. Ambiguous or non-USD prices get no unit price. They show as
   UNDETERMINED and are listed at the top of the Markdown report. The tool never guesses.
-- `vs. L-Com` compares `unit_price` with the input's `Lcom sale Price` column.
+- `vs. L-Com` compares `unit_price` with the input's `Lcom sale Price` column, divided by
+  the pack size when the description says `Package/N` (L-Com prices those per pack).
+- A unit price more than 10x cheaper than the next-cheapest candidate for the same product
+  (`IMPLAUSIBLE_PRICE_RATIO`) is treated as an extraction error. It is marked IMPLAUSIBLE,
+  excluded from the L-Com comparison and never recommended.
 - A candidate is recommended only with >= 80% accuracy (`MIN_RECOMMEND_ACCURACY`) and a
-  confirmed unit price >= 30% below L-Com (`MIN_MARGIN_PCT`). Among those, the highest
-  accuracy x margin wins. Otherwise the report says not to source from any of them.
+  confirmed unit price >= 80% below L-Com (`MIN_MARGIN_PCT` - room for shipping, storage and
+  import taxes). Among those, the highest accuracy x margin wins, but a `stated` price beats
+  an `inferred` one at equal or better accuracy. Otherwise the report says not to source.
 - `python test_pricing.py` runs an offline check of this logic.
 
 ## Cost & budget controls

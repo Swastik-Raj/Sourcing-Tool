@@ -71,7 +71,14 @@ MAX_TOKENS_PER_TURN = 3000
 
 # Sourcing only makes sense with real margin under L-Com's price, and only for candidates
 # that aren't rubric-rejected. Both are business knobs - tune with the sourcing team.
-MIN_MARGIN_PCT = 30
+MIN_MARGIN_PCT = 80  # 30% got eaten by shipping, storage and import taxes
+# A unit price this many times cheaper than the next-cheapest candidate for the same
+# product is treated as an extraction error (e.g. price divided by MOQ), not a bargain.
+IMPLAUSIBLE_PRICE_RATIO = 10
+IMPLAUSIBLE_NOTE = (
+    "unit price implausible relative to other candidates for this product - "
+    "likely extraction error, verify manually before ordering"
+)
 MIN_RECOMMEND_ACCURACY = 80
 
 PRODUCTS = [
@@ -125,10 +132,13 @@ class Candidate(BaseModel):
     distributor_site: Optional[str] = None
     listing_title: Optional[str] = None
     price: Optional[str] = None  # raw listing price string, display only
-    price_total: Optional[float] = None  # numeric USD amount that `price` covers
-    quantity_covered: Optional[int] = None  # how many units price_total buys
-    unit_price_confidence: Optional[Literal["stated", "inferred", "ambiguous"]] = None
-    unit_price_note: Optional[str] = None
+    # Required and non-nullable on purpose: every nullable field is an anyOf union, and
+    # strict output mode rejects the schema ("Schema is too complex") past ~11 of them.
+    # 0 / "" mean "unknown".
+    price_total: float  # numeric USD amount that `price` covers
+    quantity_covered: int  # how many units price_total buys
+    unit_price_confidence: Literal["stated", "inferred", "ambiguous"]
+    unit_price_note: str
     moq: Optional[str] = None
     email: Optional[str] = None
     match_percent: Optional[int] = None
@@ -193,8 +203,11 @@ give must be the final structured result, nothing else.
 PRICING - for every candidate, work out what quantity the listed price actually buys:
 - price: the raw price text exactly as shown on the listing.
 - price_total: that price as a number in USD. If a range is shown, use the HIGHER end.
+  0 if no price is shown.
 - quantity_covered: how many units price_total buys (e.g. "$0.33 / piece" -> 1;
-  "$19.75 ... (10PCS)" or "pack of 10" -> 10).
+  "$19.75 ... (10PCS)" or "pack of 10" -> 10). 0 if unknown. The MOQ / minimum order is
+  NOT quantity_covered: "$1.27-1.58, Min. order 500 pieces" is a per-piece price (-> 1).
+- unit_price_note: one short line on how you read the quantity ("" if obvious).
 - unit_price_confidence:
   "stated"    - the listing explicitly says per piece/unit, or explicitly states the pack size.
   "inferred"  - not explicit, but the listing text makes it clear (e.g. title says "10PCS").
@@ -297,7 +310,7 @@ def usage_tokens(message) -> tuple:
     return usage.input_tokens or 0, usage.output_tokens or 0
 
 
-async def research_product(client: AsyncAnthropic, session: ClientSession, tools, product: dict):
+async def research_once(client: AsyncAnthropic, session: ClientSession, tools, product: dict):
     budget = ToolBudget(MAX_TOOL_CALLS_PER_PRODUCT)
     runner_tools = [make_bounded_tool(t, session, budget) for t in tools]
 
@@ -328,6 +341,31 @@ async def research_product(client: AsyncAnthropic, session: ClientSession, tools
         except ValidationError:
             parsed = None
     return parsed, total_in, total_out, budget.used
+
+
+def is_garbled(result: Optional[SourcingResult]) -> bool:
+    """Haiku occasionally emits a whole response with spaces sprayed mid-word
+    ("al ib ab a.c om", "$2 .1 0"). URLs and domains never contain whitespace, so any
+    in those fields means the response text can't be trusted."""
+    return result is not None and any(
+        re.search(r"\s", field or "")
+        for c in result.candidates
+        for field in (c.url, c.distributor_site)
+    )
+
+
+async def research_product(client: AsyncAnthropic, session: ClientSession, tools, product: dict):
+    """research_once, retried once if the response comes back garbled. A second garbled
+    response is dropped (reported as no structured result) rather than written out."""
+    total_in = total_out = calls = 0
+    for attempt in (1, 2):
+        parsed, tin, tout, used = await research_once(client, session, tools, product)
+        total_in, total_out, calls = total_in + tin, total_out + tout, calls + used
+        if not is_garbled(parsed):
+            return parsed, total_in, total_out, calls
+        print(f"  Response text came back garbled (attempt {attempt}) - "
+              + ("retrying." if attempt == 1 else "dropping it."))
+    return None, total_in, total_out, calls
 
 
 def candidate_score(candidate: Candidate) -> tuple:
@@ -383,7 +421,33 @@ def format_vs_lcom(vs: Optional[tuple]) -> str:
 
 
 def format_unit(unit: Optional[float]) -> str:
-    return f"${unit:.2f}" if unit is not None else "UNDETERMINED"
+    if unit is None:
+        return "UNDETERMINED"
+    return f"${unit:.2f}" if unit >= 0.1 else f"${unit:.4f}"  # don't round a $0.0032 bug to $0.00
+
+
+def implausible_units(result: Optional[SourcingResult]) -> set:
+    """Indices of candidates whose unit price is > IMPLAUSIBLE_PRICE_RATIO x cheaper than
+    the next-cheapest candidate for the same product."""
+    units = [unit_price(c) for c in (result.candidates if result else [])]
+    suspect = set()
+    for i, u in enumerate(units):
+        others = [x for j, x in enumerate(units) if j != i and x is not None]
+        if u is not None and others and u * IMPLAUSIBLE_PRICE_RATIO < min(others):
+            suspect.add(i)
+    return suspect
+
+
+def checked_unit(result: SourcingResult, i: int) -> Optional[float]:
+    """unit_price() for comparisons against L-Com: None when implausible."""
+    return None if i in implausible_units(result) else unit_price(result.candidates[i])
+
+
+def confidence_label(result: SourcingResult, i: int) -> str:
+    c = result.candidates[i]
+    if i in implausible_units(result):
+        return f"{c.unit_price_confidence} (IMPLAUSIBLE)"
+    return (c.unit_price_confidence or "?") + (" (FLAGGED)" if unit_price(c) is None else "")
 
 
 def recommend(result: Optional[SourcingResult], lcom_price: Optional[float]) -> tuple:
@@ -392,22 +456,28 @@ def recommend(result: Optional[SourcingResult], lcom_price: Optional[float]) -> 
         return None, "No candidates found - nothing to source."
     if not lcom_price:
         return None, "No L-Com reference price for this product - cannot judge margin, not recommending."
-    best, best_score = None, 0.0
+    qualifying = []  # (index, accuracy, margin %, price is stated)
     for i, c in enumerate(result.candidates):
         accuracy, _ = candidate_score(c)
-        vs = price_vs_lcom(unit_price(c), lcom_price)
+        vs = price_vs_lcom(checked_unit(result, i), lcom_price)
         if vs is None or accuracy is None or accuracy < MIN_RECOMMEND_ACCURACY or vs[1] < MIN_MARGIN_PCT:
             continue
-        # ponytail: accuracy x margin% is a crude trade-off; swap for a landed-cost model (shipping, duty) if needed
-        score = accuracy * vs[1]
-        if score > best_score:
-            best, best_score = i, score
-    if best is None:
+        qualifying.append((i, accuracy, vs[1], c.unit_price_confidence == "stated"))
+    if not qualifying:
+        suspect = implausible_units(result)
         return None, (
             f"No candidate offers sufficient margin below L-Com's ${lcom_price:.2f} "
             f"(needs a confirmed unit price >= {MIN_MARGIN_PCT}% cheaper at >= {MIN_RECOMMEND_ACCURACY}% "
             "accuracy) - do not source from any of these."
+            + "".join(f" Candidate {i + 1}: {IMPLAUSIBLE_NOTE}." for i in sorted(suspect))
         )
+    # ponytail: accuracy x margin% is a crude trade-off; swap for a landed-cost model (shipping, duty) if needed
+    best = max(qualifying, key=lambda q: q[1] * q[2])
+    # A stated price beats an inferred one at equal or better accuracy.
+    stated = [q for q in qualifying if q[3] and q[1] >= best[1]]
+    if not best[3] and stated:
+        best = max(stated, key=lambda q: q[1] * q[2])
+    best = best[0]
     c = result.candidates[best]
     accuracy, _ = candidate_score(c)
     unit = unit_price(c)
@@ -423,7 +493,7 @@ def print_product_result(product: dict, result: Optional[SourcingResult], calls_
     print()
 
     if result is None:
-        print("  Could not get a structured result for this product (empty/refused response).")
+        print("  Could not get a structured result for this product (empty, refused or garbled response).")
         return
 
     if result.no_match or not result.candidates:
@@ -433,6 +503,7 @@ def print_product_result(product: dict, result: Optional[SourcingResult], calls_
 
     for i, candidate in enumerate(result.candidates, start=1):
         computed, scores = candidate_score(candidate)
+        vs = price_vs_lcom(checked_unit(result, i - 1), product.get("lcom_price"))
         manufacturer = candidate.manufacturer or "Not stated on listing"
         source = candidate.distributor_site or "Unknown site"
         price = candidate.price or "Not stated"
@@ -440,9 +511,8 @@ def print_product_result(product: dict, result: Optional[SourcingResult], calls_
         print(f"  #{i}  {manufacturer}  |  via {source}  |  Tier: {match_tier(computed)}")
         print(f"      Listing:  {candidate.listing_title or '?'}")
         print(f"      Price:    {price}   MOQ: {candidate.moq or 'Not stated'}")
-        unit = unit_price(candidate)
-        print(f"      Unit:     {format_unit(unit)} ({candidate.unit_price_confidence or '?'})  "
-              f"vs L-Com: {format_vs_lcom(price_vs_lcom(unit, product.get('lcom_price')))}")
+        print(f"      Unit:     {format_unit(unit_price(candidate))} ({confidence_label(result, i - 1)})  "
+              f"vs L-Com: {format_vs_lcom(vs)}")
         print(f"      Accuracy: {computed}%")
         print(f"      URL:      {candidate.url or 'Not stated'}")
         if scores:
@@ -463,7 +533,7 @@ def format_result_markdown(
     lines = [f"## {product['sku']} - {product['description']}", ""]
 
     if result is None:
-        lines.append("**No structured result** (empty/refused response).")
+        lines.append("**No structured result** (empty, refused or garbled response).")
     elif result.no_match or not result.candidates:
         reason = result.no_match_reason or "no plausible candidate found"
         lines.append(f"**No match found** - {reason}")
@@ -479,13 +549,12 @@ def format_result_markdown(
         ]
         for i, c in enumerate(result.candidates):
             accuracy, _ = candidate_score(c)
-            unit = unit_price(c)
             cells = [
                 f"{i + 1}. {c.manufacturer or 'Not stated'}",
                 f"{accuracy}%",
-                format_unit(unit),
-                (c.unit_price_confidence or "?") + (" (FLAGGED)" if unit is None else ""),
-                format_vs_lcom(price_vs_lcom(unit, lcom)),
+                format_unit(unit_price(c)),
+                confidence_label(result, i),
+                format_vs_lcom(price_vs_lcom(checked_unit(result, i), lcom)),
                 "YES" if i == rec_idx else "no",
             ]
             if i == rec_idx:
@@ -495,7 +564,6 @@ def format_result_markdown(
 
         for i, candidate in enumerate(result.candidates, start=1):
             computed, scores = candidate_score(candidate)
-            unit = unit_price(candidate)
             lines += [
                 f"### Candidate {i}: {computed}% - {match_tier(computed)}",
                 "",
@@ -507,9 +575,9 @@ def format_result_markdown(
                 f"| Accuracy | {computed}% |",
                 f"| Listed price | {candidate.price or 'Not stated'} |",
                 f"| Qty the price covers | {candidate.quantity_covered or '?'} |",
-                f"| Unit price | {format_unit(unit)} ({candidate.unit_price_confidence or '?'}) |",
+                f"| Unit price | {format_unit(unit_price(candidate))} ({confidence_label(result, i - 1)}) |",
                 f"| Unit price note | {candidate.unit_price_note or '-'} |",
-                f"| vs. L-Com price | {format_vs_lcom(price_vs_lcom(unit, lcom))} |",
+                f"| vs. L-Com price | {format_vs_lcom(price_vs_lcom(checked_unit(result, i - 1), lcom))} |",
                 f"| MOQ | {candidate.moq or 'Not stated'} |",
                 f"| Email | {candidate.email or 'Not stated'} |",
                 f"| URL | {candidate.url or 'Not stated'} |",
@@ -529,16 +597,21 @@ def format_result_markdown(
 
 
 def ambiguous_price_flags(rows: list) -> list:
-    """Markdown bullets for every candidate whose unit price couldn't be determined."""
+    """Markdown bullets for every candidate whose unit price couldn't be determined or looks implausible."""
     flags = []
     for product, result in rows:
+        suspect = implausible_units(result)
         for i, c in enumerate(result.candidates if result else [], start=1):
-            if unit_price(c) is None:
+            if i - 1 in suspect:
+                reason = f"{format_unit(unit_price(c))}/unit: {IMPLAUSIBLE_NOTE} ({c.unit_price_note or 'no note'})"
+            elif unit_price(c) is None:
                 reason = c.unit_price_note or c.unit_price_confidence or "no unit price given"
-                flags.append(
-                    f"- **{product['sku']}** candidate {i} ({c.manufacturer or 'unnamed'}): "
-                    f"listed \"{c.price or 'no price'}\" - {reason}"
-                )
+            else:
+                continue
+            flags.append(
+                f"- **{product['sku']}** candidate {i} ({c.manufacturer or 'unnamed'}): "
+                f"listed \"{c.price or 'no price'}\" - {reason}"
+            )
     return flags
 
 
@@ -554,7 +627,7 @@ def write_report(
         f"Recommendation rule: >= {MIN_RECOMMEND_ACCURACY}% accuracy and a confirmed unit price "
         f">= {MIN_MARGIN_PCT}% below L-Com's price; best accuracy x margin wins.",
         "",
-        "## Unit prices that could not be determined confidently",
+        "## Unit prices that could not be determined confidently or look implausible",
         "",
         *(flags or ["None."]),
         "",
@@ -571,7 +644,10 @@ def write_report(
         f.write(content)
 
 
-PRODUCT_XLSX_FIELDS = ["SKU", "Product", "Keyword", "L-Com Price", "Recommendation"]
+PRODUCT_XLSX_FIELDS = ["SKU", "Product", "Keyword", "L-Com Unit Price", "Recommendation"]
+RECOMMENDED_XLSX_FIELDS = [
+    "Recommended Manufacturer", "Recommended Email", "Recommended URL", "Recommended Unit Price",
+]
 CANDIDATE_XLSX_FIELDS = [
     "Name", "Accuracy", "Listed Price", "Unit Price", "Unit Price Confidence", "vs. L-Com Price",
     "MOQ", "URL", "Email", "Match Tier", "Comment",
@@ -582,13 +658,14 @@ GREEN = PatternFill("solid", fgColor="C6EFCE")
 def write_excel_report(rows: list, path: str) -> None:
     """rows: list of (product: dict, result: Optional[SourcingResult]) tuples.
     Sheet "Results": one row per product. Sheet "Comparison": candidates vs L-Com side by side.
-    The recommended candidate is filled green in both."""
+    The green fill marks who to buy from: the Recommended columns on Results, the row on
+    Comparison. Nothing is green when no candidate qualifies."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Results"
     comp = wb.create_sheet("Comparison")
 
-    header = list(PRODUCT_XLSX_FIELDS)
+    header = PRODUCT_XLSX_FIELDS + RECOMMENDED_XLSX_FIELDS
     for n in (1, 2, 3):
         header += [f"Manufacturer {n} {field}" for field in CANDIDATE_XLSX_FIELDS]
     ws.append(header)
@@ -600,19 +677,25 @@ def write_excel_report(rows: list, path: str) -> None:
         rec_idx, rec_reason = recommend(result, lcom)
         row = [product["sku"], product.get("product_name", ""), product["description"], lcom, rec_reason]
         candidates = result.candidates if result else []
+        if rec_idx is None:
+            row += [""] * len(RECOMMENDED_XLSX_FIELDS)
+        else:
+            rec = candidates[rec_idx]
+            row += [rec.manufacturer or "", rec.email or "", rec.url or "", round(unit_price(rec), 4)]
         for i in range(3):
             if i < len(candidates):
                 c = candidates[i]
                 computed, scores = candidate_score(c)
                 unit = unit_price(c)
                 unit_cell = round(unit, 4) if unit is not None else "UNDETERMINED"
-                vs = format_vs_lcom(price_vs_lcom(unit, lcom))
+                confidence = confidence_label(result, i)
+                vs = format_vs_lcom(price_vs_lcom(checked_unit(result, i), lcom))
                 row += [
                     c.manufacturer or "",
                     computed,
                     c.price or "",
                     unit_cell,
-                    c.unit_price_confidence or "",
+                    confidence,
                     vs,
                     c.moq or "",
                     c.url or "",
@@ -621,7 +704,7 @@ def write_excel_report(rows: list, path: str) -> None:
                     candidate_comment(scores),
                 ]
                 comp.append([product["sku"], i + 1, c.manufacturer or "", computed, unit_cell,
-                             c.unit_price_confidence or "", vs, "YES" if i == rec_idx else "no"])
+                             confidence, vs, "YES" if i == rec_idx else "no"])
                 if i == rec_idx:
                     for cell in comp[comp.max_row]:
                         cell.fill = GREEN
@@ -631,8 +714,8 @@ def write_excel_report(rows: list, path: str) -> None:
         comp.append([])
         ws.append(row)
         if rec_idx is not None:
-            start = len(PRODUCT_XLSX_FIELDS) + rec_idx * len(CANDIDATE_XLSX_FIELDS)
-            for cell in ws[ws.max_row][start : start + len(CANDIDATE_XLSX_FIELDS)]:
+            start = len(PRODUCT_XLSX_FIELDS)
+            for cell in ws[ws.max_row][start : start + len(RECOMMENDED_XLSX_FIELDS)]:
                 cell.fill = GREEN
 
     for sheet in (ws, comp):
@@ -674,6 +757,10 @@ def read_products(path: str) -> list:
         keyword = row[keyword_col - 1].value if keyword_col else None
         product_name = row[product_col - 1].value if product_col else None
         lcom_price = row[lcom_col - 1].value if lcom_col else None
+        # L-Com prices packs as one SKU ("..., Package/10") - compare candidates per unit.
+        pack = re.search(r"package\s*/\s*(\d+)", f"{keyword} {product_name}", re.IGNORECASE)
+        if pack and isinstance(lcom_price, (int, float)):
+            lcom_price /= int(pack.group(1))
         products.append({
             "sku": str(sku).strip(),
             "description": str(keyword or product_name or "").strip(),

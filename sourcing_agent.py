@@ -7,9 +7,10 @@ Claude. Claude is given a hard budget of tool calls per product, must return a s
 (schema-enforced) result with up to 3 ranked candidates, and runs on Haiku for cost.
 
 Setup:
-    pip install "anthropic[mcp]" pydantic openpyxl
-    set ANTHROPIC_API_KEY=...   (your Anthropic API key)
-    set NIMBLE_API_KEY=...      (your Nimble API key, used as the MCP bearer token)
+    pip install "anthropic[mcp]" pydantic openpyxl python-dotenv
+    .env file in this folder with:
+        ANTHROPIC_API_KEY=...   (your Anthropic API key)
+        NIMBLE_API_KEY=...      (your Nimble API key, used as the MCP bearer token)
 
 Run:
     python sourcing_agent.py                                    (5 built-in sample products)
@@ -24,10 +25,12 @@ import os
 import re
 import sys
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 import httpx2
 import openpyxl
+from dotenv import load_dotenv
+from openpyxl.styles import Font, PatternFill
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from pydantic import BaseModel, ValidationError
@@ -65,6 +68,11 @@ MAX_TOOL_CALLS_PER_PRODUCT = 8  # searches + extracts combined, hard cap
 MAX_ITERATIONS_PER_PRODUCT = MAX_TOOL_CALLS_PER_PRODUCT + 3  # backstop against loops
 MAX_TOOL_RESULT_CHARS = 2500  # truncate every tool result before it goes back to Claude
 MAX_TOKENS_PER_TURN = 3000
+
+# Sourcing only makes sense with real margin under L-Com's price, and only for candidates
+# that aren't rubric-rejected. Both are business knobs - tune with the sourcing team.
+MIN_MARGIN_PCT = 30
+MIN_RECOMMEND_ACCURACY = 80
 
 PRODUCTS = [
     {"sku": "ECF504-SC6", "description": "Cat6 RJ45 Coupler Shielded (8x8) Panel Mount Style"},
@@ -116,7 +124,11 @@ class Candidate(BaseModel):
     manufacturer: Optional[str] = None
     distributor_site: Optional[str] = None
     listing_title: Optional[str] = None
-    price: Optional[str] = None
+    price: Optional[str] = None  # raw listing price string, display only
+    price_total: Optional[float] = None  # numeric USD amount that `price` covers
+    quantity_covered: Optional[int] = None  # how many units price_total buys
+    unit_price_confidence: Optional[Literal["stated", "inferred", "ambiguous"]] = None
+    unit_price_note: Optional[str] = None
     moq: Optional[str] = None
     email: Optional[str] = None
     match_percent: Optional[int] = None
@@ -177,6 +189,19 @@ final answer. Do not narrate your process in free text at any point - every resp
 give must be the final structured result, nothing else.
 
 {RUBRIC_INSTRUCTIONS}
+
+PRICING - for every candidate, work out what quantity the listed price actually buys:
+- price: the raw price text exactly as shown on the listing.
+- price_total: that price as a number in USD. If a range is shown, use the HIGHER end.
+- quantity_covered: how many units price_total buys (e.g. "$0.33 / piece" -> 1;
+  "$19.75 ... (10PCS)" or "pack of 10" -> 10).
+- unit_price_confidence:
+  "stated"    - the listing explicitly says per piece/unit, or explicitly states the pack size.
+  "inferred"  - not explicit, but the listing text makes it clear (e.g. title says "10PCS").
+  "ambiguous" - you cannot tell whether the price is per unit or for a pack/MOQ batch
+                (e.g. "$19.75, MOQ 10 pcs" with nothing saying which), or the price is not
+                in USD. DO NOT GUESS - mark it ambiguous and say why in unit_price_note.
+Never divide the price yourself; just report price_total and quantity_covered.
 
 Return up to 3 candidates in `candidates`, ranked best first, balancing match quality
 against price (a slightly lower match % at a much lower price can rank above a perfect
@@ -334,6 +359,64 @@ def candidate_comment(scores: dict) -> str:
     return "All five rubric attributes matched something explicit on the listing."
 
 
+def unit_price(candidate: Candidate) -> Optional[float]:
+    """True single-unit cost, or None when it can't be determined confidently."""
+    c = candidate
+    if c.unit_price_confidence not in ("stated", "inferred") or not c.price_total or not c.quantity_covered:
+        return None
+    return c.price_total / c.quantity_covered
+
+
+def price_vs_lcom(unit: Optional[float], lcom_price: Optional[float]) -> Optional[tuple]:
+    """(dollars cheaper per unit, percent cheaper) vs L-Com. Negative = more expensive."""
+    if unit is None or not lcom_price:
+        return None
+    diff = lcom_price - unit
+    return diff, diff / lcom_price * 100
+
+
+def format_vs_lcom(vs: Optional[tuple]) -> str:
+    if vs is None:
+        return "n/a"
+    diff, pct = vs
+    return f"${abs(diff):.2f} ({abs(pct):.0f}%) {'cheaper' if diff >= 0 else 'more expensive'}"
+
+
+def format_unit(unit: Optional[float]) -> str:
+    return f"${unit:.2f}" if unit is not None else "UNDETERMINED"
+
+
+def recommend(result: Optional[SourcingResult], lcom_price: Optional[float]) -> tuple:
+    """Returns (index of recommended candidate or None, one-line reason)."""
+    if result is None or result.no_match or not result.candidates:
+        return None, "No candidates found - nothing to source."
+    if not lcom_price:
+        return None, "No L-Com reference price for this product - cannot judge margin, not recommending."
+    best, best_score = None, 0.0
+    for i, c in enumerate(result.candidates):
+        accuracy, _ = candidate_score(c)
+        vs = price_vs_lcom(unit_price(c), lcom_price)
+        if vs is None or accuracy is None or accuracy < MIN_RECOMMEND_ACCURACY or vs[1] < MIN_MARGIN_PCT:
+            continue
+        # ponytail: accuracy x margin% is a crude trade-off; swap for a landed-cost model (shipping, duty) if needed
+        score = accuracy * vs[1]
+        if score > best_score:
+            best, best_score = i, score
+    if best is None:
+        return None, (
+            f"No candidate offers sufficient margin below L-Com's ${lcom_price:.2f} "
+            f"(needs a confirmed unit price >= {MIN_MARGIN_PCT}% cheaper at >= {MIN_RECOMMEND_ACCURACY}% "
+            "accuracy) - do not source from any of these."
+        )
+    c = result.candidates[best]
+    accuracy, _ = candidate_score(c)
+    unit = unit_price(c)
+    return best, (
+        f"Buy from Candidate {best + 1} ({c.manufacturer or 'unnamed supplier'}): {accuracy}% accuracy at "
+        f"{format_unit(unit)}/unit, {format_vs_lcom(price_vs_lcom(unit, lcom_price))} than L-Com."
+    )
+
+
 def print_product_result(product: dict, result: Optional[SourcingResult], calls_used: int):
     print("-" * 72)
     print(f"{product['sku']} - \"{product['description']}\"  ({calls_used} tool calls used)")
@@ -357,7 +440,10 @@ def print_product_result(product: dict, result: Optional[SourcingResult], calls_
         print(f"  #{i}  {manufacturer}  |  via {source}  |  Tier: {match_tier(computed)}")
         print(f"      Listing:  {candidate.listing_title or '?'}")
         print(f"      Price:    {price}   MOQ: {candidate.moq or 'Not stated'}")
-        print(f"      Match:    {computed}%")
+        unit = unit_price(candidate)
+        print(f"      Unit:     {format_unit(unit)} ({candidate.unit_price_confidence or '?'})  "
+              f"vs L-Com: {format_vs_lcom(price_vs_lcom(unit, product.get('lcom_price')))}")
+        print(f"      Accuracy: {computed}%")
         print(f"      URL:      {candidate.url or 'Not stated'}")
         if scores:
             line = " | ".join(
@@ -368,6 +454,7 @@ def print_product_result(product: dict, result: Optional[SourcingResult], calls_
 
     if result.note:
         print(f"  Note: {result.note}")
+    print(f"  Recommendation: {recommend(result, product.get('lcom_price'))[1]}")
 
 
 def format_result_markdown(
@@ -381,8 +468,34 @@ def format_result_markdown(
         reason = result.no_match_reason or "no plausible candidate found"
         lines.append(f"**No match found** - {reason}")
     else:
+        lcom = product.get("lcom_price")
+        lcom_text = f"${lcom:.2f}" if lcom else "n/a"
+        rec_idx, rec_reason = recommend(result, lcom)
+        lines += [
+            f"**Recommendation:** {rec_reason}",
+            "",
+            f"| Candidate | Accuracy | Unit price | Unit price confidence | vs. L-Com ({lcom_text}) | Recommended |",
+            "|---|---|---|---|---|---|",
+        ]
+        for i, c in enumerate(result.candidates):
+            accuracy, _ = candidate_score(c)
+            unit = unit_price(c)
+            cells = [
+                f"{i + 1}. {c.manufacturer or 'Not stated'}",
+                f"{accuracy}%",
+                format_unit(unit),
+                (c.unit_price_confidence or "?") + (" (FLAGGED)" if unit is None else ""),
+                format_vs_lcom(price_vs_lcom(unit, lcom)),
+                "YES" if i == rec_idx else "no",
+            ]
+            if i == rec_idx:
+                cells = [f"**{x}**" for x in cells]
+            lines.append("| " + " | ".join(cells) + " |")
+        lines += [f"| L-Com (benchmark) | - | {lcom_text} | - | - | - |", ""]
+
         for i, candidate in enumerate(result.candidates, start=1):
             computed, scores = candidate_score(candidate)
+            unit = unit_price(candidate)
             lines += [
                 f"### Candidate {i}: {computed}% - {match_tier(computed)}",
                 "",
@@ -391,7 +504,12 @@ def format_result_markdown(
                 f"| Manufacturer / Producer | {candidate.manufacturer or 'Not stated on listing'} |",
                 f"| Supplier / Site | {candidate.distributor_site or 'Unknown site'} |",
                 f"| Listing | {candidate.listing_title or '?'} |",
-                f"| Price | {candidate.price or 'Not stated'} |",
+                f"| Accuracy | {computed}% |",
+                f"| Listed price | {candidate.price or 'Not stated'} |",
+                f"| Qty the price covers | {candidate.quantity_covered or '?'} |",
+                f"| Unit price | {format_unit(unit)} ({candidate.unit_price_confidence or '?'}) |",
+                f"| Unit price note | {candidate.unit_price_note or '-'} |",
+                f"| vs. L-Com price | {format_vs_lcom(price_vs_lcom(unit, lcom))} |",
                 f"| MOQ | {candidate.moq or 'Not stated'} |",
                 f"| Email | {candidate.email or 'Not stated'} |",
                 f"| URL | {candidate.url or 'Not stated'} |",
@@ -410,14 +528,35 @@ def format_result_markdown(
     return "\n".join(lines)
 
 
+def ambiguous_price_flags(rows: list) -> list:
+    """Markdown bullets for every candidate whose unit price couldn't be determined."""
+    flags = []
+    for product, result in rows:
+        for i, c in enumerate(result.candidates if result else [], start=1):
+            if unit_price(c) is None:
+                reason = c.unit_price_note or c.unit_price_confidence or "no unit price given"
+                flags.append(
+                    f"- **{product['sku']}** candidate {i} ({c.manufacturer or 'unnamed'}): "
+                    f"listed \"{c.price or 'no price'}\" - {reason}"
+                )
+    return flags
+
+
 def write_report(
-    sections: list, grand_in: int, grand_out: int, grand_cost: float, num_products: int, path: str
+    sections: list, grand_in: int, grand_out: int, grand_cost: float, num_products: int, path: str,
+    flags: list,
 ) -> None:
     header = [
         "# Competitive Sourcing Research Report",
         "",
         f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         f"Model: {MODEL} | Sites: {', '.join(SOURCING_SITES)} | Products: {num_products}",
+        f"Recommendation rule: >= {MIN_RECOMMEND_ACCURACY}% accuracy and a confirmed unit price "
+        f">= {MIN_MARGIN_PCT}% below L-Com's price; best accuracy x margin wins.",
+        "",
+        "## Unit prices that could not be determined confidently",
+        "",
+        *(flags or ["None."]),
         "",
         "---",
         "",
@@ -432,43 +571,76 @@ def write_report(
         f.write(content)
 
 
-CANDIDATE_XLSX_FIELDS = ["Name", "MOQ", "Price", "URL", "Email", "Match Tier", "Comment"]
+PRODUCT_XLSX_FIELDS = ["SKU", "Product", "Keyword", "L-Com Price", "Recommendation"]
+CANDIDATE_XLSX_FIELDS = [
+    "Name", "Accuracy", "Listed Price", "Unit Price", "Unit Price Confidence", "vs. L-Com Price",
+    "MOQ", "URL", "Email", "Match Tier", "Comment",
+]
+GREEN = PatternFill("solid", fgColor="C6EFCE")
 
 
 def write_excel_report(rows: list, path: str) -> None:
-    """rows: list of (product: dict, result: Optional[SourcingResult]) tuples."""
+    """rows: list of (product: dict, result: Optional[SourcingResult]) tuples.
+    Sheet "Results": one row per product. Sheet "Comparison": candidates vs L-Com side by side.
+    The recommended candidate is filled green in both."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Results"
+    comp = wb.create_sheet("Comparison")
 
-    header = ["SKU", "Product", "Keyword"]
+    header = list(PRODUCT_XLSX_FIELDS)
     for n in (1, 2, 3):
         header += [f"Manufacturer {n} {field}" for field in CANDIDATE_XLSX_FIELDS]
     ws.append(header)
+    comp.append(["SKU", "Candidate", "Manufacturer", "Accuracy", "Unit Price", "Unit Price Confidence",
+                 "vs. L-Com Price", "Recommended"])
 
     for product, result in rows:
-        row = [product["sku"], product.get("product_name", ""), product["description"]]
+        lcom = product.get("lcom_price")
+        rec_idx, rec_reason = recommend(result, lcom)
+        row = [product["sku"], product.get("product_name", ""), product["description"], lcom, rec_reason]
         candidates = result.candidates if result else []
         for i in range(3):
             if i < len(candidates):
                 c = candidates[i]
                 computed, scores = candidate_score(c)
+                unit = unit_price(c)
+                unit_cell = round(unit, 4) if unit is not None else "UNDETERMINED"
+                vs = format_vs_lcom(price_vs_lcom(unit, lcom))
                 row += [
                     c.manufacturer or "",
-                    c.moq or "",
+                    computed,
                     c.price or "",
+                    unit_cell,
+                    c.unit_price_confidence or "",
+                    vs,
+                    c.moq or "",
                     c.url or "",
                     c.email or "",
                     match_tier(computed),
                     candidate_comment(scores),
                 ]
+                comp.append([product["sku"], i + 1, c.manufacturer or "", computed, unit_cell,
+                             c.unit_price_confidence or "", vs, "YES" if i == rec_idx else "no"])
+                if i == rec_idx:
+                    for cell in comp[comp.max_row]:
+                        cell.fill = GREEN
             else:
                 row += [""] * len(CANDIDATE_XLSX_FIELDS)
+        comp.append([product["sku"], "L-Com", "L-Com (benchmark)", None, lcom])
+        comp.append([])
         ws.append(row)
+        if rec_idx is not None:
+            start = len(PRODUCT_XLSX_FIELDS) + rec_idx * len(CANDIDATE_XLSX_FIELDS)
+            for cell in ws[ws.max_row][start : start + len(CANDIDATE_XLSX_FIELDS)]:
+                cell.fill = GREEN
 
-    for col_cells in ws.columns:
-        width = max((len(str(cell.value)) for cell in col_cells if cell.value), default=10)
-        ws.column_dimensions[col_cells[0].column_letter].width = min(max(width + 2, 10), 60)
+    for sheet in (ws, comp):
+        for cell in sheet[1]:
+            cell.font = Font(bold=True)
+        for col_cells in sheet.columns:
+            width = max((len(str(cell.value)) for cell in col_cells if cell.value), default=10)
+            sheet.column_dimensions[col_cells[0].column_letter].width = min(max(width + 2, 10), 60)
 
     wb.save(path)
 
@@ -492,6 +664,7 @@ def read_products(path: str) -> list:
     sku_col = headers["sku"]
     keyword_col = headers.get("keyword")
     product_col = headers.get("product")
+    lcom_col = headers.get("lcom sale price")
 
     products = []
     for row in ws.iter_rows(min_row=header_row + 1):
@@ -500,10 +673,12 @@ def read_products(path: str) -> list:
             continue
         keyword = row[keyword_col - 1].value if keyword_col else None
         product_name = row[product_col - 1].value if product_col else None
+        lcom_price = row[lcom_col - 1].value if lcom_col else None
         products.append({
             "sku": str(sku).strip(),
             "description": str(keyword or product_name or "").strip(),
             "product_name": str(product_name or "").strip(),
+            "lcom_price": float(lcom_price) if isinstance(lcom_price, (int, float)) else None,
         })
     return products
 
@@ -528,15 +703,16 @@ def parse_args():
 
 async def main_async():
     args = parse_args()
+    load_dotenv()  # .env next to where you run it; real env vars still win
 
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
     nimble_key = os.environ.get("NIMBLE_API_KEY")
     missing = [n for n, v in [("ANTHROPIC_API_KEY", anthropic_key), ("NIMBLE_API_KEY", nimble_key)] if not v]
     if missing:
         print(f"Missing required environment variable(s): {', '.join(missing)}")
-        print("Set them and re-run, e.g.:")
-        print("  set ANTHROPIC_API_KEY=sk-ant-...")
-        print("  set NIMBLE_API_KEY=...")
+        print("Add them to a .env file in this folder (or set them in the shell), e.g.:")
+        print("  ANTHROPIC_API_KEY=sk-ant-...")
+        print("  NIMBLE_API_KEY=...")
         sys.exit(1)
 
     products = read_products(args.input) if args.input else PRODUCTS
@@ -623,7 +799,11 @@ async def main_async():
 
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 report_path = f"sourcing_report_{timestamp}.md"
-                write_report(report_sections, grand_in, grand_out, grand_cost, len(products), report_path)
+                flags = ambiguous_price_flags(excel_rows)
+                write_report(report_sections, grand_in, grand_out, grand_cost, len(products), report_path, flags)
+                if flags:
+                    print("Unit prices that could not be determined confidently:")
+                    print("\n".join(flags))
                 print(f"Report written to: {os.path.abspath(report_path)}")
 
                 excel_path = args.output or f"sourcing_results_{timestamp}.xlsx"

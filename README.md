@@ -31,17 +31,17 @@ wasting tool-call budget on it.
 ## Setup
 
 ```bash
-pip install "anthropic[mcp]" pydantic openpyxl
+pip install "anthropic[mcp]" pydantic openpyxl python-dotenv
 ```
 
-Set two environment variables:
+Create a `.env` file in the project folder (already gitignored):
 
 ```bash
-set ANTHROPIC_API_KEY=sk-ant-...   # your Anthropic API key
-set NIMBLE_API_KEY=...             # your Nimble API key (used as the MCP bearer token)
+ANTHROPIC_API_KEY=sk-ant-...   # your Anthropic API key
+NIMBLE_API_KEY=...             # your Nimble API key (used as the MCP bearer token)
 ```
 
-(On macOS/Linux, use `export` instead of `set`.)
+Environment variables that are already set in the shell take precedence over `.env`.
 
 ## Usage
 
@@ -82,11 +82,25 @@ Every run produces three things:
 2. **Markdown report** (`sourcing_report_<timestamp>.md`) - a human-readable writeup per
    product: full candidate details, rubric breakdown, and token/cost accounting. Good for
    a quick read or sharing a summary.
-3. **Excel report** (`sourcing_results_<timestamp>.xlsx`, or `--output` path) - one row per
-   product, with a `Manufacturer 1/2/3` block of columns each (Name, MOQ, Price, URL,
-   Email, Match Tier, Comment). Blank when fewer than 3 distinct candidates were found - a
-   weak pick is never forced in just to fill a slot. Match Tier is derived from
-   match_percent: **>=90 Auto-accepted, 80-89 Flagged for manual review, <80 Rejected.**
+3. **Excel report** (`sourcing_results_<timestamp>.xlsx`, or `--output` path) - sheet
+   `Results`: one row per product (SKU, Product, Keyword, L-Com Price, Recommendation) plus
+   a `Manufacturer 1/2/3` block each (Name, Accuracy, Listed Price, Unit Price, Unit Price
+   Confidence, vs. L-Com Price, MOQ, URL, Email, Match Tier, Comment). Sheet `Comparison`:
+   candidates stacked against the L-Com benchmark per product. The recommended candidate is
+   filled green in both sheets; nothing is green when no candidate qualifies. Match Tier is
+   derived from match_percent: **>=90 Auto-accepted, 80-89 Flagged for manual review, <80 Rejected.**
+
+### Unit price, L-Com comparison & recommendation
+
+- Claude reports `price_total`, `quantity_covered` and `unit_price_confidence`
+  (`stated` / `inferred` / `ambiguous`). The code computes `unit_price = price_total /
+  quantity_covered`. Ambiguous or non-USD prices get no unit price. They show as
+  UNDETERMINED and are listed at the top of the Markdown report. The tool never guesses.
+- `vs. L-Com` compares `unit_price` with the input's `Lcom sale Price` column.
+- A candidate is recommended only with >= 80% accuracy (`MIN_RECOMMEND_ACCURACY`) and a
+  confirmed unit price >= 30% below L-Com (`MIN_MARGIN_PCT`). Among those, the highest
+  accuracy x margin wins. Otherwise the report says not to source from any of them.
+- `python test_pricing.py` runs an offline check of this logic.
 
 ## Cost & budget controls
 

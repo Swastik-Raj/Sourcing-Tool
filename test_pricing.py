@@ -5,7 +5,7 @@ import tempfile
 import openpyxl
 
 from sourcing_agent import (
-    AttributeBreakdown, Candidate, SourcingResult, implausible_units, is_garbled, recommend, unit_price, write_excel_report,
+    AttributeBreakdown, Candidate, SourcingResult, dedupe_manufacturers, implausible_units, is_garbled, pick_skus, recommend, strip_page_chrome, unit_price, write_excel_report,
 )
 
 FULL = AttributeBreakdown(product_type=20, category_spec=20, shielding_material=20, mount_form=20, gender_pins=20)
@@ -42,8 +42,20 @@ idx, reason = recommend(hdff, 23.79)
 assert idx == 0, reason
 
 # Implausible price can't make a product clear the bar on its own.
-idx, reason = recommend(result(cand("Real", 20.0, 1, "stated"), cand("Bug", 1.58, 500, "inferred")), 23.79)
+idx, reason = recommend(result(cand("Real", 20.0, 1, "stated"), cand("Real2", 21.0, 1, "stated"),
+                               cand("Bug", 1.58, 500, "inferred")), 23.79)
 assert idx is None and "implausible" in reason, reason
+
+# ECF504-BAS regression: 2 candidates ($2.10 vs $34.72) is two real prices, not a parsing error.
+assert implausible_units(result(cand("Dongguan Baimiya", 2.10, 1, "stated"), cand("Wusheng", 34.72, 1, "stated"))) == set()
+
+# Same manufacturer twice -> keep the higher-scoring one, no backfill; placeholder names are exempt.
+dupes = [cand("PremierCable", 15.5, 1, "stated", NINETY), cand("Other", 9.0, 1, "stated"),
+         cand(" premiercable ", 18.66, 1, "stated"), cand("Unknown/Generic", 1.0, 1, "stated"),
+         cand("Unknown/Generic", 2.0, 1, "stated")]
+kept = dedupe_manufacturers(dupes)
+assert [(c.manufacturer, c.price_total) for c in kept] == [
+    ("Other", 9.0), (" premiercable ", 18.66), ("Unknown/Generic", 1.0), ("Unknown/Generic", 2.0)], kept
 
 # Stated beats a (plausible) inferred price at equal accuracy, even though inferred is cheaper.
 idx, reason = recommend(result(cand("Inferred", 1.5, 1, "inferred"), cand("Stated", 2.0, 1, "stated")), 23.79)
@@ -78,4 +90,29 @@ assert not any(c.fill.fgColor.rgb.endswith("C6EFCE") for c in row[max(rec.values
 assert all(ws[3][i].value is None for i in rec.values())
 assert not any(c.fill.fgColor.rgb.endswith("C6EFCE") for c in ws[3])
 assert wb["Comparison"].cell(3, 8).value == "YES"
+
+# 5 candidates: all get an Excel block, and the 5th can be the recommendation.
+five = result(*[cand(f"M{n}", 15.0 + n, 1, "stated") for n in range(1, 5)], cand("M5", 2.0, 1, "stated"))
+assert recommend(five, 22.59)[0] == 4
+write_excel_report([({"sku": "S5", "description": "d", "lcom_price": 22.59}, five)], path)
+ws = openpyxl.load_workbook(path)["Results"]
+header = [c.value for c in ws[1]]
+assert "Manufacturer 5 Name" in header and ws[2][header.index("Manufacturer 5 Name")].value == "M5"
+assert ws[2][header.index("Recommended Manufacturer")].value == "M5"
+# Page chrome stripped before truncation: menus/URLs gone, listing title/price/supplier/product URL kept.
+import json
+menu = "".join(f"*   [Category {n} & Things](https://www.made-in-china.com/cat/{n}.html)\n" for n in range(300))
+listing = ("## [LC Female-SC Female Simplex Adapter](https://fm.en.made-in-china.com/product/QUt/China-LC.html?x=1)\n"
+           "**US$0.07-0.25**\n10 Pieces (MOQ)\n[Shenzhen FiberMania Technology Co., Ltd.](https://fm.en.made-in-china.com/)\n")
+page = json.dumps({"content": "[Sign in](https://login.x.com/?next=y)\n" + menu + listing}) + ' {"conversation_id": "c"}'
+seen = strip_page_chrome(page)
+assert len(page) > 20000 and len(seen) < 800 and "login" not in seen, (len(seen), seen[:200])
+assert "https://fm.en.made-in-china.com/product/QUt/China-LC.html)" in seen and "US$0.07" in seen
+assert "Shenzhen FiberMania Technology Co., Ltd." in seen and "fm.en.made-in-china.com/)" not in seen
+assert strip_page_chrome("plain text, no json") == "plain text, no json"
+
+# --sku: case-insensitive, order as asked, duplicates collapsed, unknown SKUs reported.
+pool = [{"sku": "FOA-020C"}, {"sku": "C&P9M"}, {"sku": "HG2409U-PRO"}]
+picked, missing = pick_skus(pool, ["hg2409u-pro", "FOA-020C", "FOA-020C", "NOPE"])
+assert [p["sku"] for p in picked] == ["HG2409U-PRO", "FOA-020C"] and missing == ["NOPE"]
 print("ok")

@@ -3,7 +3,7 @@
 A POC tool that automates competitive sourcing research: for each product (SKU +
 description), it searches Chinese sourcing/manufacturing sites (AliExpress, Alibaba,
 Made-in-China) for equivalent products, scores each candidate against a 5-attribute rubric,
-and returns up to 3 ranked candidates per product with pricing, MOQ, and supplier info.
+and returns up to 5 ranked candidates per product with pricing, MOQ, and supplier info.
 
 It uses Claude (Haiku, for cost) with a hard tool-call budget per product, connected to the
 [Nimble](https://nimbleway.com) MCP server for web search/extraction.
@@ -20,7 +20,7 @@ For each product, Claude is given:
 Claude scores each candidate it finds against a 5-attribute rubric (product type,
 category/spec, shielding/material, mount/form factor, gender/pins — 20 points each, 100
 total), awarding 0 for anything not *explicitly* stated in the listing text — no benefit of
-the doubt. It returns up to 3 distinct candidates (different manufacturers, ranked by a
+the doubt. It returns up to 5 distinct candidates (different manufacturers, ranked by a
 balance of match quality and price), or reports no match with a reason if nothing plausible
 was found.
 
@@ -46,8 +46,15 @@ Environment variables that are already set in the shell take precedence over `.e
 ## Usage
 
 ```bash
-# Quick test - 5 built-in sample products, no input file needed
+# Quick test - the 5 built-in products (hand-picked from L-Com's site), no input file needed
 python sourcing_agent.py
+
+# First 10 rows of the spreadsheet plus the 5 built-in products (15 total)
+python sourcing_agent.py --input IE_Top_100_SKU_By_Brand_Results.xlsx --limit 10 --add-builtin
+
+# Re-run specific products only (e.g. after a transient API error). SKUs are looked up in
+# --input and the built-in products; quote any with special characters, e.g. "C&P9M"
+python sourcing_agent.py --input IE_Top_100_SKU_By_Brand_Results.xlsx --sku FOA-020C HG2409U-PRO
 
 # Run against a real product list
 python sourcing_agent.py --input IE_Top_100_SKU_By_Brand_Results.xlsx
@@ -69,6 +76,11 @@ An `.xlsx` file with a header row (anywhere in the first 5 rows) containing at l
 description Claude searches against. Any other columns are ignored. Rows with a blank SKU
 are skipped.
 
+The built-in products live in `PRODUCTS` in `sourcing_agent.py`; fill in their `lcom_price`
+(per unit; the current ones were looked up by hand, see the comments there). `read_lcom_catalog()` is a stub for pulling
+products and prices straight from L-Com's catalog later; while it returns nothing, the
+tool falls back to `PRODUCTS`.
+
 | SKU | Product | Keyword |
 |---|---|---|
 | ECF504-SC6 | Ethernet Cat6 Adapters | Cat6 RJ45 Coupler Shielded (8x8) Panel Mount Style |
@@ -85,7 +97,7 @@ Every run produces three things:
 3. **Excel report** (`sourcing_results_<timestamp>.xlsx`, or `--output` path) - sheet
    `Results`: one row per product (SKU, Product, Keyword, L-Com Unit Price, Recommendation),
    then **Recommended Manufacturer / Email / URL / Unit Price** (filled green - who to buy
-   from; blank and uncoloured when no candidate qualifies), then a `Manufacturer 1/2/3`
+   from; blank and uncoloured when no candidate qualifies), then a `Manufacturer 1-5`
    block each (Name, Accuracy, Listed Price, Unit Price, Unit Price Confidence, vs. L-Com
    Price, MOQ, URL, Email, Match Tier, Comment). Sheet `Comparison`: candidates stacked
    against the L-Com benchmark per product, recommended row in green. Match Tier is
@@ -101,7 +113,11 @@ Every run produces three things:
   the pack size when the description says `Package/N` (L-Com prices those per pack).
 - A unit price more than 10x cheaper than the next-cheapest candidate for the same product
   (`IMPLAUSIBLE_PRICE_RATIO`) is treated as an extraction error. It is marked IMPLAUSIBLE,
-  excluded from the L-Com comparison and never recommended.
+  excluded from the L-Com comparison and never recommended. The check needs at least 3
+  priced candidates - with 2 there's no telling a parsing error from two real prices.
+- Candidates from the same manufacturer (name compared case-insensitively) are collapsed to
+  the highest-scoring one; the freed slot is left empty. Placeholder names ("Unknown",
+  "unnamed", "Generic", "...seller") are exempt, since those are different anonymous sellers.
 - A candidate is recommended only with >= 80% accuracy (`MIN_RECOMMEND_ACCURACY`) and a
   confirmed unit price >= 80% below L-Com (`MIN_MARGIN_PCT` - room for shipping, storage and
   import taxes). Among those, the highest accuracy x margin wins, but a `stated` price beats
@@ -111,11 +127,11 @@ Every run produces three things:
 ## Cost & budget controls
 
 - Model: `claude-haiku-4-5`
-- `MAX_TOOL_CALLS_PER_PRODUCT` (currently 8, in `sourcing_agent.py`) hard-caps tool calls
-  per product across search + extract combined - this is the main cost lever. It's marked
-  in the code as a first guess for finding/verifying 3 candidates instead of 1; tune it
+- `MAX_TOOL_CALLS_PER_PRODUCT` (currently 13, in `sourcing_agent.py`) hard-caps tool calls
+  per product across search + extract combined - this is the main cost lever. It's a first
+  guess for finding up to 5 candidates (`MAX_CANDIDATES`), scaled from 8 for 3; tune it
   based on real batch results.
-- Observed cost so far: roughly **$0.02-0.07 per product** depending on how many tool calls
+- Observed cost with the old 3-candidate / 8-call setup: roughly **$0.02-0.07 per product** depending on how many tool calls
   it takes to find candidates (a clean match with 3 tool calls is cheap; a product needing
   the full 8-call budget costs more). A 100-SKU batch should land somewhere around $2-4.
 - Cost is printed per-product and as a running total at the end of every run - check it on
@@ -127,10 +143,20 @@ Every run produces three things:
   anti-bot throttling) - a "no match" result sometimes means the search pages didn't
   render usable content that run, not that no candidate genuinely exists. Re-running the
   same product can produce a different (often better) result.
+- Every extract call is pinned to `country: "US"`, `locale: "en"` (`EXTRACT_GEO`), since
+  unpinned calls sometimes got other countries' storefronts with prices in foreign currencies.
+- Extracted pages are stripped of menus, filters and non-product link URLs
+  (`strip_page_chrome`) before being cut to `MAX_TOOL_RESULT_CHARS`. Without this,
+  Made-in-China's listings started ~30,000 characters in and Claude only ever saw menus.
 - Individual product detail pages on these sites are unreliable to extract directly and
   often come back empty - Claude is instructed to score primarily off search-page listing
   titles instead, and treat a detail-page extract as optional bonus context only.
 - Supplier email addresses are rarely available from these listing pages (most sites use
   in-platform contact/chat, not public email) - the Email column will usually be blank.
+- Each tool call times out after `TOOL_CALL_TIMEOUT_S` (120s); the model is told and moves on,
+  instead of one hung page freezing the batch.
+- The report and Excel file are saved after every product, so a stopped or crashed run keeps
+  everything finished so far. If the .xlsx is open in Excel, that save is skipped and retried
+  after the next product.
 - This is sequential, one product at a time - a large batch will take a while; there's no
   parallelism yet.

@@ -4,7 +4,7 @@ Competitive sourcing research POC.
 For each product, connects directly to the Nimble MCP server (as an MCP client - not
 Anthropic's server-side MCP connector) and exposes ONLY its search and extract tools to
 Claude. Claude is given a hard budget of tool calls per product, must return a structured
-(schema-enforced) result with up to 3 ranked candidates, and runs on Haiku for cost.
+(schema-enforced) result with up to 5 ranked candidates, and runs on Haiku for cost.
 
 Setup:
     pip install "anthropic[mcp]" pydantic openpyxl python-dotenv
@@ -31,7 +31,7 @@ import httpx2
 import openpyxl
 from dotenv import load_dotenv
 from openpyxl.styles import Font, PatternFill
-from mcp import ClientSession
+from mcp import ClientSession, MCPError
 from mcp.client.streamable_http import streamable_http_client
 from pydantic import BaseModel, ValidationError
 
@@ -62,10 +62,17 @@ SITE_SEARCH_URLS = {
     "made-in-china.com": "https://www.made-in-china.com/products-search/hot-china-products/{query}.html",
 }
 
-MAX_TOOL_CALLS_PER_PRODUCT = 8  # searches + extracts combined, hard cap
-# ^ first guess for finding/verifying 3 distinct candidates instead of 1 - tune based on
-# actual cost/results once tested on a real batch.
+# Pinned on every extract call. Unpinned, pages came back as other countries' storefronts
+# (Korean won, Jamaican dollars, Polish zloty...), leaving prices unusable.
+EXTRACT_GEO = {"country": "US", "locale": "en"}
+
+MAX_CANDIDATES = 5  # distinct manufacturers returned (and shown in Excel) per product
+MAX_TOOL_CALLS_PER_PRODUCT = 13  # searches + extracts combined, hard cap
+# ^ first guess for 5 candidates: scaled up from 8 for 3 (8 x 5/3). Tune on real cost/results.
 MAX_ITERATIONS_PER_PRODUCT = MAX_TOOL_CALLS_PER_PRODUCT + 3  # backstop against loops
+# A single extract once hung for hours and froze a whole batch. Normal pages return in
+# well under a minute; past this the call fails and Claude moves on.
+TOOL_CALL_TIMEOUT_S = 120
 MAX_TOOL_RESULT_CHARS = 2500  # truncate every tool result before it goes back to Claude
 MAX_TOKENS_PER_TURN = 3000
 
@@ -81,12 +88,21 @@ IMPLAUSIBLE_NOTE = (
 )
 MIN_RECOMMEND_ACCURACY = 80
 
+# Hand-picked from L-Com's site. The first two are connector types like the original 10;
+# the last three are untested categories (fiber optic, surge protection, antenna/RF).
+# lcom_price: L-Com's per-unit USD price, looked up by hand from distributor listings.
 PRODUCTS = [
-    {"sku": "ECF504-SC6", "description": "Cat6 RJ45 Coupler Shielded (8x8) Panel Mount Style"},
-    {"sku": "TDG1026KS-C6", "description": "Cat6 Coupler - Shielded RJ45 (8x8) Keystone Feed-thru"},
-    {"sku": "HDFF", "description": "HDMI Panel Mount Adapter, Female to Female"},
-    {"sku": "CAPUSB-A", "description": "USB Protective Cover for Type A Jacks, ABS material"},
-    {"sku": "VIC00001", "description": "DVI 24+5 female to female coupler, bulkhead mount"},
+    # L-Com's own distributor listing on Octopart.
+    {"sku": "ECF504-AA", "description": "Flanged Panel Mounted USB 2.0 Coupler, Shielded, Type A/A Connectors", "lcom_price": 24.79},
+    # LOWER CONFIDENCE: no confirmed L-Com listing found. This is Newark's qty-1 price standing in
+    # for L-Com's own; other distributors range $2.59-$5.60 depending on source/quantity.
+    {"sku": "C&P9M", "description": "Insertion Type D-Sub Connector, DB9 Male", "lcom_price": 3.98},
+    # Graybar's listed L-Com price for this exact SKU.
+    {"sku": "FOA-020C", "description": "LC to SC Simplex Multimode Fiber Optic Adapter", "lcom_price": 63.56},
+    # Newark's qty-1 listed price.
+    {"sku": "LCSP1050", "description": "Coaxial Surge Protector, 18kA, 50 ohm, N-Type F/F Bulkhead, 1 Pole", "lcom_price": 33.04},
+    # Direct reseller listing, consistent across two independent sources.
+    {"sku": "HG2409U-PRO", "description": "2.4 GHz 9dBi Omnidirectional Antenna, N-Female Connector", "lcom_price": 99.00},
 ]
 
 ATTRIBUTES = ["product_type", "category_spec", "shielding_material", "mount_form", "gender_pins"]
@@ -189,8 +205,8 @@ promising listing URL as an optional bonus for more detail, never as required, a
 let an empty/incomplete result there block you from scoring off the search listing text
 you already have.
 
-You have a HARD BUDGET of {MAX_TOOL_CALLS_PER_PRODUCT} tool calls total for this product -
-more than before because you're now finding and verifying up to 3 candidates instead of 1.
+You have a HARD BUDGET of {MAX_TOOL_CALLS_PER_PRODUCT} tool calls total for this product, sized
+for finding and verifying up to {MAX_CANDIDATES} distinct candidates.
 Spend it deliberately: a handful of site-search extracts across different sites/queries to
 surface multiple distinct candidates, plus the occasional individual listing page only if a
 title is genuinely ambiguous on a rubric attribute. Once you've used your budget, or you
@@ -216,18 +232,52 @@ PRICING - for every candidate, work out what quantity the listed price actually 
                 in USD. DO NOT GUESS - mark it ambiguous and say why in unit_price_note.
 Never divide the price yourself; just report price_total and quantity_covered.
 
-Return up to 3 candidates in `candidates`, ranked best first, balancing match quality
+Return up to {MAX_CANDIDATES} candidates in `candidates`, ranked best first, balancing match quality
 against price (a slightly lower match % at a much lower price can rank above a perfect
 match at a high price) - report both numbers per candidate, never silently substitute one
-for the other. Each candidate must be a DIFFERENT manufacturer/supplier - never list 2-3
-listings from the same company just to fill the slots. If you only find 1 or 2 genuinely
+for the other. Each candidate must be a DIFFERENT manufacturer/supplier - never list several
+listings from the same company just to fill the slots. If you only find 1, 2 or 3 genuinely
 distinct, plausible candidates, return only that many - do not force a weak extra pick just
-to reach 3.
+to reach {MAX_CANDIDATES}.
 
 If you find no plausible candidate at all, or every candidate you found scores very low,
 set no_match to true, leave candidates empty, and briefly say why in no_match_reason - do
 not guess or force a weak candidate into looking like a real match.
 """
+
+
+PRICE_PATTERN = re.compile(r"(?:US ?\$|\$)\s?\d")
+LISTING_URL = re.compile(r"/item/|/product-detail/|/product/")  # AliExpress / Alibaba / Made-in-China
+PRE_PRICE_CONTEXT = 400  # chars kept before the first price: the first listing's title/supplier
+
+
+def is_chrome_line(line: str) -> bool:
+    """Menu items, buttons and badges: bullets or 1-3 word lines with no digits (a listing
+    line has a price, a quantity or a long title)."""
+    words = re.sub(r"[*#>`_\\|-]", " ", line).split()
+    return not words or (not re.search(r"\d", line) and (len(words) <= 3 or re.match(r"\s*[*+-]\s", line)))
+
+
+def strip_page_chrome(text: str) -> str:
+    """Cut an extracted search page down to its listings before truncation. Search pages
+    put 1-30k chars of menus, filters and link URLs ahead of the first listing (Made-in-China:
+    listings start ~30,000 chars in), so plain truncation handed Claude nothing but menus."""
+    try:  # Nimble returns {"content": "...markdown..."} - decode so newlines are real
+        text = json.JSONDecoder().raw_decode(text)[0]["content"]
+    except (ValueError, KeyError, TypeError):
+        pass
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)  # images
+    text = re.sub(r"\[\s*\]\([^)]*\)", "", text)  # empty links
+    # Keep URLs only for product listings (the candidate needs one); other links -> their text.
+    text = re.sub(r"\[([^\]]*)\]\(([^)\s]*)\)",
+                  lambda m: f"[{m[1]}]({m[2].split('?')[0]})" if LISTING_URL.search(m[2]) else m[1], text)
+    text = re.sub(r"(?<!\()https?://[^\s)\]]+",
+                  lambda m: m[0].split("?")[0] if LISTING_URL.search(m[0]) else "", text)
+    text = " ".join(line.strip() for line in text.split("\n") if not is_chrome_line(line))
+    # ponytail: "listings start near the first price" - fine for search pages; a page with a
+    # stray $ in its header would keep some chrome, never lose listings.
+    first_price = PRICE_PATTERN.search(text)
+    return text[max(0, first_price.start() - PRE_PRICE_CONTEXT):] if first_price else text
 
 
 def truncate_text(text: str, limit: int = MAX_TOOL_RESULT_CHARS) -> str:
@@ -273,11 +323,21 @@ def make_bounded_tool(tool, session: ClientSession, budget: ToolBudget):
                 f"Tool call budget exhausted ({budget.limit} calls used for this product). "
                 "Stop searching and return your best final answer now."
             )
+        if "extract" in tool_name:
+            kwargs.update(EXTRACT_GEO)  # override whatever the model passed
         print(f"    -> {tool_name}({kwargs})")
-        result = await session.call_tool(name=tool_name, arguments=kwargs)
+        try:
+            result = await session.call_tool(
+                name=tool_name, arguments=kwargs, read_timeout_seconds=TOOL_CALL_TIMEOUT_S
+            )
+        except MCPError as exc:  # timeout or tool-side error: tell Claude, don't hang the batch
+            print(f"    <- FAILED: {exc}")
+            return f"This {tool_name} call failed ({exc}). Try a different page or query, or give your answer."
         text = " ".join(
             block.text for block in result.content if getattr(block, "type", None) == "text"
         )
+        if "extract" in tool_name:
+            text = strip_page_chrome(text)
         print(f"    <- {truncate_text(text, limit=300)}")
         return truncate_text(text)
 
@@ -338,9 +398,33 @@ async def research_once(client: AsyncAnthropic, session: ClientSession, tools, p
         text = " ".join(block.text for block in last_message.content if block.type == "text")
         try:
             parsed = SourcingResult.model_validate_json(text)
+            # Strict mode can't enforce maxItems, so enforce it here: Excel has MAX_CANDIDATES blocks.
+            parsed.candidates = dedupe_manufacturers(parsed.candidates)[:MAX_CANDIDATES]
         except ValidationError:
             parsed = None
     return parsed, total_in, total_out, budget.used
+
+
+# Names the model uses when a listing doesn't name its maker. Two of these are different
+# anonymous sellers, not one manufacturer, so they're exempt from dedup.
+# ponytail: keyword list, extend when a new placeholder wording shows up.
+PLACEHOLDER_MANUFACTURER = re.compile(r"unknown|unnamed|generic|not stated|unbranded|seller", re.IGNORECASE)
+
+
+def dedupe_manufacturers(candidates: list) -> list:
+    """Keep only the highest-scoring candidate per manufacturer (case-insensitive,
+    trimmed), preserving rank order. No backfill - fewer candidates is the right answer."""
+    def key(c):
+        name = (c.manufacturer or "").strip().lower()
+        return None if not name or PLACEHOLDER_MANUFACTURER.search(name) else name
+
+    best = {}
+    for i, c in enumerate(candidates):
+        k = key(c)
+        if k is not None and (k not in best or
+                              (candidate_score(c)[0] or 0) > (candidate_score(candidates[best[k]])[0] or 0)):
+            best[k] = i
+    return [c for i, c in enumerate(candidates) if key(c) is None or best[key(c)] == i]
 
 
 def is_garbled(result: Optional[SourcingResult]) -> bool:
@@ -428,9 +512,14 @@ def format_unit(unit: Optional[float]) -> str:
 
 def implausible_units(result: Optional[SourcingResult]) -> set:
     """Indices of candidates whose unit price is > IMPLAUSIBLE_PRICE_RATIO x cheaper than
-    the next-cheapest candidate for the same product."""
+    the next-cheapest candidate for the same product. Needs >= 3 priced candidates: with
+    only 2, "one is a parsing error" and "two different real prices" look the same."""
     units = [unit_price(c) for c in (result.candidates if result else [])]
     suspect = set()
+    # ponytail: a 2-candidate product with a real parsing error now goes unflagged; add an
+    # absolute floor (e.g. vs L-Com's price) if that shows up in practice.
+    if sum(u is not None for u in units) < 3:
+        return suspect
     for i, u in enumerate(units):
         others = [x for j, x in enumerate(units) if j != i and x is not None]
         if u is not None and others and u * IMPLAUSIBLE_PRICE_RATIO < min(others):
@@ -666,7 +755,7 @@ def write_excel_report(rows: list, path: str) -> None:
     comp = wb.create_sheet("Comparison")
 
     header = PRODUCT_XLSX_FIELDS + RECOMMENDED_XLSX_FIELDS
-    for n in (1, 2, 3):
+    for n in range(1, MAX_CANDIDATES + 1):
         header += [f"Manufacturer {n} {field}" for field in CANDIDATE_XLSX_FIELDS]
     ws.append(header)
     comp.append(["SKU", "Candidate", "Manufacturer", "Accuracy", "Unit Price", "Unit Price Confidence",
@@ -682,7 +771,7 @@ def write_excel_report(rows: list, path: str) -> None:
         else:
             rec = candidates[rec_idx]
             row += [rec.manufacturer or "", rec.email or "", rec.url or "", round(unit_price(rec), 4)]
-        for i in range(3):
+        for i in range(MAX_CANDIDATES):
             if i < len(candidates):
                 c = candidates[i]
                 computed, scores = candidate_score(c)
@@ -775,10 +864,48 @@ async def connect_tools(nimble_api_key: str):
     return http_client
 
 
+def read_lcom_catalog(source: Optional[str] = None) -> list:
+    """Future input path: L-Com's own catalog -> product dicts shaped like PRODUCTS /
+    read_products(): {"sku", "description", "product_name", "lcom_price"} (per-unit USD).
+
+    TODO: implement. Fetch or parse L-Com's catalog (their category/listing pages, or a
+    bulk export if one exists) and extract SKU, name, description and price per product.
+    Watch for pack-priced SKUs ("Package/N") - divide to a per-unit price like read_products().
+    Stubbed for now: no scraper exists yet (l-com.com renders search results with
+    JavaScript, so a plain fetch doesn't see them) and the product list is still curated
+    by hand. Returns [] so callers fall back to PRODUCTS.
+    """
+    return []
+
+
+def pick_skus(products: list, skus: list) -> tuple:
+    """(products whose SKU is in `skus`, in the order asked, first match wins; SKUs not found).
+    Case-insensitive - for re-running specific products, e.g. after a transient API error."""
+    by_sku = {}
+    for p in products:
+        by_sku.setdefault(p["sku"].strip().upper(), p)
+    picked, missing = [], []
+    for s in dict.fromkeys(s.strip().upper() for s in skus):
+        if s in by_sku:
+            picked.append(by_sku[s])
+        else:
+            missing.append(s)
+    return picked, missing
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Competitive sourcing research POC")
     parser.add_argument(
-        "--input", help="Path to an .xlsx with SKU/Product/Keyword columns. Defaults to 5 built-in sample products."
+        "--input", help="Path to an .xlsx with SKU/Product/Keyword columns. Defaults to the built-in products."
+    )
+    parser.add_argument(
+        "--add-builtin", action="store_true",
+        help="Also run the built-in products after the --input ones (applied after --limit).",
+    )
+    parser.add_argument(
+        "--sku", nargs="+", metavar="SKU",
+        help="Only run these SKUs (case-insensitive), looked up in --input and the built-in products. "
+             "Ignores --limit. Quote SKUs with special characters, e.g. \"C&P9M\".",
     )
     parser.add_argument("--output", help="Path for the .xlsx results file. Defaults to a timestamped filename.")
     parser.add_argument("--limit", type=int, help="Only process the first N products (for a quick/cheap test run).")
@@ -802,9 +929,19 @@ async def main_async():
         print("  NIMBLE_API_KEY=...")
         sys.exit(1)
 
-    products = read_products(args.input) if args.input else PRODUCTS
-    if args.limit:
-        products = products[: args.limit]
+    builtin = read_lcom_catalog() or PRODUCTS
+    products = read_products(args.input) if args.input else builtin
+    if args.sku:
+        products, missing = pick_skus(products + (builtin if args.input else []), args.sku)
+        if missing:
+            print(f"SKU(s) not found in {args.input or 'the built-in products'} or the built-in list: {', '.join(missing)}")
+            if not products:
+                sys.exit(1)
+    else:
+        if args.limit:
+            products = products[: args.limit]
+        if args.input and args.add_builtin:
+            products = products + builtin
     if not products:
         print(f"No products found in {args.input} - check it has a 'SKU' header column.")
         sys.exit(1)
@@ -851,6 +988,10 @@ async def main_async():
                 grand_in, grand_out, grand_cost = 0, 0, 0.0
                 report_sections = []
                 excel_rows = []
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                report_path = f"sourcing_report_{timestamp}.md"
+                excel_path = args.output or f"sourcing_results_{timestamp}.xlsx"
+                print(f"Saving results after every product to {report_path} / {excel_path}")
 
                 for idx, product in enumerate(products, start=1):
                     print(f"\nProduct {idx} of {len(products)}: {product['sku']} ...")
@@ -877,6 +1018,13 @@ async def main_async():
                             f"**Error researching this product:** {exc}\n"
                         )
                         excel_rows.append((product, None))
+                    # Save after every product so a crash or stop keeps everything finished so far.
+                    flags = ambiguous_price_flags(excel_rows)
+                    try:
+                        write_report(report_sections, grand_in, grand_out, grand_cost, len(products), report_path, flags)
+                        write_excel_report(excel_rows, excel_path)
+                    except OSError as exc:  # e.g. the .xlsx is open in Excel - retry on the next product
+                        print(f"  Could not save results yet ({exc}) - will retry after the next product.")
 
                 print("-" * 72)
                 print(
@@ -884,17 +1032,10 @@ async def main_async():
                     f"Estimated total cost: ~${grand_cost:.4f}"
                 )
 
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                report_path = f"sourcing_report_{timestamp}.md"
-                flags = ambiguous_price_flags(excel_rows)
-                write_report(report_sections, grand_in, grand_out, grand_cost, len(products), report_path, flags)
                 if flags:
                     print("Unit prices that could not be determined confidently:")
                     print("\n".join(flags))
                 print(f"Report written to: {os.path.abspath(report_path)}")
-
-                excel_path = args.output or f"sourcing_results_{timestamp}.xlsx"
-                write_excel_report(excel_rows, excel_path)
                 print(f"Excel results written to: {os.path.abspath(excel_path)}")
 
 

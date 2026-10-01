@@ -118,10 +118,49 @@ Every run produces three things:
 - Candidates from the same manufacturer (name compared case-insensitively) are collapsed to
   the highest-scoring one; the freed slot is left empty. Placeholder names ("Unknown",
   "unnamed", "Generic", "...seller") are exempt, since those are different anonymous sellers.
+- A listing of a different product form (a cable when the target is a coupler, a multi-port
+  variant, a different connector class) is excluded outright: Claude reports
+  `same_product_form` / `listing_form` per candidate and its accuracy is zeroed. For coupler
+  and adapter targets, code also excludes any listing whose title gives a cable length
+  ("50cm", "1.5m") or says cable/cord without a part word (`apply_form_rules`), since the
+  model's own call was inconsistent. Mount style (inline vs panel vs keystone) is scored in
+  `mount_form`, not treated as a different product: for coupler targets, code keeps an inline
+  coupler the model excluded, as long as it shows the target's connector type, has no cable
+  signs and isn't a multi-port variant.
+- Antennas: a dual-band, multi-band, "2way", MIMO or multi-port listing against a
+  single-band, single-port target gets 0 on category/spec (prompt rule plus
+  `apply_spec_rules` in code), so it can't win on one matching band.
+- Each recommendation carries a **Check before ordering** note when the listing text calls
+  for one (`ordering_notes`): the title names a different variant (VGA/DB15 for a DB9 target,
+  RJ11 for RJ45, Micro/Mini/Type-C USB, single- vs multimode fiber), one listing covers
+  several models or options (MC-6BP/MC-6BR, simplex/duplex, male/female), the price needs an
+  order of `BULK_MOQ_NOTE` (500)+ pieces, a promo or unattached pack size, plus Claude's own
+  `listing_caveats`. MOQ/tier remarks are taken out of those caveats, but any quantity in
+  them still goes through the 500 check (the model sometimes states an MOQ only there). It appears under the Recommendation line in the report and in the
+  amber **Ordering Note** column in Excel. The 500 threshold is a stopgap until we have a
+  real order quantity per SKU.
+- A quantity above 1 only divides the price when that number appears next to a pack word in
+  the title or price text (`pack_size_supported`); otherwise the price is per piece. This
+  stops MOQs being used as pack sizes (HDFF's $0.0032, Suzhou Bulovb's $0.0688).
+- AliExpress new-shopper prices ("$1.09 $5.77 -81% New shoppers save…") are replaced by the
+  regular price; if none is shown the price is marked `promo (regular price unknown)`. Code
+  backs this up (`apply_price_rules`): when the price used is the promo amount the model
+  itself described, it's swapped for the stated regular price or labelled promo.
+- The implausible-price check compares only against stated/inferred prices (never promo), and
+  also flags any candidate whose model caveat says the price looks unusually low.
+- Cable detection also counts phrases that describe the item as a cable even next to
+  "adapter"/"connector" ("printer data cable", "extension cable", "ferrite", "24AWG",
+  "PVC jacket"); broader ones like "Ethernet Cable" are left out because couplers name the
+  cable they connect to.
 - A candidate is recommended only with >= 80% accuracy (`MIN_RECOMMEND_ACCURACY`) and a
   confirmed unit price >= 80% below L-Com (`MIN_MARGIN_PCT` - room for shipping, storage and
-  import taxes). Among those, the highest accuracy x margin wins, but a `stated` price beats
-  an `inferred` one at equal or better accuracy. Otherwise the report says not to source.
+  import taxes). If several qualify, the most accurate wins; among those within 5 points of it
+  (`TIE_BAND_POINTS`): a `stated` price first (then inferred, then promo), then a named
+  maker, then the lowest price. Otherwise the message names the bar that failed:
+  product form, accuracy only, price margin only, or both. Missing rubric scores are reported
+  as "scoring failed", never as a margin problem.
+- The per-product score line in the report is built from the same scores as the table; the
+  model no longer writes a free-text note.
 - `python test_pricing.py` runs an offline check of this logic.
 
 ## Cost & budget controls
@@ -153,10 +192,21 @@ Every run produces three things:
   titles instead, and treat a detail-page extract as optional bonus context only.
 - Supplier email addresses are rarely available from these listing pages (most sites use
   in-platform contact/chat, not public email) - the Email column will usually be blank.
-- Each tool call times out after `TOOL_CALL_TIMEOUT_S` (120s); the model is told and moves on,
-  instead of one hung page freezing the batch.
+- Each tool call times out after `TOOL_CALL_TIMEOUT_S` (60s, no retry); the model is told and
+  moves on, instead of one hung page freezing the batch. In the 2026-09-28 baseline, 145 of 147
+  successful extracts finished within 60s.
+- Up to `MAX_CONCURRENT_PRODUCTS` (3) products are researched at once; every progress line is
+  prefixed with its `[SKU]`. Anthropic 429/529/5xx errors are retried by the SDK with
+  exponential backoff (`ANTHROPIC_MAX_RETRIES`), Nimble rate limits by the tool wrapper
+  (`NIMBLE_RATE_LIMIT_RETRIES`); both counts are printed at the end of a run. Lower the
+  concurrency if they climb.
+- With `PREFETCH_SITE_SEARCHES` on, each product's three site searches (description as the
+  query) run at the same time in code before Claude starts; they count as 3 of the product's
+  tool calls. `PREFETCH_STAGGER_S` spaces their starts out if a site throttles.
+- Each run ends with a timing summary: wall-clock time, Nimble vs Anthropic share, timeouts,
+  peak simultaneous Nimble calls, Nimble latency and timeouts per site, and why each product
+  stopped (found 5 candidates / budget used up, with failed-call counts / model stopped early).
 - The report and Excel file are saved after every product, so a stopped or crashed run keeps
   everything finished so far. If the .xlsx is open in Excel, that save is skipped and retried
   after the next product.
-- This is sequential, one product at a time - a large batch will take a while; there's no
-  parallelism yet.
+- Within one product, tool calls still run one after another.

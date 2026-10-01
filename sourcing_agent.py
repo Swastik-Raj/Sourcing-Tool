@@ -20,11 +20,17 @@ Run:
 
 import argparse
 import asyncio
+import collections
+import contextvars
 import json
+import logging
+import math
 import os
 import re
 import sys
+import time
 from datetime import datetime
+from urllib.parse import urlparse
 from typing import Literal, Optional
 
 import httpx2
@@ -34,6 +40,7 @@ from openpyxl.styles import Font, PatternFill
 from mcp import ClientSession, MCPError
 from mcp.client.streamable_http import streamable_http_client
 from pydantic import BaseModel, ValidationError
+from pydantic.json_schema import SkipJsonSchema
 
 from anthropic import AsyncAnthropic
 from anthropic.lib.tools import beta_async_tool
@@ -70,9 +77,20 @@ MAX_CANDIDATES = 5  # distinct manufacturers returned (and shown in Excel) per p
 MAX_TOOL_CALLS_PER_PRODUCT = 13  # searches + extracts combined, hard cap
 # ^ first guess for 5 candidates: scaled up from 8 for 3 (8 x 5/3). Tune on real cost/results.
 MAX_ITERATIONS_PER_PRODUCT = MAX_TOOL_CALLS_PER_PRODUCT + 3  # backstop against loops
-# A single extract once hung for hours and froze a whole batch. Normal pages return in
-# well under a minute; past this the call fails and Claude moves on.
-TOOL_CALL_TIMEOUT_S = 120
+# A single extract once hung for hours and froze a whole batch. Baseline (2026-09-28):
+# 145 of 147 successful extracts finished within 60s, while the 8 calls that hit the old
+# 120s limit cost 16 of 64 minutes. Past this the call fails (no retry) and Claude moves on.
+TOOL_CALL_TIMEOUT_S = 60
+# Products researched at once. Nimble waits were 86% of the baseline's time and everything
+# ran one at a time. Lower this if the rate-limit retry counts at the end of a run climb.
+MAX_CONCURRENT_PRODUCTS = 3
+# Stage 2: run the three site searches for a product at the same time, in code, before Claude
+# starts (they were always its first 3 calls, one after another). They go through the normal
+# tool wrapper, so each counts against MAX_TOOL_CALLS_PER_PRODUCT (3 of 13 used up front).
+PREFETCH_SITE_SEARCHES = True
+PREFETCH_STAGGER_S = 0.0  # delay between the three starts, if Alibaba throttles simultaneous requests
+ANTHROPIC_MAX_RETRIES = 5  # SDK retries 429/529/5xx itself with exponential backoff
+NIMBLE_RATE_LIMIT_RETRIES = 3  # backoff 2s, 4s, 8s on a Nimble rate-limit response
 MAX_TOOL_RESULT_CHARS = 2500  # truncate every tool result before it goes back to Claude
 MAX_TOKENS_PER_TURN = 3000
 
@@ -83,9 +101,13 @@ MIN_MARGIN_PCT = 80  # 30% got eaten by shipping, storage and import taxes
 # product is treated as an extraction error (e.g. price divided by MOQ), not a bargain.
 IMPLAUSIBLE_PRICE_RATIO = 10
 IMPLAUSIBLE_NOTE = (
-    "unit price implausible relative to other candidates for this product - "
-    "likely extraction error, verify manually before ordering"
+    "unit price implausible (far below the other candidates, or flagged as unusually low by the "
+    "model) - likely extraction error or wrong listing, verify manually before ordering"
 )
+# The model's own "this price looks wrong" caveat. Fired once across every run through 29 Sep:
+# the $0.11 UABS "adapter" that was really a printer cable.
+LOW_PRICE_WARNING = re.compile(r"unusually low|suspicious|too (?:low|cheap|good)|verify (?:the |actual )?price|"
+                               r"price (?:seems|looks|may be) (?:off|wrong|incorrect)", re.IGNORECASE)
 MIN_RECOMMEND_ACCURACY = 80
 
 # Hand-picked from L-Com's site. The first two are connector types like the original 10;
@@ -120,18 +142,43 @@ audit). Five attributes, weighted 20 points each, for a 100-point total:
 
 1. product_type (0-20) - is the listed item fundamentally the same kind of product?
 2. category_spec (0-20) - category/performance rating match (e.g. Cat5e vs Cat6 vs Cat6a,
-   or the equivalent spec/performance class for this product type).
+   or the equivalent spec/performance class for this product type). For antennas this
+   covers frequency, gain AND band/port configuration: a dual-band, multi-band, "2way",
+   MIMO or multi-port listing is a different product from a single-band, single-port target
+   and scores 0 here, even if one of its bands matches.
 3. shielding_material (0-20) - shielding and/or material match.
-4. mount_form (0-20) - mount/form factor match (e.g. panel mount, keystone feed-thru,
-   bulkhead mount).
+4. mount_form (0-20) - mount/form factor match. Mount wording differs by category:
+   connectors - panel mount, bulkhead, keystone feed-thru; antennas - pole/mast mount,
+   wall mount, magnetic base; surge protectors - bulkhead, DIN rail, ground plate.
 5. gender_pins (0-20) - gender/pin configuration match (e.g. female-to-female), or the
-   equivalent connector-orientation attribute for non-connector products. If a product
-   type genuinely has no equivalent attribute, score it 0 - nothing was confirmed.
+   equivalent connector-orientation attribute for non-connector products.
 
 CRITICAL RULE: award 0 points for any attribute the candidate listing's own text does not
 explicitly state. Do not infer or assume a match from category context, product photos, or
 "typical" industry defaults - only credit what the listing text actually says. No benefit
-of the doubt. match_percent must equal the sum of the five scores.
+of the doubt. The converse also holds: if the listing explicitly states the attribute (e.g.
+"Pole Mount") and it does not contradict the target, award the points - even when the target
+description itself doesn't specify that attribute. match_percent must equal the sum of the
+five scores, and every candidate MUST include attribute_breakdown.
+
+PRODUCT FORM (separate from the score): set same_product_form to false when the listing is
+a fundamentally different product form from the target - a cable, cord, lead or extension
+(anything with a length of cable) when the target is an adapter/coupler/connector, or vice
+versa; a multi-port variant of a single-port target; a different connector class (USB-B vs
+USB-C, RJ45 vs RJ11, N vs SMA). A listing whose title says "cable", "cord" or gives a length
+(50cm, 1.5m, 6ft) is a cable even if it also says "adapter" or "coupler". Mount style is NOT a
+form difference: inline, keystone, bulkhead and panel-mount couplers are the same form -
+score that difference in mount_form instead. Apply this the same way for every product. listing_form: 2-5
+words for what the listing physically is (e.g. "patch cable with coupler end", "panel
+mount coupler"). Candidates with same_product_form false are never recommended.
+
+moq: whenever the listing shows a minimum order ("Min. order: 500 pieces", "100 Pieces (MOQ)"),
+put it here - don't leave it "Not stated" and mention it only elsewhere.
+
+listing_caveats: one short line on anything a buyer should check before ordering - the
+listing covers several models or variants, its title names a different pin count, connector
+or spec than the target, a material or mounting detail that differs from the target. Leave
+MOQ and quantity-tier pricing out (that goes in moq and price). "" if none.
 """
 
 
@@ -153,21 +200,29 @@ class Candidate(BaseModel):
     # 0 / "" mean "unknown".
     price_total: float  # numeric USD amount that `price` covers
     quantity_covered: int  # how many units price_total buys
-    unit_price_confidence: Literal["stated", "inferred", "ambiguous"]
+    unit_price_confidence: Literal["stated", "inferred", "promo (regular price unknown)", "ambiguous"]
     unit_price_note: str
+    same_product_form: bool  # false = different form (e.g. a cable vs a coupler): never recommended
+    listing_form: str  # what the listing physically is, e.g. "patch cable with coupler end"
+    listing_caveats: str  # the model's "check before ordering" line, "" if none
+    # Filled by code after parsing (e.g. a score it overrode); kept out of the schema Claude sees.
+    code_notes: SkipJsonSchema[list[str]] = []
     moq: Optional[str] = None
     email: Optional[str] = None
     match_percent: Optional[int] = None
-    attribute_breakdown: Optional[AttributeBreakdown] = None
+    # Required: when it was optional the model once skipped it for every HDFF candidate,
+    # which then read as "not enough margin" instead of "scoring failed".
+    attribute_breakdown: AttributeBreakdown
     url: Optional[str] = None
 
 
 class SourcingResult(BaseModel):
+    # No free-text notes: the model's own note restated scores that drifted from the table.
+    # The report builds its summary from the scores instead (score_summary).
     product: str
     no_match: bool
     no_match_reason: Optional[str] = None
     candidates: list[Candidate] = []
-    note: Optional[str] = None
 
 
 def build_prompt(product: dict) -> str:
@@ -217,12 +272,21 @@ give must be the final structured result, nothing else.
 {RUBRIC_INSTRUCTIONS}
 
 PRICING - for every candidate, work out what quantity the listed price actually buys:
-- price: the raw price text exactly as shown on the listing.
+- price: the raw price text exactly as shown on the listing, including any regular /
+  struck-through price and promo wording next to it.
 - price_total: that price as a number in USD. If a range is shown, use the HIGHER end.
   0 if no price is shown.
+- PROMO PRICES: AliExpress often shows a one-time new-shopper price with the regular price
+  right after it, e.g. "$1.09 $5.77 -81% New shoppers save $4.68" - $1.09 is the promo,
+  $5.77 the real price. Whenever promo wording appears ("new shoppers", "new user", "welcome
+  deal", "first order", "with coupon", "marked down from"), use the REGULAR price as
+  price_total. If the regular price is not shown, set unit_price_confidence to
+  "promo (regular price unknown)".
 - quantity_covered: how many units price_total buys (e.g. "$0.33 / piece" -> 1;
-  "$19.75 ... (10PCS)" or "pack of 10" -> 10). 0 if unknown. The MOQ / minimum order is
-  NOT quantity_covered: "$1.27-1.58, Min. order 500 pieces" is a per-piece price (-> 1).
+  "$19.75 ... (10PCS)" or "pack of 10" -> 10). 0 if unknown. Only use a number above 1 when
+  the listing states a pack/set/lot size attached to THAT price. The MOQ / minimum order is
+  NOT quantity_covered: "$1.27-1.58, Min. order 500 pieces" and "US$0.99-6.88, 100 Pieces
+  (MOQ)" are per-piece prices (-> 1).
 - unit_price_note: one short line on how you read the quantity ("" if obvious).
 - unit_price_confidence:
   "stated"    - the listing explicitly says per piece/unit, or explicitly states the pack size.
@@ -312,7 +376,46 @@ def pick_tool(tools, exact_names, contains, excludes=("agent", "template", "craw
     return None
 
 
-def make_bounded_tool(tool, session: ClientSession, budget: ToolBudget):
+# Products run concurrently, so every progress line is tagged with its product's SKU.
+CURRENT_SKU = contextvars.ContextVar("sku", default="")
+
+
+def log(message: str = "") -> None:
+    sku = CURRENT_SKU.get()
+    print(f"[{sku}] {message}" if sku else message)
+
+
+class _RetryCounter(logging.Handler):
+    """Counts the Anthropic SDK's own retry log lines ("Retrying due to status code 429")."""
+    def emit(self, record):
+        m = re.search(r"status code (\d+)", record.getMessage())
+        if m:
+            ANTHROPIC_RETRIES[m[1]] += 1
+
+
+ANTHROPIC_RETRIES = collections.Counter()
+NIMBLE_RATE_LIMITS = {"count": 0}
+_sdk_log = logging.getLogger("anthropic")
+_sdk_log.setLevel(logging.DEBUG)
+_sdk_log.propagate = False  # count, don't print
+_sdk_log.addHandler(_RetryCounter())
+
+
+def is_rate_limited(message: str) -> bool:
+    return bool(re.search(r"\b429\b|rate.?limit|too many requests", message, re.IGNORECASE))
+
+
+# Timing instrumentation: one row per Nimble call, one per product (see timing_summary).
+CALL_LOG = []  # {"sku", "tool", "site", "url", "start", "secs", "outcome"}
+PRODUCT_LOG = []  # {"sku", "secs", "calls"}
+
+
+def site_of(url: str) -> str:
+    host = urlparse(url or "").netloc
+    return next((s for s in SOURCING_SITES if s.split(".")[0] in host), host or "-")
+
+
+def make_bounded_tool(tool, session: ClientSession, budget: ToolBudget, sku: str = "-"):
     tool_name = tool.name
     input_schema = getattr(tool, "input_schema", None) or getattr(tool, "inputSchema", None)
     description = (tool.description or "")[:600]
@@ -325,20 +428,44 @@ def make_bounded_tool(tool, session: ClientSession, budget: ToolBudget):
             )
         if "extract" in tool_name:
             kwargs.update(EXTRACT_GEO)  # override whatever the model passed
-        print(f"    -> {tool_name}({kwargs})")
+        log(f"    -> {tool_name}({kwargs})")
+        row = {"sku": sku, "tool": tool_name, "site": site_of(kwargs.get("url")), "url": kwargs.get("url"),
+               "start": time.monotonic(), "outcome": "ok"}
         try:
-            result = await session.call_tool(
-                name=tool_name, arguments=kwargs, read_timeout_seconds=TOOL_CALL_TIMEOUT_S
-            )
+            for attempt in range(NIMBLE_RATE_LIMIT_RETRIES + 1):
+                try:
+                    result = await session.call_tool(
+                        name=tool_name, arguments=kwargs, read_timeout_seconds=TOOL_CALL_TIMEOUT_S
+                    )
+                    error_text = " ".join(getattr(b, "text", "") for b in result.content) if result.is_error else ""
+                except MCPError as exc:
+                    if attempt == NIMBLE_RATE_LIMIT_RETRIES or not is_rate_limited(str(exc)):
+                        raise
+                    error_text = str(exc)
+                if not (error_text and is_rate_limited(error_text)) or attempt == NIMBLE_RATE_LIMIT_RETRIES:
+                    break
+                NIMBLE_RATE_LIMITS["count"] += 1
+                log(f"    Nimble rate-limited - retrying in {2 ** (attempt + 1)}s")
+                await asyncio.sleep(2 ** (attempt + 1))
         except MCPError as exc:  # timeout or tool-side error: tell Claude, don't hang the batch
-            print(f"    <- FAILED: {exc}")
+            row["outcome"] = "timeout" if "timed out" in str(exc).lower() else "error"
+            log(f"    <- FAILED after {time.monotonic() - row['start']:.1f}s: {exc}")
             return f"This {tool_name} call failed ({exc}). Try a different page or query, or give your answer."
+        except Exception as exc:
+            # A bug in this wrapper would otherwise reach Claude as a silent "tool error" on every
+            # call (a whole run once returned 0 candidates that way). Make it loud.
+            row["outcome"] = "error"
+            log(f"    <- WRAPPER BUG: {type(exc).__name__}: {exc}")
+            raise
+        finally:
+            row["secs"] = time.monotonic() - row["start"]
+            CALL_LOG.append(row)
         text = " ".join(
             block.text for block in result.content if getattr(block, "type", None) == "text"
         )
         if "extract" in tool_name:
             text = strip_page_chrome(text)
-        print(f"    <- {truncate_text(text, limit=300)}")
+        log(f"    <- ({row['secs']:.1f}s) {truncate_text(text, limit=300)}")
         return truncate_text(text)
 
     return beta_async_tool(call, name=tool_name, description=description, input_schema=input_schema)
@@ -370,9 +497,36 @@ def usage_tokens(message) -> tuple:
     return usage.input_tokens or 0, usage.output_tokens or 0
 
 
+def site_search_url(site: str, text: str) -> str:
+    """The site's own search page for `text` (the same URL shapes the prompt describes)."""
+    words = re.findall(r"[A-Za-z0-9]+", text)
+    return SITE_SEARCH_URLS[site].format(query=("_" if site == "made-in-china.com" else "+").join(words))
+
+
+async def prefetch_site_searches(runner_tools: list, product: dict) -> str:
+    """All three site searches at once, through the budgeted extract wrapper."""
+    extract = next(t for t in runner_tools if "extract" in t.name)
+
+    async def one(i: int, site: str):
+        await asyncio.sleep(i * PREFETCH_STAGGER_S)
+        url = site_search_url(site, product["description"])
+        return site, url, await extract.call({"url": url, "driver": "vx8"})
+
+    pages = await asyncio.gather(*(one(i, site) for i, site in enumerate(SOURCING_SITES)))
+    return "\n\n".join(f"=== {site} search results ({url}) ===\n{text}" for site, url, text in pages)
+
+
 async def research_once(client: AsyncAnthropic, session: ClientSession, tools, product: dict):
     budget = ToolBudget(MAX_TOOL_CALLS_PER_PRODUCT)
-    runner_tools = [make_bounded_tool(t, session, budget) for t in tools]
+    runner_tools = [make_bounded_tool(t, session, budget, product['sku']) for t in tools]
+    prompt = build_prompt(product)
+    if PREFETCH_SITE_SEARCHES:
+        prompt += (
+            f"\nALREADY FETCHED: the first search on each site was run for you with the product "
+            f"description as the query - that used 3 of your {MAX_TOOL_CALLS_PER_PRODUCT} tool calls. "
+            "Don't repeat these searches; spend the rest on different queries or listing pages.\n\n"
+            + await prefetch_site_searches(runner_tools, product)
+        )
 
     runner = client.beta.messages.tool_runner(
         model=MODEL,
@@ -382,7 +536,7 @@ async def research_once(client: AsyncAnthropic, session: ClientSession, tools, p
         output_config={
             "format": {"type": "json_schema", "schema": strict_json_schema(SourcingResult)}
         },
-        messages=[{"role": "user", "content": build_prompt(product)}],
+        messages=[{"role": "user", "content": prompt}],
     )
 
     total_in, total_out = 0, 0
@@ -400,6 +554,9 @@ async def research_once(client: AsyncAnthropic, session: ClientSession, tools, p
             parsed = SourcingResult.model_validate_json(text)
             # Strict mode can't enforce maxItems, so enforce it here: Excel has MAX_CANDIDATES blocks.
             parsed.candidates = dedupe_manufacturers(parsed.candidates)[:MAX_CANDIDATES]
+            apply_form_rules(parsed, product)
+            apply_spec_rules(parsed, product)
+            apply_price_rules(parsed)
         except ValidationError:
             parsed = None
     return parsed, total_in, total_out, budget.used
@@ -409,6 +566,138 @@ async def research_once(client: AsyncAnthropic, session: ClientSession, tools, p
 # anonymous sellers, not one manufacturer, so they're exempt from dedup.
 # ponytail: keyword list, extend when a new placeholder wording shows up.
 PLACEHOLDER_MANUFACTURER = re.compile(r"unknown|unnamed|generic|not stated|unbranded|seller", re.IGNORECASE)
+
+
+# The model's same_product_form call was inconsistent (2026-09-28: kept a "50cm ... Adapter
+# Cable" for ECF504-UABS, excluded plain inline couplers for ECF504-SC6). A stated length,
+# or cable/cord with no part word in the title, marks a cable - 9 of 9 hits across three past
+# runs were real cables, 0 false positives. Only applied when the target is a coupler/adapter.
+CABLE_LENGTH = re.compile(r"\b\d+(?:\.\d+)?\s*(?:cm|m|ft|feet|foot|meters?|metres?|inch(?:es)?)\b", re.IGNORECASE)
+CABLE_WORD = re.compile(r"\b(?:cable|cord)s?\b", re.IGNORECASE)
+PART_WORD = re.compile(r"\b(?:coupler|adapter|adaptor|connector|jack|socket|plug|coupling|joiner|keystone|feed.?thr(?:u|ough))s?\b", re.IGNORECASE)
+
+
+# Phrases that describe the item itself as a cable, so they count even when "adapter" or
+# "connector" is also in the title - the part-word exemption let "USB 2.0 ... Printer Data
+# Cable Adapter with a Male to B Male ... Magnetic Ring" through as an adapter (UABS, 2026-09-29,
+# $0.11). Checked on 286 past titles: 15 hits, all real cables. Broader phrases ("Ethernet
+# Cable", "Patch Cord") also hit couplers that name the cable they connect, so they're left out.
+STRONG_CABLE = re.compile(r"\b(?:data|printer|scanner|extension|charging|charger|sync|patch)\s+(?:data\s+)?cables?\b"
+                          r"|\bferrite\b|\bmagnetic ring\b|\b\d+\s*awg\b|\bpvc jacket\b", re.IGNORECASE)
+
+
+def cable_evidence(title: str) -> str:
+    if CABLE_LENGTH.search(title):
+        return f"length {CABLE_LENGTH.search(title)[0].strip()} in title"
+    if STRONG_CABLE.search(title):
+        return f"\"{STRONG_CABLE.search(title)[0]}\" in title"
+    if CABLE_WORD.search(title) and not PART_WORD.search(title):
+        return "titled as a cable"
+    return ""
+
+
+INLINE_COUPLER = re.compile(r"\bin[\s-]?line\b.*\bcoupl|\bcoupl\w*\b.*\bin[\s-]?line\b", re.IGNORECASE)
+MULTI_PORT = re.compile(r"\b\d+\s*-?\s*(?:port|way|gang)s?\b|\b(?:dual|quad|multi)\b", re.IGNORECASE)
+CONNECTOR_TOKENS = re.compile(r"\b(?:rj45|rj11|rj12|usb|hdmi|dvi|vga|displayport|db9|db25|d-?sub|lc|sc|st|fc|"
+                              r"n-?type|sma|bnc|f-?type)\b", re.IGNORECASE)
+
+
+def apply_form_rules(result: SourcingResult, product: dict) -> None:
+    """Deterministic product-form calls where the model was inconsistent across similar
+    products (2026-09-28 runs), applied only when the target is a coupler/adapter:
+    - cables are excluded: a stated length or cable/cord with no part word in the title
+      (kept a "50cm ... Adapter Cable" for ECF504-UABS);
+    - inline couplers are the same form as a panel-mount/keystone coupler target, left to
+      mount_form to score (SC5E excluded one, SC6 and TDG1026KS-C6 kept one). Only when
+      the listing shows the target's connector type and isn't a multi-port variant."""
+    target = product.get("description", "")
+    if not re.search(r"coupler|adapter|adaptor", target, re.IGNORECASE) or CABLE_WORD.search(target):
+        return
+    def connectors(text):  # Cat5e/Cat6/Cat6a/Cat7 couplers are RJ45 even when a title doesn't say so
+        found = {t.lower().replace("-", "") for t in CONNECTOR_TOKENS.findall(text)}
+        return found | ({"rj45"} if re.search(r"\bcat\s?[5-8]", text, re.IGNORECASE) else set())
+
+    target_connectors = connectors(target)
+    for c in result.candidates:
+        title = c.listing_title or ""
+        why = cable_evidence(title)
+        if why:
+            if c.same_product_form:
+                c.same_product_form = False
+                c.listing_form = f"cable ({why}; model said: {c.listing_form})"
+            continue
+        listing_connectors = connectors(title)
+        if (not c.same_product_form and re.search(r"coupler", target, re.IGNORECASE)
+                and INLINE_COUPLER.search(f"{title} {c.listing_form}") and not MULTI_PORT.search(title)
+                and target_connectors & listing_connectors):
+            c.same_product_form = True
+            c.listing_form = f"{c.listing_form} (inline coupler: same form, mount scored separately)"
+
+
+MULTI_BAND = re.compile(r"\b(?:dual|multi|tri|quad)[\s-]?band\b|\b\d[\s-]?way\b|\bmimo\b|"
+                        r"\b(?:\d|dual|two|multi)[\s-]?ports?\b", re.IGNORECASE)
+GHZ = re.compile(r"(\d+(?:\.\d+)?)\s*g(?:hz)?\b", re.IGNORECASE)
+
+
+def band_port_mismatch(title: str) -> str:
+    """Why a listing is multi-band / multi-port, or "" - e.g. "Dual Band", "2way", or two
+    different GHz frequencies ("2.4GHz 5.8GHz", "2.4/5.8GHz")."""
+    m = MULTI_BAND.search(title)
+    if m:
+        return m[0]
+    slash = re.search(r"(\d+(?:\.\d+)?)\s*(?:g(?:hz)?)?\s*/\s*(\d+(?:\.\d+)?)\s*g(?:hz)?\b", title, re.IGNORECASE)
+    freqs = {float(f) for f in GHZ.findall(title) if 0.3 <= float(f) <= 100}
+    if slash:
+        freqs |= {float(slash[1]), float(slash[2])}
+    return f"{len(freqs)} bands ({', '.join(f'{f:g} GHz' for f in sorted(freqs))})" if len(freqs) > 1 else ""
+
+
+def apply_spec_rules(result: SourcingResult, product: dict) -> None:
+    """Antennas: a dual-band/MIMO/multi-port listing is a different product from a single-band,
+    single-port target, but the rubric had nowhere to say so - Roho's "2way 2.4GHz 5.8GHz ...
+    Dual Band MIMO" antenna won HG2409U-PRO at 85% and then 95%. Zero its category_spec,
+    unless the target itself asks for multiple bands or ports."""
+    target = product.get("description", "")
+    if not re.search(r"\bantenna\b", target, re.IGNORECASE) or band_port_mismatch(target):
+        return
+    for c in result.candidates:
+        why = band_port_mismatch(c.listing_title or "")
+        if why and c.attribute_breakdown is not None and c.attribute_breakdown.category_spec:
+            c.attribute_breakdown.category_spec = 0
+            c.code_notes.append(f"Category/spec set to 0: multi-band/multi-port listing ({why}) vs "
+                                "single-band target")
+
+
+PROMO_WORDS = re.compile(r"new shoppers?|new user|welcome deal|first order|with coupon|promo(?:tional)?", re.IGNORECASE)
+# The promo wording must follow the amount directly ("$1.09 new shopper", "$1.09 (promotional"):
+# a looser gap read "$17.13 $22.84 -25% Regular price after promo discount" as a $22.84 promo.
+PROMO_AMOUNT = re.compile(r"\$\s*(\d+(?:\.\d+)?)\s*\(?\s*(?:new shoppers?|new user|welcome|first order|promo)"
+                          r"|(?:promo(?:tional)?(?:\s+price)?|new shoppers?(?:\s+price)?)[^$;]{0,20}\$\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
+REGULAR_AMOUNT = re.compile(r"(?:regular|base|original|list|full)(?:\s+price)?\s*(?:is|of|:)?\s*~?\s*\$\s*(\d+(?:\.\d+)?)",
+                            re.IGNORECASE)
+
+
+def apply_price_rules(result: SourcingResult) -> None:
+    """Backstop for new-shopper promo prices the model reported as the real price, despite the
+    prompt (e.g. UABS 2026-09-29: "$1.09 new shopper discount from base price ~$2.31" priced at
+    $1.09). If the price used is the promo amount: use the stated regular price, or label it
+    promo when none is given."""
+    for c in result.candidates:
+        text = f"{c.price or ''} {c.unit_price_note or ''}"
+        if c.unit_price_confidence not in ("stated", "inferred") or not c.price_total or not PROMO_WORDS.search(text):
+            continue
+        regulars = {float(r) for r in REGULAR_AMOUNT.findall(text)}
+        # "Regular price $2.28 (promo $1.09...)" would otherwise read $2.28 as a promo amount
+        promos = {float(a or b) for a, b in PROMO_AMOUNT.findall(text)} - regulars
+        if not any(abs(p - c.price_total) < 0.005 for p in promos):
+            continue  # the model already used a non-promo price
+        regular = [r for r in regulars if r > c.price_total]
+        if regular:
+            c.code_notes.append(f"promo ${c.price_total:g} replaced by the listing's regular price ${max(regular):g}")
+            c.price_total = max(regular)
+        else:
+            c.code_notes.append(f"${c.price_total:g} is a promo price; regular price not shown")
+            c.unit_price_confidence = "promo (regular price unknown)"
 
 
 def dedupe_manufacturers(candidates: list) -> list:
@@ -447,19 +736,22 @@ async def research_product(client: AsyncAnthropic, session: ClientSession, tools
         total_in, total_out, calls = total_in + tin, total_out + tout, calls + used
         if not is_garbled(parsed):
             return parsed, total_in, total_out, calls
-        print(f"  Response text came back garbled (attempt {attempt}) - "
+        log(f"  Response text came back garbled (attempt {attempt}) - "
               + ("retrying." if attempt == 1 else "dropping it."))
     return None, total_in, total_out, calls
 
 
 def candidate_score(candidate: Candidate) -> tuple:
-    """Returns (computed_match_percent, {attr: score}) - recomputes from the breakdown
-    when present so a miscounted match_percent from the model can't slip through."""
+    """Returns (computed_match_percent, {attr: score}) - recomputed from the breakdown so a
+    miscounted match_percent from the model can't slip through. A wrong product form (a cable
+    for a coupler) zeroes the match: a 20-point deduction still let one win on price."""
     breakdown = candidate.attribute_breakdown
-    if breakdown is not None:
-        scores = breakdown.model_dump()
-        return sum(max(0, min(20, v)) for v in scores.values()), scores
-    return candidate.match_percent, {}
+    if breakdown is None:
+        return None, {}
+    scores = breakdown.model_dump()
+    if not candidate.same_product_form:
+        return 0, scores
+    return sum(max(0, min(20, v)) for v in scores.values()), scores
 
 
 def match_tier(match_percent: Optional[int]) -> str:
@@ -472,21 +764,49 @@ def match_tier(match_percent: Optional[int]) -> str:
     return "Rejected"
 
 
-def candidate_comment(scores: dict) -> str:
+def candidate_comment(candidate: Candidate) -> str:
+    """Built only from the scores and flags - never restates numbers the table doesn't show."""
+    _, scores = candidate_score(candidate)
     if not scores:
-        return ""
+        return "Scoring failed: no rubric scores returned for this candidate."
+    if not candidate.same_product_form:
+        return f"Wrong product form ({candidate.listing_form or 'not stated'}) - excluded."
     zero_attrs = [ATTRIBUTE_LABELS[attr] for attr in ATTRIBUTES if not scores.get(attr)]
-    if zero_attrs:
-        return f"0 pts on: {', '.join(zero_attrs)} (not stated on listing)"
-    return "All five rubric attributes matched something explicit on the listing."
+    text = (f"0 pts on: {', '.join(zero_attrs)}" if zero_attrs
+            else "All five rubric attributes matched something explicit on the listing.")
+    return "; ".join([text] + candidate.code_notes)
+
+
+PACK_WORDS = r"(?:pcs|pc|pieces?|packs?|sets?|lots?|units?|count)"
+
+
+def pack_size_supported(candidate: Candidate) -> bool:
+    """quantity_covered > 1 only counts when that number sits next to a pack word in the
+    title or price text - not in an MOQ. Dividing by an MOQ produced HDFF's $0.0032 and
+    Suzhou Bulovb's $0.0688 ("US$0.99-6.88", 100 Pieces MOQ)."""
+    q = candidate.quantity_covered
+    if q <= 1:
+        return True
+    text = f"{candidate.listing_title or ''} {candidate.price or ''}"
+    pattern = rf"(?<!\d){q}\s*{PACK_WORDS}\b|\b(?:pack|set|lot|bag|box)\s*(?:of\s*)?{q}(?!\d)|\bx\s*{q}(?!\d)"
+    for m in re.finditer(pattern, text, re.IGNORECASE):
+        nearby = text[max(0, m.start() - 12): m.end() + 12].lower()
+        if "moq" not in nearby and "min" not in nearby:
+            return True
+    # An explicit per-piece price that matches, e.g. "$23.68 ($4.74/pc)" for a 5-pack.
+    for m in re.finditer(r"\$\s*(\d+(?:\.\d+)?)\s*/\s*(?:pc|pcs|piece|unit)\b", text, re.IGNORECASE):
+        if candidate.price_total and abs(float(m[1]) - candidate.price_total / q) <= 0.02 * candidate.price_total / q + 0.01:
+            return True
+    return False
 
 
 def unit_price(candidate: Candidate) -> Optional[float]:
-    """True single-unit cost, or None when it can't be determined confidently."""
+    """True single-unit cost, or None when it can't be determined confidently. A quantity
+    the listing didn't attach to the price is treated as 1 (see pack_size_supported)."""
     c = candidate
-    if c.unit_price_confidence not in ("stated", "inferred") or not c.price_total or not c.quantity_covered:
+    if c.unit_price_confidence == "ambiguous" or not c.price_total or not c.quantity_covered:
         return None
-    return c.price_total / c.quantity_covered
+    return c.price_total / (c.quantity_covered if pack_size_supported(c) else 1)
 
 
 def price_vs_lcom(unit: Optional[float], lcom_price: Optional[float]) -> Optional[tuple]:
@@ -511,17 +831,22 @@ def format_unit(unit: Optional[float]) -> str:
 
 
 def implausible_units(result: Optional[SourcingResult]) -> set:
-    """Indices of candidates whose unit price is > IMPLAUSIBLE_PRICE_RATIO x cheaper than
-    the next-cheapest candidate for the same product. Needs >= 3 priced candidates: with
-    only 2, "one is a parsing error" and "two different real prices" look the same."""
-    units = [unit_price(c) for c in (result.candidates if result else [])]
-    suspect = set()
+    """Indices of candidates whose unit price is > IMPLAUSIBLE_PRICE_RATIO x cheaper than the
+    next-cheapest candidate for the same product, or that the model itself flagged as
+    unusually low. The comparison needs >= 3 priced candidates (with 2, "one is a parsing
+    error" and "two different real prices" look the same) and only uses stated/inferred
+    prices as the reference - a leaked $1.09 promo once hid a $0.11 outlier at 9.9x."""
+    cands = result.candidates if result else []
+    units = [unit_price(c) for c in cands]
+    reliable = [u if u is not None and c.unit_price_confidence in ("stated", "inferred") else None
+                for c, u in zip(cands, units)]
+    suspect = {i for i, c in enumerate(cands) if LOW_PRICE_WARNING.search(c.listing_caveats or "")}
     # ponytail: a 2-candidate product with a real parsing error now goes unflagged; add an
     # absolute floor (e.g. vs L-Com's price) if that shows up in practice.
     if sum(u is not None for u in units) < 3:
         return suspect
     for i, u in enumerate(units):
-        others = [x for j, x in enumerate(units) if j != i and x is not None]
+        others = [x for j, x in enumerate(reliable) if j != i and x is not None]
         if u is not None and others and u * IMPLAUSIBLE_PRICE_RATIO < min(others):
             suspect.add(i)
     return suspect
@@ -536,58 +861,215 @@ def confidence_label(result: SourcingResult, i: int) -> str:
     c = result.candidates[i]
     if i in implausible_units(result):
         return f"{c.unit_price_confidence} (IMPLAUSIBLE)"
-    return (c.unit_price_confidence or "?") + (" (FLAGGED)" if unit_price(c) is None else "")
+    label = c.unit_price_confidence or "?"
+    if not pack_size_supported(c):
+        label += f" (qty {c.quantity_covered} ignored)"
+    return label + (" (FLAGGED)" if unit_price(c) is None else "")
+
+
+# Among candidates that clear both bars, the most accurate wins. Only candidates within
+# TIE_BAND_POINTS of that top accuracy count as a tie, broken by: stated price (promo last, so it
+# never beats a stated wholesale price), then a named maker, then the lowest price.
+TIE_BAND_POINTS = 5
+CONFIDENCE_RANK = {"stated": 0, "inferred": 1, "promo (regular price unknown)": 2}
+
+
+def is_named(candidate: Candidate) -> bool:
+    name = (candidate.manufacturer or "").strip()
+    return bool(name) and not PLACEHOLDER_MANUFACTURER.search(name)
 
 
 def recommend(result: Optional[SourcingResult], lcom_price: Optional[float]) -> tuple:
-    """Returns (index of recommended candidate or None, one-line reason)."""
+    """Returns (index of recommended candidate or None, one-line reason). The reason always
+    names the rule that actually decided it."""
     if result is None or result.no_match or not result.candidates:
         return None, "No candidates found - nothing to source."
     if not lcom_price:
         return None, "No L-Com reference price for this product - cannot judge margin, not recommending."
-    qualifying = []  # (index, accuracy, margin %, price is stated)
-    for i, c in enumerate(result.candidates):
-        accuracy, _ = candidate_score(c)
+    cands = result.candidates
+    unscored = [i for i, c in enumerate(cands) if candidate_score(c)[0] is None]
+    if len(unscored) == len(cands):
+        return None, ("Scoring failed - the model returned these candidates without rubric scores; "
+                      "see the run log. Not recommending.")
+    suspect = implausible_units(result)
+    rows = []
+    for i, c in enumerate(cands):
         vs = price_vs_lcom(checked_unit(result, i), lcom_price)
-        if vs is None or accuracy is None or accuracy < MIN_RECOMMEND_ACCURACY or vs[1] < MIN_MARGIN_PCT:
-            continue
-        qualifying.append((i, accuracy, vs[1], c.unit_price_confidence == "stated"))
+        rows.append({"i": i, "c": c, "acc": candidate_score(c)[0], "pct": vs[1] if vs else None})
+    qualifying = [r for r in rows if r["acc"] is not None and r["c"].same_product_form
+                  and r["acc"] >= MIN_RECOMMEND_ACCURACY and r["pct"] is not None and r["pct"] >= MIN_MARGIN_PCT]
     if not qualifying:
-        suspect = implausible_units(result)
-        return None, (
-            f"No candidate offers sufficient margin below L-Com's ${lcom_price:.2f} "
-            f"(needs a confirmed unit price >= {MIN_MARGIN_PCT}% cheaper at >= {MIN_RECOMMEND_ACCURACY}% "
-            "accuracy) - do not source from any of these."
-            + "".join(f" Candidate {i + 1}: {IMPLAUSIBLE_NOTE}." for i in sorted(suspect))
-        )
-    # ponytail: accuracy x margin% is a crude trade-off; swap for a landed-cost model (shipping, duty) if needed
-    best = max(qualifying, key=lambda q: q[1] * q[2])
-    # A stated price beats an inferred one at equal or better accuracy.
-    stated = [q for q in qualifying if q[3] and q[1] >= best[1]]
-    if not best[3] and stated:
-        best = max(stated, key=lambda q: q[1] * q[2])
-    best = best[0]
-    c = result.candidates[best]
-    accuracy, _ = candidate_score(c)
+        return None, no_qualifier_reason(rows, lcom_price, suspect, unscored)
+    top = max(r["acc"] for r in qualifying)
+    contenders = [r for r in qualifying if r["acc"] >= top - TIE_BAND_POINTS]
+    best = min(contenders, key=lambda r: (CONFIDENCE_RANK.get(r["c"].unit_price_confidence, 3),
+                                          not is_named(r["c"]), unit_price(r["c"])))
+    c = best["c"]
     unit = unit_price(c)
-    return best, (
-        f"Buy from Candidate {best + 1} ({c.manufacturer or 'unnamed supplier'}): {accuracy}% accuracy at "
-        f"{format_unit(unit)}/unit, {format_vs_lcom(price_vs_lcom(unit, lcom_price))} than L-Com."
+    tie = (f" Tie-break over {len(contenders) - 1} other candidate(s) within {TIE_BAND_POINTS} accuracy points: "
+           "stated price, then named maker, then lowest price." if len(contenders) > 1 else "")
+    return best["i"], (
+        f"Buy from Candidate {best['i'] + 1} ({c.manufacturer or 'unnamed supplier'}): {best['acc']}% accuracy at "
+        f"{format_unit(unit)}/unit ({c.unit_price_confidence}), {format_vs_lcom(price_vs_lcom(unit, lcom_price))} "
+        f"than L-Com.{tie}"
     )
 
 
+def no_qualifier_reason(rows: list, lcom_price: float, suspect: set, unscored: list) -> str:
+    """Says which bar failed: product form, accuracy, price margin, or both."""
+    def name(r):
+        return f"Candidate {r['i'] + 1}, {r['c'].manufacturer or 'unnamed'}"
+
+    def price_text(r):
+        if r["pct"] is None:
+            why = "implausible" if r["i"] in suspect else r["c"].unit_price_confidence
+            return f"price couldn't be confirmed ({why})"
+        return f"{r['pct']:.0f}% cheaper" if r["pct"] >= 0 else f"{-r['pct']:.0f}% more expensive"
+
+    right_form = [r for r in rows if r["acc"] is not None and r["c"].same_product_form]
+    if not right_form:
+        forms = sorted({r["c"].listing_form for r in rows if r["acc"] is not None and r["c"].listing_form})
+        why = "product form: none is the right kind of product" + (f" (found: {', '.join(forms)})" if forms else "")
+    elif not any(r["acc"] >= MIN_RECOMMEND_ACCURACY for r in right_form):
+        best = max(right_form, key=lambda r: (r["acc"], r["pct"] if r["pct"] is not None else -1e9))
+        price_ok = best["pct"] is not None and best["pct"] >= MIN_MARGIN_PCT
+        why = (f"accuracy only: best reached {best['acc']}% ({name(best)}), needs {MIN_RECOMMEND_ACCURACY}%, "
+               f"at a price that does qualify ({price_text(best)})" if price_ok else
+               f"accuracy and price: best reached {best['acc']}% ({name(best)}), needs {MIN_RECOMMEND_ACCURACY}%, "
+               f"and its price doesn't qualify either ({price_text(best)})")
+    else:
+        accurate = [r for r in right_form if r["acc"] >= MIN_RECOMMEND_ACCURACY]
+        best = max(accurate, key=lambda r: r["pct"] if r["pct"] is not None else -1e9)
+        why = (f"price margin only: best accurate candidate reached {best['acc']}% ({name(best)}) but "
+               + ("its " if best["pct"] is None else "is ") + f"{price_text(best)}, needs >= {MIN_MARGIN_PCT}% cheaper")
+    extra = "".join(f" Candidate {i + 1}: {IMPLAUSIBLE_NOTE}." for i in sorted(suspect))
+    if unscored:
+        extra += f" Scoring failed for candidate(s) {', '.join(str(i + 1) for i in unscored)} - see the run log."
+    return f"No candidate qualifies - {why} (L-Com unit price ${lcom_price:.2f}). Do not source from any of these.{extra}"
+
+
+# "Check before ordering" detection, from the listing text. Families of mutually exclusive
+# variants: if the target names one and the listing title names another, flag it.
+VARIANT_FAMILIES = [
+    # (target pattern, conflicting listing pattern, label)
+    (r"\bd[be]-?9\b|\b9[\s-]?pins?\b", r"\bvga\b|\b(?:hd|db|de)-?15\b|\b15[\s-]?pins?\b|\bd[bd]-?25\b|\b25[\s-]?pins?\b|"
+                                      r"\bd[cb]-?37\b|\b37[\s-]?pins?\b", "a different D-sub pin count"),
+    (r"\brj-?45\b|\bcat\s?[5-8]", r"\brj-?1[12]\b|\brj-?9\b|\b[46]p[246]c\b", "a different modular jack (RJ11/RJ12)"),
+    (r"\busb\b", r"\bmicro[\s-]?usb\b|\bmicro[\s-]?b\b|\bmini[\s-]?usb\b|\bmini[\s-]?b\b|\btype[\s-]?c\b|\busb[\s-]?c\b",
+     "a different USB connector (Micro/Mini/Type-C)"),
+    (r"\bhdmi\b", r"\b(?:mini|micro)[\s-]?hdmi\b", "a different HDMI size (Mini/Micro)"),
+    (r"\bmulti[\s-]?mode\b", r"\bsingle[\s-]?mode\b|\bSM\b", "single-mode fiber"),
+    (r"\bsingle[\s-]?mode\b", r"\bmulti[\s-]?mode\b|\bMM\b", "multimode fiber"),
+]
+# Several variants sold under one listing / URL.
+MULTI_VARIANT = [
+    (r"\bsimplex\b.*\bduplex\b|\bduplex\b.*\bsimplex\b", "simplex and duplex"),
+    (r"\bmale\s*(?:/|&|and|\s)\s*female\b", "male and female"),
+    (r"\bsingle[\s-]?mode\b.*\bmulti[\s-]?mode\b|\bmulti[\s-]?mode\b.*\bsingle[\s-]?mode\b|\bSM\s*/\s*MM\b", "single- and multimode"),
+    (r"\b(?:\d{1,2}[\s,/]+){2,}\d{1,2}\s*pins?\b", "several pin counts"),
+]
+BULK_MOQ_NOTE = 500  # flag only genuinely bulk-only pricing; replace with real order qty per SKU when we have it
+
+
+def order_quantity(text: str) -> Optional[int]:
+    """Minimum order from an MOQ or price string: "500 pieces", "Min. order: 1,000", "1,000 Pieces (MOQ)"."""
+    m = re.search(r"([\d,]+)\s*(?:pieces?|pcs|pc|units?)?\s*\(?\s*moq\b|min\.?\s*order:?\s*([\d,]+)|"
+                  r"^\s*([\d,]+)\s*(?:pieces?|pcs|pc|units?)?\s*$", text or "", re.IGNORECASE)
+    digits = next((g for g in m.groups() if g), "").replace(",", "") if m else ""
+    return int(digits) if digits.isdigit() else None
+
+
+# The model's caveat line mixed useful notes with MOQ/tier remarks on nearly every pick, and
+# on 2026-09-29 it put HDFF's "MOQ 500" and TDG1026KS-C6's "MOQ 1000" ONLY there (its moq field
+# said "Not stated"). So MOQ/tier sentences are taken out of the caveat, but any quantity in
+# them goes through the same BULK_MOQ_NOTE check as the structured MOQ instead of being lost.
+MOQ_TIER_SENTENCE = re.compile(r"\bmoq\b|\bmin(?:imum)?\.?\s*order|\btier(?:ed)?\b|\b(?:lower|higher|larger)\s+volumes?\b|"
+                               r"\bat volume\b|\bbulk\b", re.IGNORECASE)
+MOQ_IN_TEXT = re.compile(r"(?:\bmoq\b|\bmin(?:imum)?\.?\s*order(?:\s*quantity)?)\s*(?:is|of|:)?\s*([\d,]+)", re.IGNORECASE)
+
+
+def split_caveats(caveats: str) -> tuple:
+    """(caveat text without MOQ/tier sentences, largest MOQ those sentences stated or None)."""
+    kept, moqs = [], []
+    for part in re.split(r";\s*|\.\s+", caveats or ""):
+        part = part.strip(" .")
+        if not part:
+            continue
+        if MOQ_TIER_SENTENCE.search(part):
+            moqs += [int(q.replace(",", "")) for q in MOQ_IN_TEXT.findall(part) if q.replace(",", "").isdigit()]
+        else:
+            kept.append(part)
+    return "; ".join(kept), max(moqs, default=None)
+
+
+def ordering_notes(candidate: Candidate, product: dict) -> list:
+    """What a buyer should check before ordering this candidate, from its listing text plus
+    the model's own caveat. Empty when nothing is worth flagging."""
+    c, target = candidate, product.get("description", "")
+    title = c.listing_title or ""
+    notes = []
+    for target_pat, other_pat, label in VARIANT_FAMILIES:
+        if re.search(target_pat, target, re.IGNORECASE):
+            hit = re.search(other_pat, title, re.IGNORECASE)
+            if hit and not re.search(other_pat, target, re.IGNORECASE):
+                notes.append(f"title names {label} (\"{hit[0]}\") - confirm it is the target's variant")
+    models = re.findall(r"\b([A-Z]{2,})-(\w*\d\w*)\b", title)
+    by_prefix = {}
+    for prefix, suffix in models:
+        by_prefix.setdefault(prefix, set()).add(suffix)
+    for prefix, suffixes in by_prefix.items():
+        if len(suffixes) > 1:
+            notes.append(f"one listing covers several models ({', '.join(f'{prefix}-{s}' for s in sorted(suffixes))}) "
+                         "- confirm which one ships")
+    for pat, label in MULTI_VARIANT:
+        if re.search(pat, title, re.IGNORECASE):
+            notes.append(f"listing offers {label} variants - pick the right option when ordering")
+    caveats, caveat_moq = split_caveats(c.listing_caveats)
+    moq = max((q for q in (order_quantity(c.moq or ""), order_quantity(c.price or ""), caveat_moq) if q), default=None)
+    if moq and moq >= BULK_MOQ_NOTE:
+        notes.append(f"price needs an order of {moq:,}+ pieces (MOQ)")
+    if c.unit_price_confidence.startswith("promo"):
+        notes.append("promo price - regular price not shown on the listing")
+    if not pack_size_supported(c):
+        notes.append(f"listing's quantity {c.quantity_covered} wasn't tied to this price - priced per piece")
+    if caveats:
+        notes.append(f"model: {caveats}")
+    return notes
+
+
+def ordering_note(result: Optional[SourcingResult], rec_idx: Optional[int], product: dict) -> str:
+    """The recommended candidate's notes as one line, or "" (no recommendation / nothing to flag)."""
+    if result is None or rec_idx is None:
+        return ""
+    return "; ".join(ordering_notes(result.candidates[rec_idx], product))
+
+
+def score_summary(result: SourcingResult) -> str:
+    """One line per product, templated from the same scores as the table so the two can't drift."""
+    parts = []
+    for i, c in enumerate(result.candidates, start=1):
+        acc, scores = candidate_score(c)
+        if acc is None:
+            parts.append(f"{i}. {c.manufacturer or 'unnamed'}: scoring failed")
+            continue
+        detail = "/".join(str(max(0, min(20, scores.get(a, 0)))) for a in ATTRIBUTES)
+        form = "" if c.same_product_form else f", wrong form ({c.listing_form})"
+        parts.append(f"{i}. {c.manufacturer or 'unnamed'}: {acc}% ({detail}{form})")
+    return "Scores (type/spec/shielding/mount/gender): " + "; ".join(parts)
+
+
 def print_product_result(product: dict, result: Optional[SourcingResult], calls_used: int):
-    print("-" * 72)
-    print(f"{product['sku']} - \"{product['description']}\"  ({calls_used} tool calls used)")
-    print()
+    log("-" * 72)
+    log(f"{product['sku']} - \"{product['description']}\"  ({calls_used} tool calls used)")
+    log()
 
     if result is None:
-        print("  Could not get a structured result for this product (empty, refused or garbled response).")
+        log("  Could not get a structured result for this product (empty, refused or garbled response).")
         return
 
     if result.no_match or not result.candidates:
         reason = result.no_match_reason or "no plausible candidate found"
-        print(f"  No match found - {reason}")
+        log(f"  No match found - {reason}")
         return
 
     for i, candidate in enumerate(result.candidates, start=1):
@@ -597,23 +1079,26 @@ def print_product_result(product: dict, result: Optional[SourcingResult], calls_
         source = candidate.distributor_site or "Unknown site"
         price = candidate.price or "Not stated"
 
-        print(f"  #{i}  {manufacturer}  |  via {source}  |  Tier: {match_tier(computed)}")
-        print(f"      Listing:  {candidate.listing_title or '?'}")
-        print(f"      Price:    {price}   MOQ: {candidate.moq or 'Not stated'}")
-        print(f"      Unit:     {format_unit(unit_price(candidate))} ({confidence_label(result, i - 1)})  "
+        log(f"  #{i}  {manufacturer}  |  via {source}  |  Tier: {match_tier(computed)}")
+        log(f"      Listing:  {candidate.listing_title or '?'}")
+        log(f"      Price:    {price}   MOQ: {candidate.moq or 'Not stated'}")
+        log(f"      Unit:     {format_unit(unit_price(candidate))} ({confidence_label(result, i - 1)})  "
               f"vs L-Com: {format_vs_lcom(vs)}")
-        print(f"      Accuracy: {computed}%")
-        print(f"      URL:      {candidate.url or 'Not stated'}")
+        log(f"      Accuracy: {computed}%" + ("" if candidate.same_product_form else f"  (wrong product form: {candidate.listing_form})"))
+        log(f"      URL:      {candidate.url or 'Not stated'}")
         if scores:
             line = " | ".join(
                 f"{ATTRIBUTE_LABELS[attr]} {max(0, min(20, scores.get(attr, 0)))}" for attr in ATTRIBUTES
             )
-            print(f"      Why:      {line}  ->  {candidate_comment(scores)}")
-        print()
+            log(f"      Why:      {line}  ->  {candidate_comment(candidate)}")
+        log()
 
-    if result.note:
-        print(f"  Note: {result.note}")
-    print(f"  Recommendation: {recommend(result, product.get('lcom_price'))[1]}")
+    log(f"  {score_summary(result)}")
+    rec_idx, rec_reason = recommend(result, product.get("lcom_price"))
+    log(f"  Recommendation: {rec_reason}")
+    note = ordering_note(result, rec_idx, product)
+    if note:
+        log(f"  Check before ordering: {note}")
 
 
 def format_result_markdown(
@@ -630,9 +1115,11 @@ def format_result_markdown(
         lcom = product.get("lcom_price")
         lcom_text = f"${lcom:.2f}" if lcom else "n/a"
         rec_idx, rec_reason = recommend(result, lcom)
+        note = ordering_note(result, rec_idx, product)
+        lines += [f"**Recommendation:** {rec_reason}", ""]
+        if note:
+            lines += [f"**Check before ordering:** {note}", ""]
         lines += [
-            f"**Recommendation:** {rec_reason}",
-            "",
             f"| Candidate | Accuracy | Unit price | Unit price confidence | vs. L-Com ({lcom_text}) | Recommended |",
             "|---|---|---|---|---|---|",
         ]
@@ -661,6 +1148,8 @@ def format_result_markdown(
                 f"| Manufacturer / Producer | {candidate.manufacturer or 'Not stated on listing'} |",
                 f"| Supplier / Site | {candidate.distributor_site or 'Unknown site'} |",
                 f"| Listing | {candidate.listing_title or '?'} |",
+                f"| Product form | {candidate.listing_form or '?'}" + ("" if candidate.same_product_form else " - **WRONG FORM, excluded**") + " |",
+                *([f"| **Check before ordering** | {note} |"] if note and i - 1 == rec_idx else []),
                 f"| Accuracy | {computed}% |",
                 f"| Listed price | {candidate.price or 'Not stated'} |",
                 f"| Qty the price covers | {candidate.quantity_covered or '?'} |",
@@ -677,9 +1166,8 @@ def format_result_markdown(
                 lines.append("|---|---|")
                 for attr in ATTRIBUTES:
                     lines.append(f"| {ATTRIBUTE_LABELS[attr]} | {max(0, min(20, scores.get(attr, 0)))} |")
-                lines += ["", candidate_comment(scores), ""]
-        if result.note:
-            lines.append(f"*{result.note}*")
+                lines += ["", candidate_comment(candidate), ""]
+        lines.append(f"*{score_summary(result)}*")
 
     lines += ["", f"*Tool calls used: {calls_used} | Tokens: in={tin} out={tout} | Cost: ~${cost:.4f}*", ""]
     return "\n".join(lines)
@@ -691,10 +1179,17 @@ def ambiguous_price_flags(rows: list) -> list:
     for product, result in rows:
         suspect = implausible_units(result)
         for i, c in enumerate(result.candidates if result else [], start=1):
+            if not c.same_product_form:
+                continue  # excluded anyway; its price doesn't matter
             if i - 1 in suspect:
                 reason = f"{format_unit(unit_price(c))}/unit: {IMPLAUSIBLE_NOTE} ({c.unit_price_note or 'no note'})"
             elif unit_price(c) is None:
                 reason = c.unit_price_note or c.unit_price_confidence or "no unit price given"
+            elif not pack_size_supported(c):
+                reason = (f"quantity {c.quantity_covered} ignored - not attached to this price in the listing "
+                          f"(MOQ?), priced per piece at {format_unit(unit_price(c))}")
+            elif c.unit_price_confidence.startswith("promo"):
+                reason = f"promo price, regular price not shown ({c.unit_price_note or 'no note'})"
             else:
                 continue
             flags.append(
@@ -714,7 +1209,8 @@ def write_report(
         f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         f"Model: {MODEL} | Sites: {', '.join(SOURCING_SITES)} | Products: {num_products}",
         f"Recommendation rule: >= {MIN_RECOMMEND_ACCURACY}% accuracy and a confirmed unit price "
-        f">= {MIN_MARGIN_PCT}% below L-Com's price; best accuracy x margin wins.",
+        f">= {MIN_MARGIN_PCT}% below L-Com's price, right product form; most accurate wins, and within "
+        f"{TIE_BAND_POINTS} points of it: stated price, then a named maker, then the lowest price.",
         "",
         "## Unit prices that could not be determined confidently or look implausible",
         "",
@@ -737,6 +1233,8 @@ PRODUCT_XLSX_FIELDS = ["SKU", "Product", "Keyword", "L-Com Unit Price", "Recomme
 RECOMMENDED_XLSX_FIELDS = [
     "Recommended Manufacturer", "Recommended Email", "Recommended URL", "Recommended Unit Price",
 ]
+ORDERING_NOTE_FIELD = "Ordering Note"  # right after the green Recommended block; amber when filled
+AMBER = PatternFill("solid", fgColor="FFE699")
 CANDIDATE_XLSX_FIELDS = [
     "Name", "Accuracy", "Listed Price", "Unit Price", "Unit Price Confidence", "vs. L-Com Price",
     "MOQ", "URL", "Email", "Match Tier", "Comment",
@@ -754,7 +1252,7 @@ def write_excel_report(rows: list, path: str) -> None:
     ws.title = "Results"
     comp = wb.create_sheet("Comparison")
 
-    header = PRODUCT_XLSX_FIELDS + RECOMMENDED_XLSX_FIELDS
+    header = PRODUCT_XLSX_FIELDS + RECOMMENDED_XLSX_FIELDS + [ORDERING_NOTE_FIELD]
     for n in range(1, MAX_CANDIDATES + 1):
         header += [f"Manufacturer {n} {field}" for field in CANDIDATE_XLSX_FIELDS]
     ws.append(header)
@@ -771,6 +1269,8 @@ def write_excel_report(rows: list, path: str) -> None:
         else:
             rec = candidates[rec_idx]
             row += [rec.manufacturer or "", rec.email or "", rec.url or "", round(unit_price(rec), 4)]
+        note = ordering_note(result, rec_idx, product)
+        row.append(note)
         for i in range(MAX_CANDIDATES):
             if i < len(candidates):
                 c = candidates[i]
@@ -790,7 +1290,7 @@ def write_excel_report(rows: list, path: str) -> None:
                     c.url or "",
                     c.email or "",
                     match_tier(computed),
-                    candidate_comment(scores),
+                    candidate_comment(c),
                 ]
                 comp.append([product["sku"], i + 1, c.manufacturer or "", computed, unit_cell,
                              confidence, vs, "YES" if i == rec_idx else "no"])
@@ -806,6 +1306,8 @@ def write_excel_report(rows: list, path: str) -> None:
             start = len(PRODUCT_XLSX_FIELDS)
             for cell in ws[ws.max_row][start : start + len(RECOMMENDED_XLSX_FIELDS)]:
                 cell.fill = GREEN
+        if note:
+            ws[ws.max_row][len(PRODUCT_XLSX_FIELDS) + len(RECOMMENDED_XLSX_FIELDS)].fill = AMBER
 
     for sheet in (ws, comp):
         for cell in sheet[1]:
@@ -893,6 +1395,94 @@ def pick_skus(products: list, skus: list) -> tuple:
     return picked, missing
 
 
+def percentile(values: list, q: float) -> float:
+    """Nearest-rank percentile; 0 for an empty list."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, max(0, math.ceil(q * len(ordered)) - 1))]
+
+
+def busy_time(calls: list) -> float:
+    """Seconds during which at least one of these calls was in flight. Summing durations
+    counted the prefetch's three parallel searches three times (2026-09-29 run showed an
+    impossible "Anthropic 2%")."""
+    total, end = 0.0, None
+    for c in sorted(calls, key=lambda c: c["start"]):
+        start, stop = c["start"], c["start"] + c["secs"]
+        if end is None or start >= end:
+            total += stop - start
+            end = stop
+        elif stop > end:
+            total += stop - end
+            end = stop
+    return total
+
+
+def peak_concurrency(calls: list) -> int:
+    """Most Nimble calls in flight at the same moment."""
+    events = sorted([(c["start"], 1) for c in calls] + [(c["start"] + c["secs"], -1) for c in calls],
+                    key=lambda e: (e[0], e[1]))  # ends before starts at the same instant
+    peak = now = 0
+    for _, delta in events:
+        now += delta
+        peak = max(peak, now)
+    return peak
+
+
+def stop_reason(result: Optional[SourcingResult], calls_used: int, failed_calls: int) -> str:
+    """Why a product's search ended - so a lower budget's effect can be told apart: found enough
+    vs ran out of calls (and how many of those failed) vs the model gave up with budget left."""
+    budget = f"{calls_used}/{MAX_TOOL_CALLS_PER_PRODUCT} calls, {failed_calls} failed"
+    if result is None:
+        return f"no usable result ({budget})"
+    n = len(result.candidates)
+    if n >= MAX_CANDIDATES:
+        return f"found {MAX_CANDIDATES} candidates ({budget})"
+    if calls_used >= MAX_TOOL_CALLS_PER_PRODUCT:
+        return f"budget used up with {n} candidates ({budget})"
+    return f"model stopped with {n} candidates, budget left ({budget})"
+
+
+def timing_summary(calls: list, products: list, wall_secs: float) -> str:
+    """Where the wall-clock time went: Nimble vs Anthropic (= product time minus its Nimble
+    time), timeouts, and Nimble latency per tool/site for picking a timeout."""
+    by_sku = {}
+    for c in calls:
+        by_sku.setdefault(c["sku"], []).append(c)
+    nimble = sum(busy_time(group) for group in by_sku.values())  # waiting time, overlaps counted once
+    product_total = sum(p["secs"] for p in products)
+    anthropic = product_total - nimble
+    timeouts = [c for c in calls if c["outcome"] == "timeout"]
+    timeout_secs = sum(c["secs"] for c in timeouts)
+    pct = lambda x: f"{100 * x / product_total:.0f}%" if product_total else "-"
+    lines = [
+        f"Wall clock: {wall_secs / 60:.1f} min for {len(products)} products "
+        f"({wall_secs / max(1, len(products)):.0f}s per product)",
+        f"  Waiting on Nimble:     {nimble / 60:6.1f} min  {pct(nimble)}  ({len(calls)} calls)",
+        f"    of which timeouts:   {timeout_secs / 60:6.1f} min  {pct(timeout_secs)}  ({len(timeouts)} calls)",
+        f"  Anthropic + overhead:  {anthropic / 60:6.1f} min  {pct(anthropic)}",
+        f"  Peak simultaneous Nimble calls: {peak_concurrency(calls)}",
+        "Nimble latency (s)      calls  median   p90    max  timeouts",
+    ]
+    groups = {}
+    for c in calls:
+        groups.setdefault(f"{c['tool'].replace('nimble_', '')} {c['site']}", []).append(c)
+    for name, group in sorted(groups.items()):
+        secs = [c["secs"] for c in group]
+        lines.append(f"  {name:22} {len(secs):5}  {percentile(secs, .5):6.1f} {percentile(secs, .9):6.1f} {max(secs):6.1f}"
+                     f"  {sum(c['outcome'] == 'timeout' for c in group):8}")
+    reasons = collections.Counter(p.get("stop", "?").split(" (")[0] for p in products)
+    lines.append("Why products stopped: " + "; ".join(f"{r}: {n}" for r, n in reasons.most_common()))
+    ok = [c["secs"] for c in calls if c["outcome"] == "ok"]
+    buckets = [(0, 15), (15, 30), (30, 45), (45, 60), (60, 90), (90, 10**9)]
+    lines.append("Successful call latency: " + "  ".join(
+        f"{lo}-{hi if hi < 10**9 else ''}s: {sum(lo <= x < hi for x in ok)}" for lo, hi in buckets))
+    for c in timeouts:
+        lines.append(f"  TIMEOUT {c['sku']} {c['tool']} {c['url']}")
+    return "\n".join(lines)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Competitive sourcing research POC")
     parser.add_argument(
@@ -946,7 +1536,7 @@ async def main_async():
         print(f"No products found in {args.input} - check it has a 'SKU' header column.")
         sys.exit(1)
 
-    client = AsyncAnthropic(api_key=anthropic_key)
+    client = AsyncAnthropic(api_key=anthropic_key, max_retries=ANTHROPIC_MAX_RETRIES)
 
     print("Competitive Sourcing Research POC")
     print(f"Model: {MODEL}  |  Products: {len(products)}  |  Sites: {', '.join(SOURCING_SITES)}")
@@ -985,53 +1575,67 @@ async def main_async():
                     print("--inspect-tools: exiting before spending any Anthropic tokens.")
                     return
 
-                grand_in, grand_out, grand_cost = 0, 0, 0.0
-                report_sections = []
-                excel_rows = []
+                run_started = time.monotonic()
+                totals = {"in": 0, "out": 0, "cost": 0.0}
+                # One slot per product in input order: (report section, excel row) once finished.
+                done = [None] * len(products)
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 report_path = f"sourcing_report_{timestamp}.md"
                 excel_path = args.output or f"sourcing_results_{timestamp}.xlsx"
                 print(f"Saving results after every product to {report_path} / {excel_path}")
+                print(f"Running up to {MAX_CONCURRENT_PRODUCTS} products at once")
+                slots = asyncio.Semaphore(MAX_CONCURRENT_PRODUCTS)
+                save_lock = asyncio.Lock()
 
-                for idx, product in enumerate(products, start=1):
-                    print(f"\nProduct {idx} of {len(products)}: {product['sku']} ...")
-                    try:
-                        result, tin, tout, calls_used = await research_product(
-                            client, session, tools, product
-                        )
-                        print_product_result(product, result, calls_used)
-                        cost = (tin / 1_000_000 * HAIKU_INPUT_PER_MTOK) + (
-                            tout / 1_000_000 * HAIKU_OUTPUT_PER_MTOK
-                        )
-                        grand_in += tin
-                        grand_out += tout
-                        grand_cost += cost
-                        print(f"  Tokens:     in={tin} out={tout}  (~${cost:.4f})")
-                        report_sections.append(format_result_markdown(product, result, calls_used, tin, tout, cost))
-                        excel_rows.append((product, result))
-                    except Exception as exc:  # noqa: BLE001 - POC: keep going on any per-product failure
-                        print("-" * 72)
-                        print(f"{product['sku']} - \"{product['description']}\"")
-                        print(f"  Error researching this product: {exc}")
-                        report_sections.append(
-                            f"## {product['sku']} - {product['description']}\n\n"
-                            f"**Error researching this product:** {exc}\n"
-                        )
-                        excel_rows.append((product, None))
-                    # Save after every product so a crash or stop keeps everything finished so far.
-                    flags = ambiguous_price_flags(excel_rows)
-                    try:
-                        write_report(report_sections, grand_in, grand_out, grand_cost, len(products), report_path, flags)
-                        write_excel_report(excel_rows, excel_path)
-                    except OSError as exc:  # e.g. the .xlsx is open in Excel - retry on the next product
-                        print(f"  Could not save results yet ({exc}) - will retry after the next product.")
+                async def run_one(idx: int, product: dict):
+                    CURRENT_SKU.set(product["sku"])
+                    async with slots:
+                        log(f"Product {idx + 1} of {len(products)} ...")
+                        started = time.monotonic()
+                        try:
+                            result, tin, tout, calls_used = await research_product(client, session, tools, product)
+                            print_product_result(product, result, calls_used)
+                            cost = (tin / 1_000_000 * HAIKU_INPUT_PER_MTOK) + (tout / 1_000_000 * HAIKU_OUTPUT_PER_MTOK)
+                            totals["in"] += tin
+                            totals["out"] += tout
+                            totals["cost"] += cost
+                            log(f"  Tokens:     in={tin} out={tout}  (~${cost:.4f})")
+                            secs = time.monotonic() - started
+                            nimble = busy_time([c for c in CALL_LOG if c["sku"] == product["sku"]])
+                            failed = sum(c["outcome"] != "ok" for c in CALL_LOG if c["sku"] == product["sku"])
+                            stop = stop_reason(result, calls_used, failed)
+                            PRODUCT_LOG.append({"sku": product["sku"], "secs": secs, "calls": calls_used, "stop": stop})
+                            log(f"  Time:       {secs:.0f}s  (Nimble {nimble:.0f}s, Anthropic+other {secs - nimble:.0f}s, "
+                                f"{calls_used} tool calls)")
+                            log(f"  Stopped:    {stop}")
+                            done[idx] = (format_result_markdown(product, result, calls_used, tin, tout, cost), (product, result))
+                        except Exception as exc:  # noqa: BLE001 - POC: keep going on any per-product failure
+                            log(f"  Error researching this product: {exc}")
+                            done[idx] = (f"## {product['sku']} - {product['description']}\n\n"
+                                         f"**Error researching this product:** {exc}\n", (product, None))
+                    # Save after every product so a crash or stop keeps everything finished so far,
+                    # rows in input order. The lock keeps two finishing products from interleaving writes.
+                    async with save_lock:
+                        finished = [d for d in done if d]
+                        try:
+                            write_report([s for s, _ in finished], totals["in"], totals["out"], totals["cost"],
+                                         len(products), report_path, ambiguous_price_flags([r for _, r in finished]))
+                            write_excel_report([r for _, r in finished], excel_path)
+                        except OSError as exc:  # e.g. the .xlsx is open in Excel - retry on the next product
+                            log(f"  Could not save results yet ({exc}) - will retry after the next product.")
+
+                await asyncio.gather(*(run_one(i, p) for i, p in enumerate(products)))
 
                 print("-" * 72)
+                print(timing_summary(CALL_LOG, PRODUCT_LOG, time.monotonic() - run_started))
+                print(f"Anthropic retries (429 rate limit / 529 overloaded / 5xx): {dict(ANTHROPIC_RETRIES) or 'none'}")
+                print(f"Nimble rate-limit retries: {NIMBLE_RATE_LIMITS['count'] or 'none'}")
                 print(
-                    f"Total tokens: in={grand_in} out={grand_out}  |  "
-                    f"Estimated total cost: ~${grand_cost:.4f}"
+                    f"Total tokens: in={totals['in']} out={totals['out']}  |  "
+                    f"Estimated total cost: ~${totals['cost']:.4f}"
                 )
 
+                flags = ambiguous_price_flags([d[1] for d in done if d])
                 if flags:
                     print("Unit prices that could not be determined confidently:")
                     print("\n".join(flags))

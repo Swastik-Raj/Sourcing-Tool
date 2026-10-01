@@ -5,46 +5,140 @@ import tempfile
 import openpyxl
 
 from sourcing_agent import (
-    AttributeBreakdown, Candidate, SourcingResult, dedupe_manufacturers, implausible_units, is_garbled, pick_skus, recommend, strip_page_chrome, unit_price, write_excel_report,
+    AttributeBreakdown, Candidate, SourcingResult, candidate_comment, candidate_score, dedupe_manufacturers,
+    implausible_units, is_garbled, pack_size_supported, pick_skus, percentile, recommend, score_summary,
+    strip_page_chrome, timing_summary, unit_price, write_excel_report,
 )
 
 FULL = AttributeBreakdown(product_type=20, category_spec=20, shielding_material=20, mount_form=20, gender_pins=20)
 NINETY = AttributeBreakdown(product_type=20, category_spec=20, shielding_material=20, mount_form=10, gender_pins=20)
+SEVENTY = AttributeBreakdown(product_type=20, category_spec=20, shielding_material=10, mount_form=10, gender_pins=10)
 
 
-def cand(name, total, qty, conf, breakdown=FULL):
+def cand(name, total, qty, conf, breakdown=FULL, title="", price="", form=True, listing_form="panel mount coupler",
+         caveats="", moq=None):
     return Candidate(manufacturer=name, price_total=total or 0, quantity_covered=qty or 0, unit_price_note="",
-                     unit_price_confidence=conf, attribute_breakdown=breakdown, email=f"{name}@x", url=f"u/{name}")
+                     unit_price_confidence=conf, attribute_breakdown=breakdown.model_copy(), email=f"{name}@x",
+                     url=f"u/{name}", listing_title=title, price=price, same_product_form=form,
+                     listing_form=listing_form, listing_caveats=caveats, moq=moq)
 
 
 def result(*cands):
     return SourcingResult(product="x", no_match=False, candidates=list(cands))
 
 
-# Bundle price is divided down; ambiguous never yields a unit price.
-assert unit_price(cand("A", 19.75, 10, "inferred")) == 1.975
-assert unit_price(cand("A", 19.75, 10, "ambiguous")) is None
+# Bundle price is divided down only when the pack size is attached to the listing; ambiguous never priced.
+assert unit_price(cand("AS95", 19.75, 10, "inferred", title="RJ45 Panel Mount Coupler(10PCS)", price="$19.75")) == 1.975
+assert unit_price(cand("A", 19.75, 10, "ambiguous", title="Coupler 10PCS")) is None
 assert unit_price(cand("A", 19.75, None, "stated")) is None
+
+# MOQ is not a pack size (item 3). Suzhou Bulovb, exact listing text from the 2026-09-25 run: $6.88 per piece, not $0.0688.
+bulovb = cand("Suzhou Bulovb Electronic Co., Ltd.", 6.88, 100, "inferred",
+              title="USB2.0 a Male & a Female to B Female Printer Print Converter Adapter Connector USB 2.0 Port",
+              price="US$0.99-6.88")
+assert not pack_size_supported(bulovb) and unit_price(bulovb) == 6.88
+# HDFF / FARSINCE, the original case: "$1.27-1.58, Min. order 500 pieces" -> $1.58 per piece, not $0.0032.
+farsince = cand("FARSINCE", 1.58, 500, "inferred", title="FARSINCE 4K 8K HDMI Panel Coupler HDMI Female to Female",
+                price="$1.27-1.58 Min. order: 500 pieces")
+assert not pack_size_supported(farsince) and unit_price(farsince) == 1.58
+assert not pack_size_supported(cand("X", 6.88, 100, "stated", price="US$0.99-6.88 100 Pieces (MOQ)"))
+assert not pack_size_supported(cand("X", 1.5, 100, "stated", price="$1.50 (100-499 pieces)"))
+
+# A per-piece price stated next to the pack price counts as the pack size ("$23.68 ($4.74/pc)" = 5-pack).
+assert unit_price(cand("AliX", 23.68, 5, "inferred", price="$23.68 ($4.74/pc)")) == 23.68 / 5
+assert unit_price(cand("AliX", 23.68, 5, "inferred", price="$23.68 ($2.00/pc)")) == 23.68  # doesn't match -> per piece
+
+# Cable backstop (2026-09-28 run): a stated length or a plain "cable" title is excluded for coupler/adapter
+# targets, whatever the model said; couplers "for ... cable" are left alone.
+from sourcing_agent import apply_form_rules
+coupler_target = {"sku": "ECF504-UABS", "description": "USB Adapter A-B, Shielded"}
+r = result(cand("Cooyear", 0.65, 1, "stated", title="50cm USB 2.0 Type A Female to B Male Adapter Cable Fast Charging"),
+           cand("Wusheng", 2.0, 1, "stated", title="USB A-B PANEL ADPT SHIELDED"),
+           cand("Inline", 1.0, 1, "stated", title="Cat6 FTP Shielded Female to Female Inline Cable Coupler"))
+apply_form_rules(r, coupler_target)
+assert [c.same_product_form for c in r.candidates] == [False, True, True], [c.listing_form for c in r.candidates]
+assert "length 50cm" in r.candidates[0].listing_form
+antenna = result(cand("Pigtail", 5.0, 1, "stated", title="2.4GHz 9dBi antenna with 5m cable"))
+apply_form_rules(antenna, {"sku": "HG", "description": "2.4 GHz 9dBi Omnidirectional Antenna, N-Female Connector"})
+assert antenna.candidates[0].same_product_form  # not a coupler/adapter target: left to the model
+
+# Inline couplers are the same form as a panel-mount coupler target (real titles the model excluded,
+# 2026-09-28); multi-port, wrong-connector and cable listings stay excluded.
+sc_target = {"sku": "ECF504-SC5E", "description": "Cat5e RJ45 Coupler Shielded (8x8) Panel Mount Style"}
+r = result(cand("SC5E-inline", 1.0, 1, "stated", title="Cat6 Waterproof Shielded RJ45 Inline Coupler Female to Female Straight",
+                form=False, listing_form="Inline coupler"),
+           cand("SC6-inline", 1.0, 1, "stated", title="CAT6 RJ45 8p8c Network Jack in-Line Coupler Female to Female",
+                form=False, listing_form="In-line coupler"),
+           cand("Cable-coupler", 1.0, 1, "stated", title="Cat6 FTP Shielded Female to Female Inline Cable Coupler",
+                form=False, listing_form="Inline coupler (no cable)"),
+           cand("4port", 1.0, 1, "stated", title="RJ45 4-Port Inline Coupler Female", form=False, listing_form="4 port inline coupler"),
+           cand("RJ11", 1.0, 1, "stated", title="RJ11 6P4C Inline Coupler", form=False, listing_form="RJ11 inline coupler"),
+           cand("Patch", 1.0, 1, "stated", title="RJ45 Inline Coupler with 1m Patch Cable", form=False, listing_form="inline coupler"))
+apply_form_rules(r, sc_target)
+assert [c.same_product_form for c in r.candidates] == [True, True, True, False, False, False], \
+    [(c.manufacturer, c.same_product_form) for c in r.candidates]
+assert "mount scored separately" in r.candidates[0].listing_form
 
 # 100% match barely under L-Com loses to 90% match with a big gap.
 idx, reason = recommend(result(cand("Close", 21.0, 1, "stated"), cand("Cheap", 4.0, 1, "stated", NINETY),
                                cand("Mystery", 1.0, 1, "ambiguous")), 22.59)
 assert idx == 1, reason
 
-# 30-79% cheaper no longer qualifies (bar is 80%).
+# Messages name the bar that failed (item 7).
 idx, reason = recommend(result(cand("Half", 11.0, 1, "stated")), 22.59)
-assert idx is None and ">= 80% cheaper" in reason and "do not source" in reason, reason
+assert idx is None and "price margin only" in reason and ">= 80% cheaper" in reason and "do not source" in reason.lower(), reason
+idx, reason = recommend(result(cand("Close", 2.0, 1, "stated", SEVENTY)), 22.59)
+assert idx is None and "accuracy only" in reason and "70%" in reason and "does qualify" in reason, reason
+idx, reason = recommend(result(cand("Bad", 21.0, 1, "stated", SEVENTY)), 22.59)
+assert idx is None and "accuracy and price" in reason, reason
 
-# HDFF regression: price/MOQ gave $0.0032 "inferred" next to two $1.09 "stated" -> implausible, not picked.
-hdff = result(cand("A", 1.09, 1, "stated"), cand("B", 1.09, 1, "stated"), cand("FARSINCE", 1.58, 500, "inferred"))
+# Implausible guard still works on a genuinely too-low price.
+hdff = result(cand("A", 1.09, 1, "stated"), cand("B", 1.10, 1, "stated"), cand("Cheapo", 0.05, 1, "stated"))
 assert implausible_units(hdff) == {2}
 idx, reason = recommend(hdff, 23.79)
 assert idx == 0, reason
-
-# Implausible price can't make a product clear the bar on its own.
 idx, reason = recommend(result(cand("Real", 20.0, 1, "stated"), cand("Real2", 21.0, 1, "stated"),
-                               cand("Bug", 1.58, 500, "inferred")), 23.79)
+                               cand("Bug", 0.05, 1, "inferred")), 23.79)
 assert idx is None and "implausible" in reason, reason
+idx, reason = recommend(result(cand("Acc", 20.0, 1, "stated"), cand("Acc2", 21.0, 1, "stated"), cand("Unpriced", 0, 1, "ambiguous"),
+                               cand("Bug", 0.05, 1, "inferred"), cand("Top", 0.0, 1, "ambiguous")), 23.79)
+assert "but is " in reason or "but its price" in reason, reason
+
+# Wrong product form zeroes the match and is never recommended, even when cheapest (item 1, SC5E Lanka vs Kabasi).
+lanka = cand("Lanka Industrial Automation", 0.70, 1, "stated", NINETY, form=False, listing_form="patch cable with coupler end")
+kabasi = cand("Xiamen Kabasi Electric", 2.33, 1, "stated", NINETY)
+assert candidate_score(lanka)[0] == 0 and "Wrong product form" in candidate_comment(lanka)
+idx, reason = recommend(result(lanka, kabasi), 22.59)
+assert idx == 1, reason
+idx, reason = recommend(result(lanka), 22.59)
+assert idx is None and "product form" in reason and "patch cable" in reason, reason
+
+# Missing scores say "scoring failed", never a margin message (item 4, HDFF).
+unscored = cand("Mo-Tech", 1.5, 1, "stated")
+unscored.attribute_breakdown = None
+idx, reason = recommend(result(unscored), 23.79)
+assert idx is None and reason.startswith("Scoring failed"), reason
+
+# Accuracy first: a 100% inferred price beats an 80% stated one; within 5 points, stated wins.
+EIGHTY = AttributeBreakdown(product_type=20, category_spec=20, shielding_material=20, mount_form=20, gender_pins=0)
+NINETY_FIVE = AttributeBreakdown(product_type=20, category_spec=20, shielding_material=20, mount_form=15, gender_pins=20)
+idx, _ = recommend(result(cand("Stated80", 2.0, 1, "stated", EIGHTY), cand("Inferred100", 1.5, 1, "inferred")), 23.79)
+assert idx == 1
+idx, reason = recommend(result(cand("Inferred100", 1.5, 1, "inferred"), cand("Stated95", 2.0, 1, "stated", NINETY_FIVE)), 23.79)
+assert idx == 1 and "within 5 accuracy points" in reason, reason
+# Tie-break among equally accurate qualifiers (item 8): stated > inferred > promo, then named maker, then lowest price.
+idx, _ = recommend(result(cand("Promo seller", 1.09, 1, "promo (regular price unknown)"), cand("Acme", 2.0, 1, "stated")), 23.79)
+assert idx == 1
+idx, _ = recommend(result(cand("Unknown seller", 1.0, 1, "stated"), cand("Acme", 2.0, 1, "stated")), 23.79)
+assert idx == 1
+idx, _ = recommend(result(cand("Acme", 2.0, 1, "stated"), cand("Beta Co", 1.5, 1, "stated")), 23.79)
+assert idx == 1
+
+# Summary line is templated from the table's scores (item 5); comments don't invent a reason for zeros.
+line = score_summary(result(kabasi, lanka))
+assert "90% (20/20/20/10/20)" in line and "0% (20/20/20/10/20, wrong form (patch cable with coupler end))" in line, line
+no_mount = AttributeBreakdown(product_type=20, category_spec=20, shielding_material=20, mount_form=0, gender_pins=20)
+assert candidate_comment(cand("ROHO", 14.79, 1, "stated", no_mount)) == "0 pts on: Mount/form factor"
 
 # ECF504-BAS regression: 2 candidates ($2.10 vs $34.72) is two real prices, not a parsing error.
 assert implausible_units(result(cand("Dongguan Baimiya", 2.10, 1, "stated"), cand("Wusheng", 34.72, 1, "stated"))) == set()
@@ -57,7 +151,7 @@ kept = dedupe_manufacturers(dupes)
 assert [(c.manufacturer, c.price_total) for c in kept] == [
     ("Other", 9.0), (" premiercable ", 18.66), ("Unknown/Generic", 1.0), ("Unknown/Generic", 2.0)], kept
 
-# Stated beats a (plausible) inferred price at equal accuracy, even though inferred is cheaper.
+# Stated beats a (plausible) inferred price, even though inferred is cheaper.
 idx, reason = recommend(result(cand("Inferred", 1.5, 1, "inferred"), cand("Stated", 2.0, 1, "stated")), 23.79)
 assert idx == 1, reason
 
@@ -111,8 +205,198 @@ assert "https://fm.en.made-in-china.com/product/QUt/China-LC.html)" in seen and 
 assert "Shenzhen FiberMania Technology Co., Ltd." in seen and "fm.en.made-in-china.com/)" not in seen
 assert strip_page_chrome("plain text, no json") == "plain text, no json"
 
+# Fix 1: antenna band/port. Roho's exact title from the 29 Sep run (and the review's wording of it) must no
+# longer be recommendable for a single-band, single-port target; single-band antennas are untouched.
+from sourcing_agent import apply_spec_rules, ordering_notes, ordering_note, ORDERING_NOTE_FIELD
+hg = {"sku": "HG2409U-PRO", "description": "2.4 GHz 9dBi Omnidirectional Antenna, N-Female Connector", "lcom_price": 99.00}
+ROHO_95 = AttributeBreakdown(product_type=20, category_spec=20, shielding_material=20, mount_form=20, gender_pins=15)
+for roho_title in ("2way 2.4GHz 5.8GHz 5-9dBi Dual Band MIMO Omni Direction N Female Connector Pole Mount Fiberglass Antenna",
+                   "2way 2.4GHz/5.8GHz 5.9dBi Dual-Band MIMO Omni-Direction N-Female Connector Pole-Mount Fiberglass Antenna"):
+    r = result(cand("Roho Connector", 14.79, 1, "stated", ROHO_95, title=roho_title))
+    apply_spec_rules(r, hg)
+    assert candidate_score(r.candidates[0])[0] == 75 and "single-band target" in candidate_comment(r.candidates[0])
+    assert recommend(r, hg["lcom_price"])[0] is None
+for single in ("9dBi High Gain 2.4GHz Omni Fiberglass Antenna N Female", "2400-2500MHz Omni Outdoor Antenna 9dBi N Female"):
+    r = result(cand("Single", 14.79, 1, "stated", ROHO_95, title=single))
+    apply_spec_rules(r, hg)
+    assert candidate_score(r.candidates[0])[0] == 95, single
+r = result(cand("Coupler", 1.0, 1, "stated", title="Dual Band 2.4GHz/5.8GHz thing"))
+apply_spec_rules(r, {"description": "HDMI Panel Mount Adapter, Female to Female"})
+assert candidate_score(r.candidates[0])[0] == 100  # non-antenna targets never touched
+
+# Fix 2: "check before ordering" notes, from this run's three listings (29 Sep) plus a clean one.
+dsub = {"sku": "C&P9M", "description": "Insertion Type D-Sub Connector, DB9 Male"}
+notes = ordering_notes(cand("FF TEK", 0.25, 1, "stated", title="High Quality PCB DIP Mount D-SUB Standard Connectors Male Female VGA Dsub Connector",
+                            price="US$0.03-0.25", moq="500 pieces"), dsub)
+assert any("D-sub pin count" in n and "VGA" in n for n in notes) and any("500+ pieces" in n for n in notes), notes
+notes = ordering_notes(cand("Centron", 6.50, 1, "stated", title="Milcom MC-6BP MC-6BR Lightning Arrestor Coaxial Surge Protector "
+                            "Bulkhead N-Type Male/Female 6GHz Transmitter RF", moq="5 pieces"),
+                       {"description": "Coaxial Surge Protector, 18kA, 50 ohm, N-Type F/F Bulkhead, 1 Pole"})
+assert any("MC-6BP, MC-6BR" in n for n in notes), notes
+notes = ordering_notes(cand("TOPNET", 0.075, 1, "stated", title="Sc LC Simplex Duplex Fiber Optic Coupler Adaptor",
+                            price="US$0.062-0.075", moq="100 Piece"),
+                       {"description": "LC to SC Simplex Multimode Fiber Optic Adapter"})
+assert any("simplex and duplex" in n for n in notes) and not any("MOQ" in n for n in notes), notes  # MOQ 100 < 500
+assert any("1,000+" in n for n in ordering_notes(cand("XTZ", 0.20, 1, "stated", price="$0.20 1,000 Pieces (MOQ)"),
+                                                  {"description": "HDMI Panel Mount Adapter, Female to Female"}))
+assert ordering_notes(cand("Eternalstar", 1.25, 1, "stated", title="DVI to DVI Adapter Female to Female Converter DVI-I (24+5) Female to Female",
+                           price="$1.25"), {"description": "DVI 24+5 female to female coupler"}) == []
+assert ordering_notes(cand("Nice U.mi", 4.24, 1, "stated", title="1-4PCS RJ45 Panel Mount Coupler Shielded D-Type RJ45 Connector CAT6 "
+                           "Female To Female LAN Network Bulkhead Pass Through Socket", price="$4.24"),
+                      {"description": "Cat6 RJ45 Coupler Shielded (8x8) Panel Mount Style"}) == []
+assert ordering_notes(cand("X", 1.0, 1, "stated", caveats="only the MC-6BR variant is F/F"), {"description": "x"}) == \
+    ["model: only the MC-6BR variant is F/F"]
+
+# MOQ/tier remarks move out of the model caveat into the >= 500 check (exact caveats from the 29 Sep run, where
+# the structured moq field said "Not stated"). 500 is flagged, 499 isn't; useful caveats are kept.
+def note_for(caveat, moq="Not stated"):
+    return ordering_notes(cand("X", 1.0, 1, "stated", caveats=caveat, moq=moq), {"description": "x"})
+assert note_for("Minimum order quantity is 500 pieces") == ["price needs an order of 500+ pieces (MOQ)"]  # HDFF
+assert note_for("MOQ 1000 pieces at this price; lower volumes (10-9999) available at $1.05-1.35") == \
+    ["price needs an order of 1,000+ pieces (MOQ)"]  # TDG1026KS-C6
+assert note_for("Minimum order quantity is 499 pieces") == []
+assert note_for("Minimum order 100 pieces; pricing shown is for 100-499 piece quantity tier") == []  # VIC00001
+assert note_for("Tiered pricing at volume; Square Flange form factor specified but adapter gender may vary by model selection") == \
+    ["model: Square Flange form factor specified but adapter gender may vary by model selection"]  # FOA-020C
+assert note_for("PE plastic material (not silicone); female port only", moq="1,000 pieces") == \
+    ["price needs an order of 1,000+ pieces (MOQ)", "model: PE plastic material (not silicone); female port only"]  # CAPUSB-A
+assert note_for("CAT6 spec listed; target is CAT5e") == ["model: CAT6 spec listed; target is CAT5e"]  # ECF504-SC5E
+
+# ...and they land in the Excel Ordering Note column (amber) only for a recommended, flagged product.
+path = os.path.join(tempfile.mkdtemp(), "notes.xlsx")
+write_excel_report([
+    ({"sku": "S1", "description": "Insertion Type D-Sub Connector, DB9 Male", "lcom_price": 3.98},
+     result(cand("FF TEK", 0.25, 1, "stated", title="Male Female VGA Dsub Connector"))),
+    ({"sku": "S2", "description": "DVI 24+5 female to female coupler", "lcom_price": 28.19},
+     result(cand("Eternalstar", 1.25, 1, "stated", title="DVI Female to Female Coupler"))),
+    ({"sku": "S3", "description": "d", "lcom_price": 5.0}, result(cand("Pricey", 4.0, 1, "stated", title="VGA thing"))),
+], path)
+ws = openpyxl.load_workbook(path)["Results"]
+col = [c.value for c in ws[1]].index(ORDERING_NOTE_FIELD)
+assert "VGA" in ws[2][col].value and ws[2][col].fill.fgColor.rgb.endswith("FFE699")
+assert ws[3][col].value in (None, "") and ws[4][col].value in (None, "")
+
+# UABS $0.11 "adapter" (29 Sep, 102713): really a printer data cable at a junk listing price. Three independent
+# catches now: the cable phrase, the model's own low-price warning, and the price check once the $1.09 promo
+# prices beside it are fixed.
+from sourcing_agent import apply_price_rules, cable_evidence
+uabs = {"sku": "ECF504-UABS", "description": "USB Adapter A-B, Shielded", "lcom_price": 20.19}
+tongze = cand("unnamed", 0.11, 1, "stated", title="USB 2.0 High-Speed Square Port Printer Data Cable Adapter with a Male to B Male "
+              "Shielded Magnetic Ring", price="$0.11", moq="5 pieces",
+              caveats="Price unusually low; verify actual product form and shielding specifications on order")
+cand1 = cand("unnamed", 1.63, 1, "stated", title="USB2.0 Type a to B Printer Scanner Cable High Speed Data Transfer Cord Shielded "
+             "PVC Jacket Male Connector for Computer", price="$0.77-1.63")
+cand4 = cand("unnamed", 1.09, 1, "inferred", SEVENTY, title="High Speed USB 2.0 Type A Female To Type B Male USB Printer Scanner "
+             "Adapter Data Sync Coupler Converter Connector", price="$1.09")
+cand4.unit_price_note = "Title explicitly lists female-to-male adapter; promo pricing shown ($1.09 new shopper discount from base price ~$2.31)"
+cand5 = cand("unnamed", 1.09, 1, "inferred", SEVENTY, title="USB 2.0 A Male & Female to USB Type B Print Converter Adapter", price="$1.09")
+cand5.unit_price_note = "Title lists both male and female variants; promo pricing ($1.09 new shopper discount)"
+assert "Printer Data Cable" in cable_evidence(tongze.listing_title) and "Scanner Cable" in cable_evidence(cand1.listing_title)
+assert cable_evidence("Cat6 IP67 Waterproof RJ45 Bulkhead Connector Outdoor Ethernet Cable Panel Mount") == ""  # real coupler
+assert cable_evidence("SC-LC Simplex Hybrid Adapter with Flange Metal Fiber Optic Patch Cord Pigtail") == ""   # real adapter
+r = result(cand1, tongze, cand4, cand5)
+apply_form_rules(r, uabs)
+apply_price_rules(r)
+assert [c.same_product_form for c in r.candidates] == [False, False, True, True]
+assert cand4.price_total == 2.31 and "regular price $2.31" in cand4.code_notes[0]
+assert cand5.unit_price_confidence == "promo (regular price unknown)"
+assert 1 in implausible_units(r)  # the model's own warning alone flags it
+idx, reason = recommend(r, uabs["lcom_price"])
+assert idx is None and "accuracy only" in reason, reason
+# Without the warning or the cable rule, the price check alone now fires: reference is $1.16/$2.31, not the $1.09 promo.
+plain = cand("unnamed", 0.11, 1, "stated")
+others = [cand("A", 1.63, 1, "stated"), cand("B", 1.16, 1, "stated"), cand("C", 1.09, 1, "promo (regular price unknown)")]
+assert 0 in implausible_units(result(plain, *others))
+# The promo backstop leaves correctly used regular prices alone.
+ok = cand("X", 2.28, 1, "stated"); ok.unit_price_note = "Regular price $2.28 (promo $1.09 for new shoppers)"
+ok2 = cand("Y", 5.77, 1, "stated"); ok2.unit_price_note = "Single unit; promo price shown but regular price $5.77 used"
+leak = cand("Z", 1.09, 1, "stated", price="$1.09"); leak.unit_price_note = "Single piece price shown at $1.09 (promotional price, regular $1.49)"
+lcsp = cand("L", 22.84, 1, "stated", price="$17.13 $22.84 -25%")  # replay false positive, 102713 LCSP1050 cand 4
+lcsp.unit_price_note = "Regular price after promo discount; 50ohm explicitly stated"
+apply_price_rules(result(ok, ok2, leak, lcsp))
+assert (ok.price_total, ok.unit_price_confidence, ok2.price_total, leak.price_total) == (2.28, "stated", 5.77, 1.49)
+assert (lcsp.price_total, lcsp.unit_price_confidence, lcsp.code_notes) == (22.84, "stated", [])
+
 # --sku: case-insensitive, order as asked, duplicates collapsed, unknown SKUs reported.
 pool = [{"sku": "FOA-020C"}, {"sku": "C&P9M"}, {"sku": "HG2409U-PRO"}]
 picked, missing = pick_skus(pool, ["hg2409u-pro", "FOA-020C", "FOA-020C", "NOPE"])
 assert [p["sku"] for p in picked] == ["HG2409U-PRO", "FOA-020C"] and missing == ["NOPE"]
+# Tool wrapper against the real MCP result type (a fake with the wrong field name once hid a
+# bug that failed every call): rate limit -> backoff + retry, then the page text comes through.
+import asyncio
+import sourcing_agent
+from mcp import types as mcp_types
+
+
+class FakeSession:
+    replies = [mcp_types.CallToolResult(content=[mcp_types.TextContent(type="text", text="429 Too Many Requests")], is_error=True),
+               mcp_types.CallToolResult(content=[mcp_types.TextContent(type="text", text='{"content": "Widget $1.09"}')])]
+
+    async def call_tool(self, name, arguments, read_timeout_seconds=None):
+        return self.replies.pop(0)
+
+
+async def no_sleep(_):
+    pass
+
+
+sourcing_agent.asyncio.sleep, real_sleep = no_sleep, sourcing_agent.asyncio.sleep
+tool = sourcing_agent.make_bounded_tool(
+    type("T", (), {"name": "nimble_extract", "description": "", "inputSchema": {"type": "object", "properties": {}}})(),
+    FakeSession(), sourcing_agent.ToolBudget(3), "TEST")
+assert asyncio.run(tool.call({"url": "https://www.alibaba.com/x"})) == "Widget $1.09"
+assert sourcing_agent.NIMBLE_RATE_LIMITS["count"] == 1 and sourcing_agent.CALL_LOG[-1]["outcome"] == "ok"
+sourcing_agent.asyncio.sleep = real_sleep
+
+# Timing summary: Anthropic time = product time - Nimble time; timeouts listed; percentiles sane.
+assert percentile([1, 2, 3, 4, 10], 0.5) == 3 and percentile([1, 2, 3, 4, 10], 0.9) == 10 and percentile([], 0.5) == 0
+calls = [{"sku": "A", "tool": "nimble_extract", "site": "alibaba.com", "url": "u1", "start": 0.0, "secs": 20.0, "outcome": "ok"},
+         {"sku": "A", "tool": "nimble_extract", "site": "aliexpress.com", "url": "u2", "start": 10.0, "secs": 120.0, "outcome": "timeout"}]
+summary = timing_summary(calls, [{"sku": "A", "secs": 200.0, "calls": 2, "stop": "found 5 candidates (2/13 calls, 1 failed)"}], 200.0)
+import re
+assert re.search(r"Waiting on Nimble:\s+2\.2 min\s+65%", summary) and re.search(r"Anthropic \+ overhead:\s+1\.2 min\s+35%", summary), summary  # 10-20s overlap counted once
+assert "TIMEOUT A nimble_extract u2" in summary and "15-30s: 1" in summary, summary
+assert "Peak simultaneous Nimble calls: 2" in summary and "found 5 candidates: 1" in summary, summary
+assert re.search(r"extract aliexpress\.com\s+1 .* 1$", summary, re.M), summary  # per-site timeout column
+
+# Peak concurrency: back-to-back calls don't overlap; three at once do.
+from sourcing_agent import peak_concurrency, stop_reason, site_search_url, prefetch_site_searches, MAX_TOOL_CALLS_PER_PRODUCT
+assert peak_concurrency([{"start": 0, "secs": 5}, {"start": 5, "secs": 5}]) == 1
+from sourcing_agent import busy_time
+assert busy_time([{"start": 0, "secs": 10}, {"start": 0, "secs": 10}, {"start": 0, "secs": 12}]) == 12  # 3 parallel = 12s, not 32s
+assert busy_time([{"start": 0, "secs": 5}, {"start": 10, "secs": 5}]) == 10
+assert peak_concurrency([{"start": 0, "secs": 5}, {"start": 1, "secs": 5}, {"start": 2, "secs": 1}]) == 3
+
+# Stop reasons tell "found enough" from "ran out of calls" from "gave up with budget left".
+five = result(*[cand(f"M{n}", 1.0, 1, "stated") for n in range(5)])
+assert stop_reason(five, 9, 0).startswith("found 5 candidates")
+assert stop_reason(result(cand("A", 1.0, 1, "stated")), MAX_TOOL_CALLS_PER_PRODUCT, 4) == \
+    f"budget used up with 1 candidates ({MAX_TOOL_CALLS_PER_PRODUCT}/{MAX_TOOL_CALLS_PER_PRODUCT} calls, 4 failed)"
+assert stop_reason(result(cand("A", 1.0, 1, "stated")), 4, 0).startswith("model stopped with 1 candidates, budget left")
+assert stop_reason(None, 2, 2).startswith("no usable result")
+
+# Prefetch: the three site searches run at the same time through the budgeted wrapper (3 calls used).
+assert site_search_url("made-in-china.com", "Cat6 RJ45 Coupler (8x8)") == \
+    "https://www.made-in-china.com/products-search/hot-china-products/Cat6_RJ45_Coupler_8x8.html"
+assert site_search_url("alibaba.com", "LC to SC Adapter") == "https://www.alibaba.com/trade/search?SearchText=LC+to+SC+Adapter"
+
+
+class SlowSession:
+    in_flight = peak = 0
+
+    async def call_tool(self, name, arguments, read_timeout_seconds=None):
+        SlowSession.in_flight += 1
+        SlowSession.peak = max(SlowSession.peak, SlowSession.in_flight)
+        await asyncio.sleep(0.05)
+        SlowSession.in_flight -= 1
+        return mcp_types.CallToolResult(content=[mcp_types.TextContent(type="text", text=f"page for {arguments['url']}")])
+
+
+budget = sourcing_agent.ToolBudget(MAX_TOOL_CALLS_PER_PRODUCT)
+extract_tool = sourcing_agent.make_bounded_tool(
+    type("T", (), {"name": "nimble_extract", "description": "", "inputSchema": {"type": "object", "properties": {}}})(),
+    SlowSession(), budget, "PREFETCH")
+pages = asyncio.run(prefetch_site_searches([extract_tool], {"sku": "S", "description": "Cat6 RJ45 Coupler"}))
+assert budget.used == 3 and SlowSession.peak == 3, (budget.used, SlowSession.peak)
+assert all(f"=== {site} search results" in pages for site in sourcing_agent.SOURCING_SITES)
 print("ok")

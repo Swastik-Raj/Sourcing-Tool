@@ -21,6 +21,7 @@ Run:
 import argparse
 import asyncio
 import collections
+import csv
 import contextvars
 import json
 import logging
@@ -42,7 +43,7 @@ from mcp.client.streamable_http import streamable_http_client
 from pydantic import BaseModel, ValidationError
 from pydantic.json_schema import SkipJsonSchema
 
-from anthropic import AsyncAnthropic
+from anthropic import APIStatusError, AsyncAnthropic
 from anthropic.lib.tools import beta_async_tool
 
 MODEL = "claude-haiku-4-5"
@@ -118,7 +119,7 @@ PRODUCTS = [
     {"sku": "ECF504-AA", "description": "Flanged Panel Mounted USB 2.0 Coupler, Shielded, Type A/A Connectors", "lcom_price": 24.79},
     # LOWER CONFIDENCE: no confirmed L-Com listing found. This is Newark's qty-1 price standing in
     # for L-Com's own; other distributors range $2.59-$5.60 depending on source/quantity.
-    {"sku": "C&P9M", "description": "Insertion Type D-Sub Connector, DB9 Male", "lcom_price": 3.98},
+    {"sku": "C&P9M", "description": "Insertion Type D-Sub Connector, DB9 Male, Crimp Contacts", "lcom_price": 3.98},
     # Graybar's listed L-Com price for this exact SKU.
     {"sku": "FOA-020C", "description": "LC to SC Simplex Multimode Fiber Optic Adapter", "lcom_price": 63.56},
     # Newark's qty-1 listed price.
@@ -178,7 +179,15 @@ put it here - don't leave it "Not stated" and mention it only elsewhere.
 listing_caveats: one short line on anything a buyer should check before ordering - the
 listing covers several models or variants, its title names a different pin count, connector
 or spec than the target, a material or mounting detail that differs from the target. Leave
-MOQ and quantity-tier pricing out (that goes in moq and price). "" if none.
+MOQ and quantity-tier pricing out (that goes in moq and price). Also say so here when the
+listing contradicts itself on an attribute - e.g. its title says "Female" but its attribute
+table says "male", or the text says "compatible with CAT5e" while a table lists Cat3-Cat6A.
+"" if none.
+
+spec_lines: if you saw the listing's spec table or description (a detail-page extract), copy the
+lines about type, jacket, length, category/rating, gender and contact/mount briefly and
+verbatim, e.g. "Jacket: PVC; Length: Customized; Category: Cat5e Cat6". "" if you only saw the
+search-result title. Never invent or paraphrase specs you did not see.
 """
 
 
@@ -205,6 +214,7 @@ class Candidate(BaseModel):
     same_product_form: bool  # false = different form (e.g. a cable vs a coupler): never recommended
     listing_form: str  # what the listing physically is, e.g. "patch cable with coupler end"
     listing_caveats: str  # the model's "check before ordering" line, "" if none
+    spec_lines: str = ""  # spec-table lines the model actually saw (type/jacket/length/category), shown in the report
     # Filled by code after parsing (e.g. a score it overrode); kept out of the schema Claude sees.
     code_notes: SkipJsonSchema[list[str]] = []
     moq: Optional[str] = None
@@ -557,6 +567,7 @@ async def research_once(client: AsyncAnthropic, session: ClientSession, tools, p
             apply_form_rules(parsed, product)
             apply_spec_rules(parsed, product)
             apply_price_rules(parsed)
+            apply_reviewer_exclusions(parsed, product["sku"])
         except ValidationError:
             parsed = None
     return parsed, total_in, total_out, budget.used
@@ -586,6 +597,13 @@ STRONG_CABLE = re.compile(r"\b(?:data|printer|scanner|extension|charging|charger
                           r"|\bferrite\b|\bmagnetic ring\b|\b\d+\s*awg\b|\bpvc jacket\b", re.IGNORECASE)
 
 
+# Spec-sheet wording seen on HDFF's recommended page (xtz-tech, 2026-10-04: "Jacket PVC", "AWG 24/28/26",
+# "Length (Customized)") - note only, never an exclusion. Candidate text rarely carries page specs (the
+# search reads titles), and no saved report has any, so this can't be replayed yet: 0 hits on all 10 reports.
+SPEC_CABLE = re.compile(r"\bpvc jacket\b|\bjacket\s*:?\s*pvc\b|\b\d+(?:/\d+)*\s*awg\b|\bawg\s*\d+|"
+                        r"\b(?:custom(?:ized|ised)?|adjustable)\s+length\b|\blength\s*\(custom", re.IGNORECASE)
+
+
 def cable_evidence(title: str) -> str:
     if CABLE_LENGTH.search(title):
         return f"length {CABLE_LENGTH.search(title)[0].strip()} in title"
@@ -598,6 +616,70 @@ def cable_evidence(title: str) -> str:
 
 INLINE_COUPLER = re.compile(r"\bin[\s-]?line\b.*\bcoupl|\bcoupl\w*\b.*\bin[\s-]?line\b", re.IGNORECASE)
 MULTI_PORT = re.compile(r"\b\d+\s*-?\s*(?:port|way|gang)s?\b|\b(?:dual|quad|multi)\b", re.IGNORECASE)
+# Contact / termination type. A crimp-contact target is a different part from a solder-cup
+# listing (C&P9M, Srijan's RS check, 2026-10-04: all four candidates were solder type).
+CONTACT_TYPES = {
+    "crimp": re.compile(r"\bcrimp(?:ed|ing)?\b", re.IGNORECASE),
+    "solder": re.compile(r"\bsolder\b", re.IGNORECASE),
+    "PCB/DIP": re.compile(r"\bpcb\b|\bdip\b", re.IGNORECASE),
+    "IDC": re.compile(r"\bidc\b|insulation[\s-]displacement", re.IGNORECASE),
+}
+
+
+def contact_types(text: str) -> set:
+    return {name for name, pat in CONTACT_TYPES.items() if pat.search(text)}
+
+
+def candidate_contact_text(c: Candidate) -> str:
+    return f"{c.listing_title or ''} {c.listing_form or ''} {c.listing_caveats or ''} {c.spec_lines or ''}"
+
+
+# A listing that contradicts itself (Kabasi: "compatible with CAT5e" next to a "Cat.3-Cat.6A"
+# table; LUNG KAY: title "Type A Female", attribute table "Type A male") is flagged, not zeroed:
+# a category range alone is legitimate (Hyconnect's "Cat5e Cat6 Cat6a").
+COMPATIBLE_CAT = re.compile(r"compatible with\s+cat\.?\s?(\d)", re.IGNORECASE)
+CAT_RANGE = re.compile(r"cat\.?\s?(\d)\w*\s*[-–]\s*cat\.?\s?(\d)", re.IGNORECASE)
+PORT_GENDER = re.compile(r"\btype[\s-]?([ab])\s+(male|female)\b", re.IGNORECASE)
+
+
+def contradictions(c: Candidate) -> list:
+    text = f"{c.listing_title or ''} {c.spec_lines or ''} {c.listing_caveats or ''}"
+    found = []
+    single = {int(n) for n in COMPATIBLE_CAT.findall(text)}
+    top = max((int(hi) for _, hi in CAT_RANGE.findall(text)), default=0)
+    if single and top > max(single):
+        found.append(f"listing contradicts itself on category: \"compatible with CAT{max(single)}\" but also lists "
+                     f"up to Cat.{top} - confirm the rating with the seller")
+    genders = {}
+    for port, gender in PORT_GENDER.findall(text):
+        genders.setdefault(port.upper(), set()).add(gender.lower())
+    for port, seen in sorted(genders.items()):
+        if len(seen) > 1:
+            found.append(f"listing contradicts itself on gender: Type {port} is both male and female - "
+                         "confirm with the seller")
+    return found
+
+
+REVIEWER_EXCLUSIONS_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reviewer_exclusions.csv")
+
+
+def apply_reviewer_exclusions(result: SourcingResult, sku: str, path: str = REVIEWER_EXCLUSIONS_CSV) -> None:
+    """Honor reviewer_exclusions.csv (sku, supplier_or_url, reason): a candidate for that SKU whose maker
+    name or URL contains supplier_or_url (case-insensitive) is excluded as wrong product form."""
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            rows = [r for r in csv.DictReader(f) if r["sku"].strip().upper() == sku.strip().upper()]
+    except FileNotFoundError:
+        return
+    for c in result.candidates:
+        haystack = f"{c.manufacturer or ''} {c.url or ''}".lower()
+        for r in rows:
+            if r["supplier_or_url"].strip().lower() in haystack:
+                c.same_product_form = False
+                c.listing_form = f"excluded by reviewer: {r['reason'].strip()}"
+                break
+
+
 CONNECTOR_TOKENS = re.compile(r"\b(?:rj45|rj11|rj12|usb|hdmi|dvi|vga|displayport|db9|db25|d-?sub|lc|sc|st|fc|"
                               r"n-?type|sma|bnc|f-?type)\b", re.IGNORECASE)
 
@@ -611,6 +693,14 @@ def apply_form_rules(result: SourcingResult, product: dict) -> None:
       mount_form to score (SC5E excluded one, SC6 and TDG1026KS-C6 kept one). Only when
       the listing shows the target's connector type and isn't a multi-port variant."""
     target = product.get("description", "")
+    target_contacts = contact_types(target)
+    if target_contacts:  # applies to any target that states a contact type, not only couplers
+        for c in result.candidates:
+            found = contact_types(candidate_contact_text(c))
+            if found and not found & target_contacts and c.same_product_form:
+                c.same_product_form = False
+                c.listing_form = (f"wrong contact type ({'/'.join(sorted(found))} vs target "
+                                  f"{'/'.join(sorted(target_contacts))}; model said: {c.listing_form})")
     if not re.search(r"coupler|adapter|adaptor", target, re.IGNORECASE) or CABLE_WORD.search(target):
         return
     def connectors(text):  # Cat5e/Cat6/Cat6a/Cat7 couplers are RJ45 even when a title doesn't say so
@@ -677,11 +767,34 @@ REGULAR_AMOUNT = re.compile(r"(?:regular|base|original|list|full)(?:\s+price)?\s
                             re.IGNORECASE)
 
 
+# The lookahead keeps "$22.84 -25%" (a discount) from reading as a $22.84-25 range.
+PRICE_RANGE = re.compile(r"\$\s*(\d+(?:\.\d+)?)\s*[-–]\s*\$?\s*(?![\d.]+\s*%)(\d+(?:\.\d+)?)")
+# "$2.68 100-999 pieces $2.58 >=1,000 pieces": each price tied to its own quantity tier
+PRICE_TIER = re.compile(r"\$\s*(\d+(?:\.\d+)?)\s*\(?\s*((?:\d[\d,]*\s*[-–]\s*\d[\d,]*|[≥>]=?\s*\d[\d,]*)\s*"
+                        r"(?:pieces|pcs|pc))", re.IGNORECASE)
+
+
+def price_tier_note(c: Candidate) -> str:
+    """When the listing ties different prices to quantity tiers, say which tier was used."""
+    tiers = PRICE_TIER.findall(c.price or "")
+    if len(tiers) < 2:
+        return ""
+    used = [t for p, t in tiers if abs(float(p) - c.price_total) < 0.005]
+    others = ", ".join(f"${p} at {t}" for p, t in tiers if abs(float(p) - c.price_total) >= 0.005)
+    return f"price is for the {used[0]} tier (others: {others})" if used else ""
+
+
 def apply_price_rules(result: SourcingResult) -> None:
     """Backstop for new-shopper promo prices the model reported as the real price, despite the
     prompt (e.g. UABS 2026-09-29: "$1.09 new shopper discount from base price ~$2.31" priced at
     $1.09). If the price used is the promo amount: use the stated regular price, or label it
-    promo when none is given."""
+    promo when none is given. Also: a listed range ("$0.05-1.58") always uses its high end -
+    CAPUSB-A candidate 3 took the low end while other rows took the high one (Srijan, 2026-10-04)."""
+    for c in result.candidates:
+        rng = PRICE_RANGE.search(c.price or "")
+        if rng and c.price_total and abs(c.price_total - float(rng[1])) < 0.005 and float(rng[2]) > float(rng[1]):
+            c.code_notes.append(f"listed range ${rng[1]}-{rng[2]}: low end ${c.price_total:g} replaced by the high end")
+            c.price_total = float(rng[2])
     for c in result.candidates:
         text = f"{c.price or ''} {c.unit_price_note or ''}"
         if c.unit_price_confidence not in ("stated", "inferred") or not c.price_total or not PROMO_WORDS.search(text):
@@ -770,11 +883,13 @@ def candidate_comment(candidate: Candidate) -> str:
     if not scores:
         return "Scoring failed: no rubric scores returned for this candidate."
     if not candidate.same_product_form:
+        if (candidate.listing_form or "").startswith("excluded by reviewer"):
+            return candidate.listing_form
         return f"Wrong product form ({candidate.listing_form or 'not stated'}) - excluded."
     zero_attrs = [ATTRIBUTE_LABELS[attr] for attr in ATTRIBUTES if not scores.get(attr)]
     text = (f"0 pts on: {', '.join(zero_attrs)}" if zero_attrs
             else "All five rubric attributes matched something explicit on the listing.")
-    return "; ".join([text] + candidate.code_notes)
+    return "; ".join([text] + candidate.code_notes + contradictions(candidate))
 
 
 PACK_WORDS = r"(?:pcs|pc|pieces?|packs?|sets?|lots?|units?|count)"
@@ -882,7 +997,9 @@ def is_named(candidate: Candidate) -> bool:
 def recommend(result: Optional[SourcingResult], lcom_price: Optional[float]) -> tuple:
     """Returns (index of recommended candidate or None, one-line reason). The reason always
     names the rule that actually decided it."""
-    if result is None or result.no_match or not result.candidates:
+    if result is None:  # a crash or an unusable response is never a genuine "no match"
+        return None, error_recommendation("no result for this product")
+    if result.no_match or not result.candidates:
         return None, "No candidates found - nothing to source."
     if not lcom_price:
         return None, "No L-Com reference price for this product - cannot judge margin, not recommending."
@@ -900,10 +1017,21 @@ def recommend(result: Optional[SourcingResult], lcom_price: Optional[float]) -> 
                   and r["acc"] >= MIN_RECOMMEND_ACCURACY and r["pct"] is not None and r["pct"] >= MIN_MARGIN_PCT]
     if not qualifying:
         return None, no_qualifier_reason(rows, lcom_price, suspect, unscored)
-    top = max(r["acc"] for r in qualifying)
-    contenders = [r for r in qualifying if r["acc"] >= top - TIE_BAND_POINTS]
-    best = min(contenders, key=lambda r: (CONFIDENCE_RANK.get(r["c"].unit_price_confidence, 3),
-                                          not is_named(r["c"]), unit_price(r["c"])))
+
+    def pick(rs):  # most accurate; ties within TIE_BAND_POINTS broken by price confidence, named maker, price
+        top = max(r["acc"] for r in rs)
+        contenders = [r for r in rs if r["acc"] >= top - TIE_BAND_POINTS]
+        return min(contenders, key=lambda r: (CONFIDENCE_RANK.get(r["c"].unit_price_confidence, 3),
+                                              not is_named(r["c"]), unit_price(r["c"]))), contenders
+
+    # A candidate with no URL can't be recommended: nobody can open it to check or order.
+    with_url = [r for r in qualifying if (r["c"].url or "").strip()]
+    if not with_url:
+        nb, _ = pick(qualifying)
+        return None, (f"Best candidate (Candidate {nb['i'] + 1}, {nb['c'].manufacturer or 'unnamed supplier'}) qualifies "
+                      f"({nb['acc']}% accuracy, {format_unit(unit_price(nb['c']))}/unit) but has no URL - "
+                      "locate it manually. Not recommending.")
+    best, contenders = pick(with_url)
     c = best["c"]
     unit = unit_price(c)
     tie = (f" Tie-break over {len(contenders) - 1} other candidate(s) within {TIE_BAND_POINTS} accuracy points: "
@@ -913,6 +1041,72 @@ def recommend(result: Optional[SourcingResult], lcom_price: Optional[float]) -> 
         f"{format_unit(unit)}/unit ({c.unit_price_confidence}), {format_vs_lcom(price_vs_lcom(unit, lcom_price))} "
         f"than L-Com.{tie}"
     )
+
+
+def error_text(exc: BaseException) -> str:
+    """Short, single-line reason for a product that crashed."""
+    msg = " ".join(str(getattr(exc, "message", None) or exc).split())
+    text = f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+    return text if len(text) <= 140 else text[:137] + "..."
+
+
+class BatchStopped(Exception):
+    """A product that never ran because an earlier one hit a billing/auth error."""
+
+
+# A 400 with this wording is how Anthropic reports an empty balance ("credit balance is too low").
+BILLING_WORDS = re.compile(r"credit balance|billing|payment|insufficient (?:funds|credit)|api key|authenticat", re.IGNORECASE)
+
+
+def is_fatal_api_error(exc: BaseException) -> bool:
+    """Billing, credit or authentication failure: every remaining product would fail the same way."""
+    if not isinstance(exc, APIStatusError):
+        return False
+    return exc.status_code in (401, 402, 403) or bool(BILLING_WORDS.search(str(getattr(exc, "message", "") or exc)))
+
+
+def error_recommendation(reason: str) -> str:
+    return f"Error researching this product: {reason} - re-run with --sku"
+
+
+def product_recommendation(product: dict, result: Optional[SourcingResult]) -> tuple:
+    """recommend(), except that a product that errored reads as an error, never as a no-match."""
+    if product.get("error"):
+        return None, error_recommendation(product["error"])
+    return recommend(result, product.get("lcom_price"))
+
+
+def run_counts(rows: list) -> tuple:
+    """(recommended, no recommendation, errored) over (product, result) rows."""
+    errored = sum(bool(p.get("error")) for p, _ in rows)
+    recommended = sum(not p.get("error") and product_recommendation(p, r)[0] is not None for p, r in rows)
+    return recommended, len(rows) - errored - recommended, errored
+
+
+def ps_quote(text: str) -> str:
+    """PowerShell single-quoted literal: safe for SKUs like C&P9M."""
+    return "'" + text.replace("'", "''") + "'"
+
+
+def rerun_command(rows: list, input_path: Optional[str] = None) -> str:
+    skus = [p["sku"] for p, _ in rows if p.get("error")]
+    if not skus:
+        return ""
+    parts = ["python sourcing_agent.py"] + (["--input", ps_quote(input_path)] if input_path else [])
+    return " ".join(parts + ["--sku"] + [ps_quote(s) for s in skus])
+
+
+def summary_lines(rows: list, total: int, input_path: Optional[str] = None, stopped: str = "") -> list:
+    """Counts (recommended / no recommendation / errored), why a batch stopped early, and the re-run command."""
+    rec, norec, err = run_counts(rows)
+    pending = total - len(rows)
+    lines = [f"Results: **{rec} recommended** | {norec} no recommendation | **{err} errored**"
+             + (f" | {pending} still running" if pending > 0 else "")]
+    if stopped:
+        lines.append(f"**BATCH STOPPED EARLY:** {stopped}. Finished products were saved; the rest were not run.")
+    if err:
+        lines.append(f"Re-run the errored products: `{rerun_command(rows, input_path)}`")
+    return lines
 
 
 def no_qualifier_reason(rows: list, lcom_price: float, suspect: set, unscored: list) -> str:
@@ -1024,10 +1218,26 @@ def ordering_notes(candidate: Candidate, product: dict) -> list:
     for pat, label in MULTI_VARIANT:
         if re.search(pat, title, re.IGNORECASE):
             notes.append(f"listing offers {label} variants - pick the right option when ordering")
+    target_contacts = contact_types(target)
+    if target_contacts:
+        found = contact_types(candidate_contact_text(c))
+        if not found:
+            notes.append(f"contact type isn't stated on the listing (target is {'/'.join(sorted(target_contacts))}) "
+                         "- confirm before ordering")
+        elif len(found) > 1:
+            notes.append(f"listing mentions several contact types ({'/'.join(sorted(found))}; target is "
+                         f"{'/'.join(sorted(target_contacts))}) - check before ordering")
     caveats, caveat_moq = split_caveats(c.listing_caveats)
     moq = max((q for q in (order_quantity(c.moq or ""), order_quantity(c.price or ""), caveat_moq) if q), default=None)
     if moq and moq >= BULK_MOQ_NOTE:
         notes.append(f"price needs an order of {moq:,}+ pieces (MOQ)")
+    notes += contradictions(c)
+    spec = SPEC_CABLE.search(f"{title} {c.listing_caveats or ''} {c.spec_lines or ''} {c.unit_price_note or ''}")
+    if spec and re.search(r"coupler|adapter|adaptor", target, re.IGNORECASE):
+        notes.append(f"listing text mentions \"{spec[0]}\" - may be a short cable rather than a plain adapter, verify the product page")
+    tier = price_tier_note(c)
+    if tier:
+        notes.append(tier)
     if c.unit_price_confidence.startswith("promo"):
         notes.append("promo price - regular price not shown on the listing")
     if not pack_size_supported(c):
@@ -1094,7 +1304,7 @@ def print_product_result(product: dict, result: Optional[SourcingResult], calls_
         log()
 
     log(f"  {score_summary(result)}")
-    rec_idx, rec_reason = recommend(result, product.get("lcom_price"))
+    rec_idx, rec_reason = product_recommendation(product, result)
     log(f"  Recommendation: {rec_reason}")
     note = ordering_note(result, rec_idx, product)
     if note:
@@ -1106,7 +1316,9 @@ def format_result_markdown(
 ) -> str:
     lines = [f"## {product['sku']} - {product['description']}", ""]
 
-    if result is None:
+    if product.get("error"):
+        lines.append(f"**Recommendation:** {error_recommendation(product['error'])}")
+    elif result is None:
         lines.append("**No structured result** (empty, refused or garbled response).")
     elif result.no_match or not result.candidates:
         reason = result.no_match_reason or "no plausible candidate found"
@@ -1114,7 +1326,7 @@ def format_result_markdown(
     else:
         lcom = product.get("lcom_price")
         lcom_text = f"${lcom:.2f}" if lcom else "n/a"
-        rec_idx, rec_reason = recommend(result, lcom)
+        rec_idx, rec_reason = product_recommendation(product, result)
         note = ordering_note(result, rec_idx, product)
         lines += [f"**Recommendation:** {rec_reason}", ""]
         if note:
@@ -1159,6 +1371,7 @@ def format_result_markdown(
                 f"| MOQ | {candidate.moq or 'Not stated'} |",
                 f"| Email | {candidate.email or 'Not stated'} |",
                 f"| URL | {candidate.url or 'Not stated'} |",
+                f"| Spec lines seen | {candidate.spec_lines or 'none (search-result title only)'} |",
                 "",
             ]
             if scores:
@@ -1199,15 +1412,86 @@ def ambiguous_price_flags(rows: list) -> list:
     return flags
 
 
+LCOM_PRICES_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lcom_prices.csv")
+
+
+def load_lcom_prices(path: str = LCOM_PRICES_CSV) -> dict:
+    """lcom_prices.csv (sku, pack_size, pack_price, source, date_checked) -> {SKU upper: row}."""
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            return {r["sku"].strip().upper(): r for r in csv.DictReader(f)}
+    except FileNotFoundError:
+        return {}
+
+
+def apply_lcom_prices(products: list, path: str = LCOM_PRICES_CSV) -> None:
+    """One source for L-Com reference prices: the CSV wins; a SKU missing from it keeps the price it
+    came with (input sheet / built-in list) and gets a warning. unit price = pack_price / pack_size."""
+    table = load_lcom_prices(path)
+    for p in products:
+        row = table.get(p["sku"].strip().upper())
+        if row:
+            p["lcom_price"] = round(float(row["pack_price"]) / int(row["pack_size"] or 1), 2)  # to the cent: $19.99/10 = $2.00
+            p["lcom_source"], p["lcom_date"] = row["source"], row["date_checked"]
+        else:
+            log(f"WARNING: {p['sku']} is not in {os.path.basename(path)} - using the price it came with, unverified.")
+            p["lcom_source"], p["lcom_date"] = "not in lcom_prices.csv (unverified fallback)", ""
+
+
+def check_input_files(files: Optional[dict] = None) -> list:
+    """Problems with the two human-maintained CSVs: missing or no data rows. A fresh checkout
+    (both are .gitignored) would otherwise silently lose the L-Com prices and reviewer exclusions."""
+    files = files or {
+        "lcom_prices.csv": ("every L-Com price falls back to the input sheet / built-in value and is marked unverified",
+                            LCOM_PRICES_CSV),
+        "reviewer_exclusions.csv": ("known-bad listings will NOT be excluded", REVIEWER_EXCLUSIONS_CSV),
+    }
+    problems = []
+    for name, (consequence, path) in files.items():
+        try:
+            with open(path, newline="", encoding="utf-8") as f:
+                has_rows = any(any((v or "").strip() for v in row.values()) for row in csv.DictReader(f))
+        except FileNotFoundError:
+            problems.append(f"{name} is MISSING - {consequence}.")
+            continue
+        if not has_rows:
+            problems.append(f"{name} is EMPTY - {consequence}.")
+    return problems
+
+
+def print_input_file_warnings(problems: list) -> None:
+    if problems:
+        bar = "!" * 72
+        print("\n".join([bar, "!!! WARNING: required input file problem(s) - results will be WRONG !!!", *problems, bar]))
+
+
+def price_is_unverified(product: dict) -> bool:
+    source = (product.get("lcom_source") or "").lower()
+    return not source or "unverified" in source or "unconfirmed" in source
+
+
+def lcom_price_lines(products: list) -> list:
+    """Report-header block: each SKU's L-Com price with its source and date, and the unverified ones."""
+    lines = ["## L-Com reference prices", "", "| SKU | L-Com unit price | Source | Date checked |", "|---|---|---|---|"]
+    for p in products:
+        price = f"${p['lcom_price']:.2f}" if p.get("lcom_price") else "n/a"
+        lines.append(f"| {p['sku']} | {price} | {p.get('lcom_source') or 'n/a'} | {p.get('lcom_date') or '-'} |")
+    unverified = [p["sku"] for p in products if price_is_unverified(p)]
+    lines += ["", "**Still on unverified L-Com prices (do not read the margin as confirmed):** "
+              + (", ".join(unverified) or "none"), "", "---", ""]
+    return lines
+
+
 def write_report(
     sections: list, grand_in: int, grand_out: int, grand_cost: float, num_products: int, path: str,
-    flags: list,
+    flags: list, products: Optional[list] = None, summary: Optional[list] = None,
 ) -> None:
     header = [
         "# Competitive Sourcing Research Report",
         "",
         f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         f"Model: {MODEL} | Sites: {', '.join(SOURCING_SITES)} | Products: {num_products}",
+        *(["", *summary, ""] if summary else []),
         f"Recommendation rule: >= {MIN_RECOMMEND_ACCURACY}% accuracy and a confirmed unit price "
         f">= {MIN_MARGIN_PCT}% below L-Com's price, right product form; most accurate wins, and within "
         f"{TIE_BAND_POINTS} points of it: stated price, then a named maker, then the lowest price.",
@@ -1218,6 +1502,7 @@ def write_report(
         "",
         "---",
         "",
+        *(lcom_price_lines(products) if products else []),
     ]
     footer = [
         "---",
@@ -1229,7 +1514,8 @@ def write_report(
         f.write(content)
 
 
-PRODUCT_XLSX_FIELDS = ["SKU", "Product", "Keyword", "L-Com Unit Price", "Recommendation"]
+PRODUCT_XLSX_FIELDS = ["SKU", "Product", "Keyword", "L-Com Unit Price", "L-Com Price Source", "L-Com Price Date",
+                       "Recommendation"]
 RECOMMENDED_XLSX_FIELDS = [
     "Recommended Manufacturer", "Recommended Email", "Recommended URL", "Recommended Unit Price",
 ]
@@ -1261,8 +1547,9 @@ def write_excel_report(rows: list, path: str) -> None:
 
     for product, result in rows:
         lcom = product.get("lcom_price")
-        rec_idx, rec_reason = recommend(result, lcom)
-        row = [product["sku"], product.get("product_name", ""), product["description"], lcom, rec_reason]
+        rec_idx, rec_reason = product_recommendation(product, result)
+        row = [product["sku"], product.get("product_name", ""), product["description"], lcom,
+               product.get("lcom_source", ""), product.get("lcom_date", ""), rec_reason]
         candidates = result.candidates if result else []
         if rec_idx is None:
             row += [""] * len(RECOMMENDED_XLSX_FIELDS)
@@ -1299,6 +1586,8 @@ def write_excel_report(rows: list, path: str) -> None:
                         cell.fill = GREEN
             else:
                 row += [""] * len(CANDIDATE_XLSX_FIELDS)
+        if product.get("error"):  # never green: the Recommended cell carries the error text
+            comp.append([product["sku"], "ERROR", "", None, None, "", "", rec_reason])
         comp.append([product["sku"], "L-Com", "L-Com (benchmark)", None, lcom])
         comp.append([])
         ws.append(row)
@@ -1505,9 +1794,77 @@ def parse_args():
     return parser.parse_args()
 
 
+async def run_batch(products: list, research, report_path: str, excel_path: str, totals: dict,
+                    input_path: Optional[str] = None) -> tuple:
+    """Research every product (MAX_CONCURRENT_PRODUCTS at a time) and save the report and Excel after each
+    one, so a crash or stop keeps everything finished so far. `research(product)` returns
+    (result, tokens_in, tokens_out, calls_used). A product that raises, or comes back with no usable
+    result, is recorded as errored (product["error"]) - never as a no-match. A billing, credit or
+    authentication error stops the batch: products not yet started are recorded as errored without being
+    run, instead of failing one by one. Returns (done, why_stopped); done[i] = (markdown, (product, result))."""
+    # One slot per product in input order: (report section, excel row) once finished.
+    done = [None] * len(products)
+    slots = asyncio.Semaphore(MAX_CONCURRENT_PRODUCTS)
+    save_lock = asyncio.Lock()
+    stop = {"reason": ""}
+
+    async def run_one(idx: int, product: dict):
+        CURRENT_SKU.set(product["sku"])
+        async with slots:
+            log(f"Product {idx + 1} of {len(products)} ...")
+            started = time.monotonic()
+            try:
+                if stop["reason"]:
+                    raise BatchStopped(f"not run - batch stopped early ({stop['reason']})")
+                result, tin, tout, calls_used = await research(product)
+                if result is None:
+                    product["error"] = "no structured result (empty, refused or garbled response)"
+                print_product_result(product, result, calls_used)
+                cost = (tin / 1_000_000 * HAIKU_INPUT_PER_MTOK) + (tout / 1_000_000 * HAIKU_OUTPUT_PER_MTOK)
+                totals["in"] += tin
+                totals["out"] += tout
+                totals["cost"] += cost
+                log(f"  Tokens:     in={tin} out={tout}  (~${cost:.4f})")
+                secs = time.monotonic() - started
+                nimble = busy_time([c for c in CALL_LOG if c["sku"] == product["sku"]])
+                failed = sum(c["outcome"] != "ok" for c in CALL_LOG if c["sku"] == product["sku"])
+                stopped = stop_reason(result, calls_used, failed)
+                PRODUCT_LOG.append({"sku": product["sku"], "secs": secs, "calls": calls_used, "stop": stopped})
+                log(f"  Time:       {secs:.0f}s  (Nimble {nimble:.0f}s, Anthropic+other {secs - nimble:.0f}s, "
+                    f"{calls_used} tool calls)")
+                log(f"  Stopped:    {stopped}")
+                done[idx] = (format_result_markdown(product, result, calls_used, tin, tout, cost), (product, result))
+            except Exception as exc:  # noqa: BLE001 - POC: keep going on any per-product failure
+                reason = str(exc) if isinstance(exc, BatchStopped) else error_text(exc)
+                product["error"] = reason
+                if is_fatal_api_error(exc) and not stop["reason"]:
+                    stop["reason"] = reason
+                    log("!" * 72)
+                    log(f"!!! BILLING / CREDIT / AUTH ERROR - stopping the batch: {reason}")
+                    log("!!! Products already finished are saved; the rest will not be run.")
+                    log("!" * 72)
+                log(f"  Error researching this product: {reason}")
+                done[idx] = (format_result_markdown(product, None, 0, 0, 0, 0.0), (product, None))
+        # The lock keeps two finishing products from interleaving writes.
+        async with save_lock:
+            finished = [d for d in done if d]
+            try:
+                write_report([s for s, _ in finished], totals["in"], totals["out"], totals["cost"],
+                             len(products), report_path, ambiguous_price_flags([r for _, r in finished]),
+                             [p for p, _ in (d[1] for d in finished)],
+                             summary_lines([d[1] for d in finished], len(products), input_path, stop["reason"]))
+                write_excel_report([r for _, r in finished], excel_path)
+            except OSError as exc:  # e.g. the .xlsx is open in Excel - retry on the next product
+                log(f"  Could not save results yet ({exc}) - will retry after the next product.")
+
+    await asyncio.gather(*(run_one(i, p) for i, p in enumerate(products)))
+    return done, stop["reason"]
+
+
 async def main_async():
     args = parse_args()
     load_dotenv()  # .env next to where you run it; real env vars still win
+    print_input_file_warnings(check_input_files())
 
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
     nimble_key = os.environ.get("NIMBLE_API_KEY")
@@ -1536,6 +1893,7 @@ async def main_async():
         print(f"No products found in {args.input} - check it has a 'SKU' header column.")
         sys.exit(1)
 
+    apply_lcom_prices(products)
     client = AsyncAnthropic(api_key=anthropic_key, max_retries=ANTHROPIC_MAX_RETRIES)
 
     print("Competitive Sourcing Research POC")
@@ -1577,54 +1935,16 @@ async def main_async():
 
                 run_started = time.monotonic()
                 totals = {"in": 0, "out": 0, "cost": 0.0}
-                # One slot per product in input order: (report section, excel row) once finished.
-                done = [None] * len(products)
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 report_path = f"sourcing_report_{timestamp}.md"
                 excel_path = args.output or f"sourcing_results_{timestamp}.xlsx"
                 print(f"Saving results after every product to {report_path} / {excel_path}")
                 print(f"Running up to {MAX_CONCURRENT_PRODUCTS} products at once")
-                slots = asyncio.Semaphore(MAX_CONCURRENT_PRODUCTS)
-                save_lock = asyncio.Lock()
 
-                async def run_one(idx: int, product: dict):
-                    CURRENT_SKU.set(product["sku"])
-                    async with slots:
-                        log(f"Product {idx + 1} of {len(products)} ...")
-                        started = time.monotonic()
-                        try:
-                            result, tin, tout, calls_used = await research_product(client, session, tools, product)
-                            print_product_result(product, result, calls_used)
-                            cost = (tin / 1_000_000 * HAIKU_INPUT_PER_MTOK) + (tout / 1_000_000 * HAIKU_OUTPUT_PER_MTOK)
-                            totals["in"] += tin
-                            totals["out"] += tout
-                            totals["cost"] += cost
-                            log(f"  Tokens:     in={tin} out={tout}  (~${cost:.4f})")
-                            secs = time.monotonic() - started
-                            nimble = busy_time([c for c in CALL_LOG if c["sku"] == product["sku"]])
-                            failed = sum(c["outcome"] != "ok" for c in CALL_LOG if c["sku"] == product["sku"])
-                            stop = stop_reason(result, calls_used, failed)
-                            PRODUCT_LOG.append({"sku": product["sku"], "secs": secs, "calls": calls_used, "stop": stop})
-                            log(f"  Time:       {secs:.0f}s  (Nimble {nimble:.0f}s, Anthropic+other {secs - nimble:.0f}s, "
-                                f"{calls_used} tool calls)")
-                            log(f"  Stopped:    {stop}")
-                            done[idx] = (format_result_markdown(product, result, calls_used, tin, tout, cost), (product, result))
-                        except Exception as exc:  # noqa: BLE001 - POC: keep going on any per-product failure
-                            log(f"  Error researching this product: {exc}")
-                            done[idx] = (f"## {product['sku']} - {product['description']}\n\n"
-                                         f"**Error researching this product:** {exc}\n", (product, None))
-                    # Save after every product so a crash or stop keeps everything finished so far,
-                    # rows in input order. The lock keeps two finishing products from interleaving writes.
-                    async with save_lock:
-                        finished = [d for d in done if d]
-                        try:
-                            write_report([s for s, _ in finished], totals["in"], totals["out"], totals["cost"],
-                                         len(products), report_path, ambiguous_price_flags([r for _, r in finished]))
-                            write_excel_report([r for _, r in finished], excel_path)
-                        except OSError as exc:  # e.g. the .xlsx is open in Excel - retry on the next product
-                            log(f"  Could not save results yet ({exc}) - will retry after the next product.")
+                async def research(product):
+                    return await research_product(client, session, tools, product)
 
-                await asyncio.gather(*(run_one(i, p) for i, p in enumerate(products)))
+                done, stopped_why = await run_batch(products, research, report_path, excel_path, totals, args.input)
 
                 print("-" * 72)
                 print(timing_summary(CALL_LOG, PRODUCT_LOG, time.monotonic() - run_started))
@@ -1635,6 +1955,12 @@ async def main_async():
                     f"Estimated total cost: ~${totals['cost']:.4f}"
                 )
 
+                rows = [d[1] for d in done if d]
+                print("\n".join(line.replace("**", "") for line in summary_lines(rows, len(products), args.input, stopped_why)
+                                if not line.startswith("Re-run")))
+                if rerun_command(rows, args.input):
+                    print("Re-run the errored products (PowerShell):")
+                    print("  " + rerun_command(rows, args.input))
                 flags = ambiguous_price_flags([d[1] for d in done if d])
                 if flags:
                     print("Unit prices that could not be determined confidently:")

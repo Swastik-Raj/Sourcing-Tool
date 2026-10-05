@@ -76,8 +76,14 @@ An `.xlsx` file with a header row (anywhere in the first 5 rows) containing at l
 description Claude searches against. Any other columns are ignored. Rows with a blank SKU
 are skipped.
 
-The built-in products live in `PRODUCTS` in `sourcing_agent.py`; fill in their `lcom_price`
-(per unit; the current ones were looked up by hand, see the comments there). `read_lcom_catalog()` is a stub for pulling
+The built-in products live in `PRODUCTS` in `sourcing_agent.py`. **L-Com reference prices come
+from `lcom_prices.csv`** (`sku, pack_size, pack_price, source, date_checked`; unit price =
+pack_price / pack_size, to the cent). The tool reads it first and only falls back to the
+price in the input sheet / `PRODUCTS` for a SKU that's missing, with a warning and an
+"unverified" label. Rows checked by a person say so in `source` (e.g. "Srijan, live check")
+with a date; everything else is "unverified" (C&P9M: "Newark distributor price,
+unconfirmed"). L-Com's site blocks automated access, so update the CSV by hand after a
+live check. `read_lcom_catalog()` is a stub for pulling
 products and prices straight from L-Com's catalog later; while it returns nothing, the
 tool falls back to `PRODUCTS`.
 
@@ -95,7 +101,8 @@ Every run produces three things:
    product: full candidate details, rubric breakdown, and token/cost accounting. Good for
    a quick read or sharing a summary.
 3. **Excel report** (`sourcing_results_<timestamp>.xlsx`, or `--output` path) - sheet
-   `Results`: one row per product (SKU, Product, Keyword, L-Com Unit Price, Recommendation),
+   `Results`: one row per product (SKU, Product, Keyword, L-Com Unit Price, L-Com Price
+   Source, L-Com Price Date, Recommendation),
    then **Recommended Manufacturer / Email / URL / Unit Price** (filled green - who to buy
    from; blank and uncoloured when no candidate qualifies), then a `Manufacturer 1-5`
    block each (Name, Accuracy, Listed Price, Unit Price, Unit Price Confidence, vs. L-Com
@@ -109,8 +116,39 @@ Every run produces three things:
   (`stated` / `inferred` / `ambiguous`). The code computes `unit_price = price_total /
   quantity_covered`. Ambiguous or non-USD prices get no unit price. They show as
   UNDETERMINED and are listed at the top of the Markdown report. The tool never guesses.
-- `vs. L-Com` compares `unit_price` with the input's `Lcom sale Price` column, divided by
-  the pack size when the description says `Package/N` (L-Com prices those per pack).
+- `vs. L-Com` compares `unit_price` with the L-Com unit price from `lcom_prices.csv` (pack
+  price divided by pack size; L-Com prices packs as one SKU, e.g. `Package/10`). The report
+  header lists every SKU's price source and date and the SKUs still on unverified prices.
+- Contact type is a hard exclude (`apply_form_rules`): when the target states crimp, solder,
+  PCB/DIP or IDC contacts and a candidate states a different one, it's wrong form (accuracy 0).
+  A listing stating both gets a "check before ordering" note; one that states none gets a
+  "contact type isn't stated" note. Targets that state no contact type are unaffected, and
+  nothing is inferred from words like "insertion" (C&P9M's description now says crimp).
+- `reviewer_exclusions.csv` (`sku, supplier_or_url, reason`): a human call the tool honors. A
+  candidate for that SKU whose maker name or URL contains `supplier_or_url` is excluded and
+  shown as "excluded by reviewer: <reason>". Seeded with HDFF / Xiangtianzhong and VIC00001 /
+  Xindaying (short cables per their product pages).
+- A listing that contradicts itself (title says Female but its attribute table says male;
+  "compatible with CAT5e" next to a Cat3-Cat6A table) gets an ordering note and a comment, not a
+  zero score. A plain category range ("Cat5e Cat6 Cat6a") is left alone.
+- IDC is its own contact type, separate from crimp. A listing that states both is kept with a note.
+- A product that crashes (API error, encoding error, unusable response) is recorded as
+  "Error researching this product: <reason> - re-run with --sku" in the Excel Results and
+  Comparison sheets and the report - never as "No candidates found", never green, and the email
+  agent skips it. The report header and the end-of-run summary give separate counts (recommended /
+  no recommendation / errored) and the exact PowerShell `--sku` command to re-run the errored ones.
+  A billing, credit or authentication error from the API stops the batch at once: finished products
+  are saved, products not yet started are recorded as errored without being run, and the reason is
+  printed loudly.
+- A candidate with no URL is never recommended: the reason says "best candidate has no URL,
+  locate it manually" and nothing is highlighted green.
+- The report shows each candidate's **Spec lines seen** (type/jacket/length/category the model
+  read on a detail page, or "none") so a spec-text cable rule can be tested on real text next round.
+- A price range always uses its high end (`apply_price_rules`; the Listed Price column keeps
+  the full range). A listing that ties prices to quantity tiers gets a note naming the tier used.
+- Spec text that reads like a short cable ("PVC jacket", "24 AWG", "custom length") on a
+  coupler/adapter target adds an ordering note, never an exclusion. The search reads titles, so
+  this only fires when the model carries such text into its caveats.
 - A unit price more than 10x cheaper than the next-cheapest candidate for the same product
   (`IMPLAUSIBLE_PRICE_RATIO`) is treated as an extraction error. It is marked IMPLAUSIBLE,
   excluded from the L-Com comparison and never recommended. The check needs at least 3

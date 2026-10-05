@@ -16,11 +16,11 @@ SEVENTY = AttributeBreakdown(product_type=20, category_spec=20, shielding_materi
 
 
 def cand(name, total, qty, conf, breakdown=FULL, title="", price="", form=True, listing_form="panel mount coupler",
-         caveats="", moq=None):
+         caveats="", moq=None, spec_lines=""):
     return Candidate(manufacturer=name, price_total=total or 0, quantity_covered=qty or 0, unit_price_note="",
                      unit_price_confidence=conf, attribute_breakdown=breakdown.model_copy(), email=f"{name}@x",
                      url=f"u/{name}", listing_title=title, price=price, same_product_form=form,
-                     listing_form=listing_form, listing_caveats=caveats, moq=moq)
+                     listing_form=listing_form, listing_caveats=caveats, moq=moq, spec_lines=spec_lines)
 
 
 def result(*cands):
@@ -399,4 +399,262 @@ extract_tool = sourcing_agent.make_bounded_tool(
 pages = asyncio.run(prefetch_site_searches([extract_tool], {"sku": "S", "description": "Cat6 RJ45 Coupler"}))
 assert budget.used == 3 and SlowSession.peak == 3, (budget.used, SlowSession.peak)
 assert all(f"=== {site} search results" in pages for site in sourcing_agent.SOURCING_SITES)
+
+# --- Srijan's v1 review (2026-10-04) ---
+from sourcing_agent import (apply_lcom_prices, contact_types, load_lcom_prices, lcom_price_lines, ordering_notes,
+                            price_is_unverified, price_tier_note)
+
+# 1. Contact type is a hard exclude. C&P9M's four real 102713 candidates were all solder/PCB; the target now says crimp.
+cp9m = {"sku": "C&P9M", "description": "Insertion Type D-Sub Connector, DB9 Male, Crimp Contacts"}
+assert contact_types(cp9m["description"]) == {"crimp"}
+assert contact_types(next(p for p in sourcing_agent.PRODUCTS if p["sku"] == "C&P9M")["description"]) == {"crimp"}
+solder_titles = [
+    "High Quality Straight PCB Wire Mount 9 Position Solder Cup D-SUB dB9 Standard Connectors Male",
+    "10PCS DB9 Female Male PCB Mount serial port Connector Solder Type D-Sub RS232 COM CONNECTORS 9pin socket 9p Adapter FOR PCB",
+    "PCB Solder/Screw Gold-plated Vertical Horizontal 9 15 25 23 37 Pin Blue Black Vga D-sub Db15 Db9 Female Male Dsub Connectors",
+    "5PCS DB9 DB15 DB25 37 Female Male PCB Mount serial port Connector Solder Type D-Sub RS232 CONNECTORS 9pin socket Adapter FOR PCB",
+]
+crimp_ok = cand("CrimpCo", 0.5, 1, "stated", title="DB9 Male D-Sub Crimp Contact Connector Plastic Shell")
+both = cand("BothCo", 0.4, 1, "stated", title="DB9 Male D-Sub Connector Crimp/Solder Cup")
+silent = cand("SilentCo", 0.3, 1, "stated", title="DB9 Male D-Sub Connector Gold Plated")
+r = result(*[cand(f"S{i}", 0.25, 1, "stated", title=t, listing_form="PCB solder connector") for i, t in enumerate(solder_titles)],
+           crimp_ok, both, silent)
+apply_form_rules(r, cp9m)
+assert [c.same_product_form for c in r.candidates] == [False] * 4 + [True] * 3
+assert "wrong contact type" in r.candidates[0].listing_form and candidate_score(r.candidates[0])[0] == 0
+idx, reason = recommend(result(*r.candidates[:4]), 3.98)
+assert idx is None and "product form" in reason, reason
+assert ordering_notes(crimp_ok, cp9m) == []
+assert any("several contact types" in n for n in ordering_notes(both, cp9m))
+assert any("contact type isn't stated" in n for n in ordering_notes(silent, cp9m))
+# A target that states no contact type (any RJ45 coupler) is unaffected, and so are its notes.
+rj45 = {"sku": "ECF504-SC6", "description": "Cat6 RJ45 Coupler Shielded (8x8) Panel Mount Style"}
+pcb_coupler = cand("K", 2.33, 1, "stated", title="Cnlinko RJ45 Shielded Panel Mount Coupler PCB Board Connector Solder")
+apply_form_rules(result(pcb_coupler), rj45)
+assert pcb_coupler.same_product_form and ordering_notes(pcb_coupler, rj45) == []
+
+# Spec text that reads like a short cable gets a note (never an exclusion) on a coupler/adapter target.
+hdff_t = {"sku": "HDFF", "description": "HDMI Panel Mount Adapter, Female to Female"}
+hd = cand("XTZ", 0.2, 1, "stated", title="HDMI a Female to Female with Panel Mount Adapter",
+          caveats="specs: Jacket PVC, AWG 24/28/26, Length (Customized)")
+assert any("short cable" in n for n in ordering_notes(hd, hdff_t))
+assert not any("short cable" in n for n in ordering_notes(cand("P", 0.2, 1, "stated", title="HDMI Panel Coupler"), hdff_t))
+apply_form_rules(result(hd), hdff_t)
+assert hd.same_product_form
+
+# 3. Price ranges use the high end; a discount like "-25%" is not a range; tiers are named in the note.
+capusb3 = cand("Dongguan", 0.05, 1, "stated", title="Silicone USB Cap Port Cover", price="US$0.05-1.58 (1,000 Pieces MOQ)")
+capusb2 = cand("Mao Jia", 0.08, 1, "stated", title="Usb Waterproof Cap", price="$0.07-0.08 (1,000-9,999 pieces)")
+cappromo = cand("L", 22.84, 1, "stated", title="x", price="$17.13 $22.84 -25%")
+apply_price_rules(result(capusb3, capusb2, cappromo))
+assert (capusb3.price_total, capusb2.price_total, cappromo.price_total) == (1.58, 0.08, 22.84)
+assert "high end" in capusb3.code_notes[0] and not cappromo.code_notes
+tiered = cand("Lung Kay", 2.68, 1, "stated", title="USB adapter", price="$2.68 100-999 pieces $2.58 ≥1,000 pieces")
+assert price_tier_note(tiered) == "price is for the 100-999 pieces tier (others: $2.58 at ≥1,000 pieces)", price_tier_note(tiered)
+assert price_tier_note(capusb3) == ""
+
+# 2. L-Com prices come from lcom_prices.csv; missing SKUs keep their price and are marked unverified.
+csv_path = os.path.join(tempfile.mkdtemp(), "lcom_prices.csv")
+with open(csv_path, "w", newline="") as f:
+    f.write("sku,pack_size,pack_price,source,date_checked\n"
+            'CAPUSB-A,10,19.99,"Srijan, live check",2026-10-04\nHDFF,1,31.70,"Srijan, live check",2026-10-04\n'
+            "OLD,1,5.00,unverified,\n")
+prods = [{"sku": "CAPUSB-A", "lcom_price": 3.998}, {"sku": "hdff", "lcom_price": 23.79},
+         {"sku": "OLD", "lcom_price": 4.0}, {"sku": "MISSING", "lcom_price": 9.99}]
+apply_lcom_prices(prods, csv_path)
+assert prods[0]["lcom_price"] == 2.0 and prods[1]["lcom_price"] == 31.70 and prods[2]["lcom_price"] == 5.0
+assert prods[3]["lcom_price"] == 9.99 and price_is_unverified(prods[3]) and price_is_unverified(prods[2])
+assert not price_is_unverified(prods[0]) and prods[0]["lcom_date"] == "2026-10-04"
+header = "\n".join(lcom_price_lines(prods))
+assert "Still on unverified L-Com prices (do not read the margin as confirmed):** OLD, MISSING" in header
+# Margin at the new CAPUSB-A reference: $0.45 is 77.5% cheaper than $2.00, so it no longer qualifies; $0.40 does.
+assert recommend(result(cand("A", 0.45, 1, "stated")), 2.0)[0] is None
+assert recommend(result(cand("A", 0.40, 1, "stated")), 2.0)[0] == 0
+# The seeded file itself: Srijan's four values, C&P9M flagged, every built-in/input SKU present.
+seeded = load_lcom_prices()
+assert {s: round(float(seeded[s]["pack_price"]) / int(seeded[s]["pack_size"]), 2) for s in ("HDFF", "FOA-020C", "ECF504-SC6", "CAPUSB-A")} == \
+       {"HDFF": 31.70, "FOA-020C": 72.99, "ECF504-SC6": 20.54, "CAPUSB-A": 2.0}
+assert seeded["C&P9M"]["source"] == "Newark distributor price, unconfirmed"
+assert all(p["sku"].upper() in seeded for p in sourcing_agent.PRODUCTS)
+# The Results sheet carries each price's source and date.
+path = os.path.join(tempfile.mkdtemp(), "r.xlsx")
+write_excel_report([({"sku": "HDFF", "description": "d", "lcom_price": 31.70, "lcom_source": "Srijan, live check",
+                      "lcom_date": "2026-10-04"}, None)], path)
+ws = openpyxl.load_workbook(path).worksheets[0]
+hdr = [c.value for c in ws[1]]
+row = dict(zip(hdr, [c.value for c in ws[2]]))
+assert row["L-Com Price Source"] == "Srijan, live check" and row["L-Com Price Date"] == "2026-10-04"
+# --- Srijan's answers, round 2 (2026-10-04) ---
+from sourcing_agent import apply_reviewer_exclusions, contradictions, format_result_markdown
+
+# Reviewer exclusions: seeded for HDFF / Xiangtianzhong and VIC00001 / Xindaying; matches maker name or URL.
+xtz = cand("SHENZHEN XIANGTIANZHONG TECHNOLOGY CO., LTD.", 0.2, 1, "stated", title="HDMI a Female to Female with Panel Mount Adapter")
+other = cand("FARSINCE", 1.58, 1, "stated", title="HDMI Panel Coupler")
+by_url = cand("", 0.2, 1, "stated", title="HDMI Panel Adapter")
+by_url.url = "https://xtz-tech.en.made-in-china.com/product/hOtASZeTkIcF/xiangtianzhong-hdmi.html"
+rr = result(xtz, other, by_url)
+apply_reviewer_exclusions(rr, "hdff")
+assert [c.same_product_form for c in rr.candidates] == [False, True, False]
+assert candidate_comment(xtz).startswith("excluded by reviewer: short cable per its product page")
+assert candidate_score(xtz)[0] == 0
+vic = result(cand("Shenzhen Xindaying Technology Co., Ltd.", 1.6, 1, "stated"))
+apply_reviewer_exclusions(vic, "VIC00001")
+assert not vic.candidates[0].same_product_form
+untouched = result(cand("Shenzhen Xindaying Technology Co., Ltd.", 1.6, 1, "stated"))
+apply_reviewer_exclusions(untouched, "HDFF")  # exclusion is per SKU
+assert untouched.candidates[0].same_product_form
+
+# Self-contradiction: flagged with a note, not zeroed. Real texts from the 2026-10-04 page reads.
+kabasi = cand("Kabasi", 2.33, 1, "stated", title="Cnlinko Yt-RJ45 Shielded Industrial Panel Mount Bulkhead Female Coupler",
+              spec_lines="Compatible with CAT5e and compliant with EIA568B; Terminal Type: Cat.3-Cat.6A")
+assert contradictions(kabasi) and "category" in contradictions(kabasi)[0]
+lungkay = cand("LUNG KAY", 2.68, 1, "stated", title="LUNG KAY USB 2.0 Type a Female to USB Type B Male Adaptor",
+               spec_lines="Connector A: Type A male; Connector B: Type B Male")
+assert [("gender" in n) for n in contradictions(lungkay)] == [True]
+hyconnect = cand("Hy", 0.7, 1, "stated", title="8P8C Cat 6 STP FTP RJ45 to RJ45 Inline Coupler Shielded Cat5e Cat6 Cat6A Keystone Jack",
+                 spec_lines="Category: Cat5e Cat6 Cat6a; Gender: Female R45 Keystone Jack")
+assert contradictions(hyconnect) == []  # a legitimate multi-category listing is untouched
+assert candidate_score(kabasi)[0] == 100 and any("contradicts" in n for n in ordering_notes(kabasi, rj45))
+assert "contradicts" in candidate_comment(kabasi)
+
+# IDC is its own contact type: IDC-only vs a crimp target is excluded; "IDC ... Crimp" states both, so it's kept with a note.
+idc_only = cand("I", 0.5, 1, "stated", title="DB9 Male IDC Ribbon D-Sub Connector")
+idc_crimp = cand("IC", 0.5, 1, "stated", title="DSUB E09P IDC RIBBON DB9 9P Male IDC D Sub Connector Insulation Displacement Crimp Type")
+apply_form_rules(result(idc_only, idc_crimp), cp9m)
+assert not idc_only.same_product_form and idc_crimp.same_product_form
+assert any("several contact types" in n for n in ordering_notes(idc_crimp, cp9m))
+
+# A candidate with no URL can't be recommended; one with a URL still can.
+nourl = cand("NoUrl", 0.2, 1, "stated"); nourl.url = None
+withurl = cand("HasUrl", 0.3, 1, "stated")
+idx, reason = recommend(result(nourl), 10.0)
+assert idx is None and "no URL" in reason and "locate it manually" in reason, reason
+assert recommend(result(nourl, withurl), 10.0)[0] == 1
+
+# The report shows the spec lines read, or says none were.
+md = format_result_markdown({"sku": "K", "description": "d", "lcom_price": 20.54}, result(kabasi, hyconnect), 5, 1, 1, 0.0)
+assert "| Spec lines seen | Compatible with CAT5e" in md
+md2 = format_result_markdown({"sku": "K", "description": "d", "lcom_price": 20.54}, result(other), 5, 1, 1, 0.0)
+assert "none (search-result title only)" in md2
+# A fresh checkout (the CSVs are .gitignored) must not silently skip them: missing or empty is reported loudly.
+from sourcing_agent import check_input_files, print_input_file_warnings
+tmp = tempfile.mkdtemp()
+empty_csv = os.path.join(tmp, "empty.csv")
+with open(empty_csv, "w") as f:
+    f.write("sku,supplier_or_url,reason\n\n")
+full_csv = os.path.join(tmp, "full.csv")
+with open(full_csv, "w") as f:
+    f.write("sku,supplier_or_url,reason\nHDFF,x,y\n")
+probs = check_input_files({"gone.csv": ("it matters", os.path.join(tmp, "gone.csv")), "empty.csv": ("it matters", empty_csv),
+                           "full.csv": ("it matters", full_csv)})
+assert probs == ["gone.csv is MISSING - it matters.", "empty.csv is EMPTY - it matters."], probs
+assert check_input_files() == []  # the real files in this checkout are present and non-empty
+import contextlib, io
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    print_input_file_warnings(probs)
+    print_input_file_warnings([])
+assert buf.getvalue().count("!!! WARNING") == 1 and "gone.csv is MISSING" in buf.getvalue()
+
+# --- A crashed product must never read as a no-match (offline: a fake `research`, no API or Nimble calls) ---
+import anthropic
+import httpx
+from sourcing_agent import (GREEN, error_text, is_fatal_api_error, product_recommendation, ps_quote, rerun_command,
+                            run_batch, run_counts)
+
+
+def api_error(cls, status, message):
+    resp = httpx.Response(status, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+    return cls(message, response=resp, body={"type": "error", "error": {"type": "x", "message": message}})
+
+
+credit_error = api_error(anthropic.BadRequestError, 400, "Your credit balance is too low to access the Anthropic API.")
+assert is_fatal_api_error(credit_error)
+assert is_fatal_api_error(api_error(anthropic.AuthenticationError, 401, "invalid x-api-key"))
+assert not is_fatal_api_error(api_error(anthropic.BadRequestError, 400, "prompt is too long"))
+assert not is_fatal_api_error(RuntimeError("boom")) and not is_fatal_api_error(UnicodeEncodeError("charmap", "x", 0, 1, "bad"))
+assert error_text(RuntimeError("boom\n  twice")) == "RuntimeError: boom twice" and len(error_text(RuntimeError("x" * 500))) == 140
+
+
+def fake_results():
+    good = result(cand("GoodCo", 0.2, 1, "stated"))
+    nomatch = SourcingResult(product="x", no_match=True, no_match_reason="nothing close", candidates=[])
+    return good, nomatch
+
+
+def batch(products, behaviours, tmp):
+    """Runs run_batch with one scripted outcome per SKU: a result, None, or an exception to raise."""
+    calls = []
+
+    async def research(product):
+        calls.append(product["sku"])
+        outcome = behaviours[product["sku"]]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome, 100, 10, 3
+
+    sourcing_agent.MAX_CONCURRENT_PRODUCTS = 1  # one at a time, so which products ran is deterministic
+    try:
+        done, why = asyncio.run(run_batch(products, research, os.path.join(tmp, "r.md"), os.path.join(tmp, "r.xlsx"),
+                                          {"in": 0, "out": 0, "cost": 0.0}, "in put.xlsx"))
+    finally:
+        sourcing_agent.MAX_CONCURRENT_PRODUCTS = 3
+    return done, why, calls
+
+
+good, nomatch = fake_results()
+mk = lambda sku: {"sku": sku, "description": "d", "product_name": "p", "lcom_price": 10.0}
+tmp = tempfile.mkdtemp()
+done, why, calls = batch([mk("OK"), mk("C&P9M"), mk("NORES"), mk("NOMATCH")],
+                         {"OK": good, "C&P9M": RuntimeError("boom"), "NORES": None, "NOMATCH": nomatch}, tmp)
+rows = [d[1] for d in done]
+assert calls == ["OK", "C&P9M", "NORES", "NOMATCH"] and why == ""
+crash, nores, genuine = rows[1][0], rows[2][0], rows[3][0]
+for crashed in (crash, nores):
+    text = product_recommendation(crashed, None)[1]
+    assert text.startswith("Error researching this product: ") and text.endswith(" - re-run with --sku"), text
+    assert "No candidates found" not in text and product_recommendation(crashed, None)[0] is None
+assert "RuntimeError: boom" in product_recommendation(crash, None)[1]
+assert "no structured result" in product_recommendation(nores, None)[1]
+assert product_recommendation(genuine, rows[3][1])[1] == "No candidates found - nothing to source." and "error" not in genuine
+assert recommend(None, 10.0)[1] != "No candidates found - nothing to source."  # even a bare None result can't pass as a no-match
+assert run_counts(rows) == (1, 1, 2)
+cmd = rerun_command(rows, "in put.xlsx")
+assert cmd == "python sourcing_agent.py --input 'in put.xlsx' --sku 'C&P9M' 'NORES'", cmd
+assert ps_quote("it's") == "'it''s'" and rerun_command([rows[0], rows[3]]) == ""
+# The saved report and Excel carry the error, never green, never "No candidates found" for it.
+md = open(os.path.join(tmp, "r.md"), encoding="utf-8").read()
+assert "**1 recommended** | 1 no recommendation | **2 errored**" in md and f"`{cmd}`" in md
+assert "**Recommendation:** Error researching this product: RuntimeError: boom - re-run with --sku" in md
+wb = openpyxl.load_workbook(os.path.join(tmp, "r.xlsx"))
+res, comp = wb["Results"], wb["Comparison"]
+hdr = [c.value for c in res[1]]
+by_sku = {r[0].value: r for r in res.iter_rows(min_row=2)}
+rec_col = hdr.index("Recommendation")
+assert by_sku["C&P9M"][rec_col].value == "Error researching this product: RuntimeError: boom - re-run with --sku"
+assert by_sku["NORES"][rec_col].value.startswith("Error researching this product: no structured result")
+assert by_sku["NOMATCH"][rec_col].value == "No candidates found - nothing to source."
+for sku in ("C&P9M", "NORES"):
+    assert not by_sku[sku][hdr.index("Recommended Manufacturer")].value and not by_sku[sku][hdr.index("Recommended URL")].value
+    assert not any(c.fill.fgColor.rgb == GREEN.fgColor.rgb for c in by_sku[sku])
+errs = [r for r in comp.iter_rows(min_row=2) if r[1].value == "ERROR"]
+assert [r[0].value for r in errs] == ["C&P9M", "NORES"] and all(r[7].value.startswith("Error researching") for r in errs)
+assert not any(c.fill.fgColor.rgb == GREEN.fgColor.rgb for r in errs for c in r)
+assert any(r[0].value == "OK" and r[7].value == "YES" for r in comp.iter_rows(min_row=2))
+
+# A billing/credit/auth error stops the batch: finished products are saved, the rest are not run at all.
+tmp = tempfile.mkdtemp()
+done, why, calls = batch([mk("A"), mk("B"), mk("C"), mk("D")], {"A": good, "B": credit_error, "C": good, "D": good}, tmp)
+assert calls == ["A", "B"], calls  # C and D were never researched
+assert "credit balance is too low" in why
+rows = [d[1] for d in done]
+assert run_counts(rows) == (1, 0, 3)
+assert rows[2][0]["error"].startswith("not run - batch stopped early (BadRequestError: Your credit balance is too low")
+assert rerun_command(rows).endswith("--sku 'B' 'C' 'D'")
+md = open(os.path.join(tmp, "r.md"), encoding="utf-8").read()
+assert "**BATCH STOPPED EARLY:** BadRequestError: Your credit balance is too low" in md and "**1 recommended**" in md
+# An ordinary crash does not stop the batch.
+tmp = tempfile.mkdtemp()
+done, why, calls = batch([mk("A"), mk("B"), mk("C")], {"A": RuntimeError("x"), "B": good, "C": good}, tmp)
+assert calls == ["A", "B", "C"] and why == "" and run_counts([d[1] for d in done]) == (2, 0, 1)
 print("ok")

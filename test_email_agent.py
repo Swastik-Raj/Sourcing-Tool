@@ -733,6 +733,257 @@ def test_drafts_never_touch_the_state_file():
         assert open(ea.STATE_PATH, "rb").read() == before                 # an existing state file is left byte-for-byte
 
 
+# ---------- structured quote fields: the model extracts (stubbed here), the code verifies ----------
+
+def run_quote(fixture, raw, state=None, draft=None):
+    """A stub LLM returns `raw` for the fixture reply; record_reply verifies it against the reply text."""
+    state = {} if state is None else state
+    draft = draft or ea.make_draft(cand("A1", "a@x.com"))
+    full = {"status": "pricing_provided", "summary": "stub summary", **raw}
+    result = ea.record_reply(state, draft, read_fixture(fixture), summarize=lambda text: full)
+    return result, state[draft["key"]]
+
+
+QUOTE_CASES = [
+    ("a per-unit sample price", "quote_per_unit.txt",
+     {"sample_available": "yes", "sample_quantity": 5, "sample_unit_price": "3.20", "price_basis": "per_unit",
+      "lead_time_days": 5, "currency": "USD",
+      "evidence": {"sample_quantity": "5 pcs are available as samples", "sample_unit_price": "Sample price is USD 3.20 per piece",
+                   "lead_time_days": "Lead time for samples is 5 days"}},
+     {"sample_available": "yes", "sample_quantity": 5, "sample_unit_price": "3.20", "sample_total_price": None, "price_basis": "per_unit",
+      "lead_time_days": 5, "currency": "USD", "bulk_tiers": None, "moq": None}, []),
+    ("a total sample fee", "quote_total_fee.txt",
+     {"sample_available": "yes", "sample_quantity": 10, "sample_total_price": "45.00", "price_basis": "total_for_quantity",
+      "lead_time_days": 7, "currency": "USD",
+      "evidence": {"sample_quantity": "in total for 10 pcs", "sample_total_price": "The sample fee is $45.00 in total",
+                   "lead_time_days": "Sample lead time is 7 days"}},
+     {"sample_quantity": 10, "sample_unit_price": None, "sample_total_price": "45.00", "price_basis": "total_for_quantity",
+      "lead_time_days": 7, "currency": "USD"}, []),
+    ("bulk tiers", "quote_bulk_tiers.txt",
+     {"sample_quantity": 5, "sample_unit_price": "3.20", "price_basis": "per_unit", "moq": 100, "production_lead_time_days": 20,
+      "shipping_terms": "FOB", "currency": "USD", "quote_valid_until": "2026-11-15",
+      "bulk_tiers": [{"min_qty": 100, "unit_price": "1.80", "evidence": "100-499 pcs USD 1.80/pc"},
+                     {"min_qty": 500, "unit_price": "1.50", "evidence": "500-999 pcs USD 1.50/pc"},
+                     {"min_qty": 1000, "unit_price": "1.20", "evidence": "1000+ pcs USD 1.20/pc"}],
+      "evidence": {"sample_quantity": "Samples: 5 pcs", "sample_unit_price": "5 pcs at USD 3.20 each", "moq": "MOQ is 100 pcs",
+                   "production_lead_time_days": "Production lead time is 20 days"}},
+     {"moq": 100, "production_lead_time_days": 20, "shipping_terms": "FOB", "quote_valid_until": "2026-11-15", "currency": "USD",
+      "bulk_tiers": [{"min_qty": 100, "unit_price": "1.80"}, {"min_qty": 500, "unit_price": "1.50"}, {"min_qty": 1000, "unit_price": "1.20"}]}, []),
+    ("a branding fee", "quote_branding_fee.txt",
+     {"branding_possible": "yes", "branding_fee": "30.00", "branding_min_qty": 50, "sample_quantity": 10, "sample_unit_price": "2.50",
+      "price_basis": "per_unit", "currency": "USD",
+      "evidence": {"branding_fee": "The engraving fee is USD 30.00 one-time setup", "branding_min_qty": "minimum 50 pcs for engraving",
+                   "sample_quantity": "for 10 pcs", "sample_unit_price": "Sample price is USD 2.50 per piece"}},
+     {"branding_possible": "yes", "branding_fee": "30.00", "branding_min_qty": 50, "sample_unit_price": "2.50", "currency": "USD"}, []),
+    ("a quote in RMB", "quote_rmb.txt",
+     {"sample_quantity": 10, "sample_unit_price": "22.50", "price_basis": "per_unit", "shipping_cost": "80", "shipping_terms": "EXW",
+      "currency": "RMB",
+      "evidence": {"sample_quantity": "for 10 pcs", "sample_unit_price": "Sample price is RMB 22.50 per piece",
+                   "shipping_cost": "Shipping cost is RMB 80"}},
+     {"sample_unit_price": "22.50", "shipping_cost": "80", "shipping_terms": "EXW", "currency": "CNY"}, []),
+    ("an ambiguous price", "quote_ambiguous.txt",
+     {"sample_quantity": 10, "sample_unit_price": "15", "price_basis": "unclear",
+      "evidence": {"sample_quantity": "for 10 pcs sample", "sample_unit_price": "The price is 15 for 10 pcs sample"}},
+     {"sample_quantity": 10, "sample_unit_price": "15", "price_basis": "unclear", "currency": "unknown"}, []),
+    ("a reply in Chinese", "quote_chinese.txt",
+     {"sample_available": "yes", "sample_quantity": 5, "sample_unit_price": "3.2", "price_basis": "per_unit", "lead_time_days": 5,
+      "branding_possible": "yes", "branding_fee": "50", "currency": "USD",
+      "evidence": {"sample_quantity": "样品数量5件", "sample_unit_price": "样品价格每件3.2美元", "lead_time_days": "样品交期5天",
+                   "branding_fee": "工程费50美元"}},
+     # 美元 is a USD marker (matched before the 元 inside it), so the Chinese quote is USD and nothing is mixed
+     {"sample_quantity": 5, "sample_unit_price": "3.2", "lead_time_days": 5, "branding_fee": "50", "branding_possible": "yes",
+      "currency": "USD"}, []),
+    ("a reply with questions for us", "quote_needs_info.txt",
+     {"status": "needs_info", "needs_from_us": ["drawing", "planned order quantity", " preferred shielding material "]},
+     {"needs_from_us": ["drawing", "planned order quantity", "preferred shielding material"], "sample_unit_price": None,
+      "currency": None, "price_basis": None, "bulk_tiers": None, "sample_quantity": None}, []),
+    ("a stub number that is not in the reply", "quote_per_unit.txt",
+     {"sample_quantity": 5, "sample_unit_price": "2.50", "price_basis": "per_unit", "currency": "USD",
+      "evidence": {"sample_quantity": "5 pcs are available as samples", "sample_unit_price": "USD 2.50 per piece"}},
+     {"sample_quantity": 5, "sample_unit_price": None, "price_basis": None, "currency": None},
+     ["sample_unit_price: evidence quote not found in the reply text"]),
+]
+
+
+def test_quote_fields_through_the_stub_llm():
+    for name, fixture, raw, want, warnings in QUOTE_CASES:
+        result, entry = run_quote(fixture, raw)
+        for field, value in want.items():
+            got = entry[field]
+            if field == "bulk_tiers" and got:
+                got = [{k: t[k] for k in ("min_qty", "unit_price")} for t in got]
+            assert got == value, (name, field, got, value)
+        assert entry["quote_warnings"] == warnings, (name, entry["quote_warnings"])
+        assert entry["status"] == raw.get("status", "pricing_provided") and entry["summary"] == "stub summary"   # names unchanged
+        assert set(ea.QUOTE_KEYS) <= set(entry)                                      # every field is present, null when unstated
+        for money in ea.QUOTE_MONEY_FIELDS:                                           # money is a string that parses as a Decimal
+            assert entry[money] is None or (isinstance(entry[money], str) and ea.Decimal(entry[money]) >= 0), (name, money)
+        proven = [f for f in ea.QUOTE_EVIDENCE_FIELDS if entry[f] is not None]
+        assert sorted(entry["evidence"]) == sorted(proven), (name, entry["evidence"])  # evidence for every non-null field only
+        for field, quote in entry["evidence"].items():
+            assert ea._norm(quote) in ea._norm(read_fixture(fixture)), (name, field)
+    # persisted under SKU + listing, as a plain JSON-safe entry
+    state = {}
+    draft = ea.make_draft(cand("A1", "a@x.com", url="http://shop/a1"))
+    run_quote("quote_bulk_tiers.txt", QUOTE_CASES[2][2], state, draft)
+    assert list(state) == ["A1|shop/a1"] and json.loads(json.dumps(state))["A1|shop/a1"]["bulk_tiers"][1]["min_qty"] == 500
+
+
+VERIFY_TABLE = [  # (what the stub returned, the field, expected value, warning that must appear (or None))
+    ({"sample_unit_price": "3.50", "evidence": {"sample_unit_price": "Sample price is USD 3.20 per piece"}}, "sample_unit_price", None,
+     "sample_unit_price: the number 3.50 does not appear in its evidence quote"),
+    ({"sample_unit_price": "3.20"}, "sample_unit_price", None, "sample_unit_price: no evidence quote given"),
+    ({"sample_unit_price": "3.20", "evidence": {"sample_unit_price": "  "}}, "sample_unit_price", None, "no evidence quote given"),
+    ({"sample_unit_price": "3.20", "evidence": {"sample_unit_price": "sample   PRICE is usd 3.20\nper piece"}}, "sample_unit_price", "3.20", None),
+    ({"sample_unit_price": 3.2, "evidence": {"sample_unit_price": "Sample price is USD 3.20 per piece"}}, "sample_unit_price", "3.2", None),
+    ({"sample_unit_price": "$3.20", "evidence": {"sample_unit_price": "Sample price is USD 3.20 per piece"}}, "sample_unit_price", "3.20", None),
+    ({"sample_unit_price": "abc", "evidence": {"sample_unit_price": "USD 3.20"}}, "sample_unit_price", None, "'abc' is not an amount"),
+    ({"sample_unit_price": "-3.20", "evidence": {"sample_unit_price": "USD 3.20"}}, "sample_unit_price", None, "is not an amount"),
+    ({"sample_quantity": 0, "evidence": {"sample_quantity": "5 pcs"}}, "sample_quantity", None, "is not a positive whole number"),
+    ({"sample_quantity": 2.5, "evidence": {"sample_quantity": "5 pcs"}}, "sample_quantity", None, "is not a positive whole number"),
+    ({"sample_quantity": "ten", "evidence": {"sample_quantity": "5 pcs"}}, "sample_quantity", None, "is not a positive whole number"),
+    ({"sample_quantity": True, "evidence": {"sample_quantity": "5 pcs"}}, "sample_quantity", None, "is not a positive whole number"),
+    ({"sample_quantity": 5.0, "evidence": {"sample_quantity": "5 pcs are available as samples"}}, "sample_quantity", 5, None),
+    ({"sample_quantity": "5", "evidence": {"sample_quantity": "5 pcs are available as samples"}}, "sample_quantity", 5, None),
+    ({"sample_quantity": 50, "evidence": {"sample_quantity": "5 pcs are available as samples"}}, "sample_quantity", None, "the number 50 does not appear"),
+    ({"sample_quantity": 5, "evidence": {"sample_quantity": "five pieces"}}, "sample_quantity", None, "evidence quote not found"),
+    ({"lead_time_days": 5, "evidence": {"lead_time_days": "Lead time for samples is 5 days"}}, "lead_time_days", 5, None),
+    ({"lead_time_days": 9, "evidence": {"lead_time_days": "Lead time for samples is 5 days"}}, "lead_time_days", None, "the number 9 does not appear"),
+    ({"shipping_terms": "DDP"}, "shipping_terms", None, "shipping_terms: not found in the reply text"),
+    ({"sample_available": "maybe"}, "sample_available", "unknown", "'maybe' is not yes/no/unknown"),
+    ({"sample_available": None}, "sample_available", "unknown", None),
+    ({"sample_unit_price": "3.20", "price_basis": "weekly", "evidence": {"sample_unit_price": "Sample price is USD 3.20 per piece"}},
+     "price_basis", "unclear", "price_basis: 'weekly' is not"),
+    ({"sample_unit_price": "3.20", "currency": "EUR", "evidence": {"sample_unit_price": "Sample price is USD 3.20 per piece"}},
+     "currency", "USD", "currency: the model said 'EUR' but the evidence shows USD"),
+    ({"sample_unit_price": "3.20", "sample_quantity": 5, "evidence": {"sample_unit_price": "Sample price is USD 3.20 per piece",
+      "sample_quantity": "5 pcs are available"}, "currency": "$"}, "currency", "USD", None),
+    ({"bulk_tiers": [{"min_qty": 100, "unit_price": "1.80"}]}, "bulk_tiers", None, "bulk_tiers[0].min_qty: no evidence quote given"),
+    ({"bulk_tiers": [{"min_qty": 200, "unit_price": "1.80", "evidence": "100-499 pcs USD 1.80/pc"}]}, "bulk_tiers", None,
+     "bulk_tiers[0].min_qty: the number 200 does not appear"),
+    ({"bulk_tiers": [{"min_qty": 100, "unit_price": "9.99", "evidence": "100-499 pcs USD 1.80/pc"}]}, "bulk_tiers", None,
+     "bulk_tiers[0].unit_price: the number 9.99 does not appear"),
+    ({"bulk_tiers": ["100 pcs"]}, "bulk_tiers", None, "bulk_tiers[0]: needs a positive whole min_qty"),
+]
+
+
+def test_numbers_are_verified_in_code():
+    reply_fixture = "quote_per_unit.txt"
+    for raw, field, want, warning in VERIFY_TABLE:
+        reply = read_fixture("quote_bulk_tiers.txt") if "bulk_tiers" in raw else read_fixture(reply_fixture)
+        got = ea.verify_quote({"status": "pricing_provided", **raw}, reply)
+        value = got[field]
+        assert value == want, (raw, field, value, want)
+        if warning:
+            assert any(warning in w for w in got["quote_warnings"]), (raw, got["quote_warnings"])
+        else:
+            assert got["quote_warnings"] == [], (raw, got["quote_warnings"])
+    # a nulled field leaves no evidence behind; the others keep theirs
+    got = ea.verify_quote({"sample_quantity": 5, "sample_unit_price": "9.99",
+                           "evidence": {"sample_quantity": "5 pcs are available as samples", "sample_unit_price": "USD 9.99"}},
+                          read_fixture(reply_fixture))
+    assert got["sample_unit_price"] is None and list(got["evidence"]) == ["sample_quantity"]
+    # mixed currencies in the evidence never pick one
+    mixed = ea.verify_quote({"sample_unit_price": "3.20", "shipping_cost": "80", "evidence": {
+        "sample_unit_price": "USD 3.20", "shipping_cost": "RMB 80"}}, "Sample USD 3.20 each. Shipping RMB 80.")
+    assert mixed["currency"] == "unknown" and any("mixes currencies" in w for w in mixed["quote_warnings"])
+
+
+def test_currency_detection_follows_the_stated_markers():
+    table = [("USD 3.20", "USD"), ("US$3.20", "USD"), ("$3.20", "USD"), ("usd 3.20", "USD"), ("RMB 22", "CNY"), ("CNY 22", "CNY"),
+             ("¥22", "CNY"), ("EUR 5", "EUR"), ("€5", "EUR"), ("22 yuan", "unknown"), ("22 dollars", "unknown")]
+    for evidence, want in table:
+        number = re.search(r"\d+(?:\.\d+)?", evidence)[0]
+        got = ea.verify_quote({"sample_unit_price": number, "evidence": {"sample_unit_price": evidence}}, f"Our price: {evidence} each.")
+        assert got["sample_unit_price"] == number and got["currency"] == want, (evidence, got["currency"], got["quote_warnings"])
+
+
+CHINESE_MARKERS = [  # (evidence, expected currency)
+    ("3.2美元", "USD"), ("3.2 美元", "USD"), ("美元3.2", "USD"), ("美元 3.2", "USD"),            # 美元 is USD, never CNY
+    ("3.2美金", "USD"), ("3.2 美金", "USD"), ("美金3.2", "USD"), ("美金 3.2", "USD"),
+    ("每件3.2美元", "USD"), ("报价3.2美金/件", "USD"), ("USD 3.2", "USD"), ("3.2$", "USD"),
+    ("22人民币", "CNY"), ("人民币22", "CNY"), ("人民币 22", "CNY"),
+    ("22元", "CNY"), ("22 元", "CNY"), ("每件22元", "CNY"), ("22.5元/件", "CNY"), ("RMB 22", "CNY"), ("¥22", "CNY"), ("￥22", "CNY"),
+    ("每单元22", "unknown"), ("22个单元", "unknown"), ("22元件", "unknown"), ("元22", "unknown"), ("22 dollars", "unknown"),   # not markers
+]
+
+
+def test_chinese_currency_markers():
+    for evidence, want in CHINESE_MARKERS:
+        number = re.search(r"\d+(?:\.\d+)?", evidence)[0]
+        got = ea.verify_quote({"sample_unit_price": number, "evidence": {"sample_unit_price": evidence}}, f"您好 {evidence} 谢谢")
+        assert got["sample_unit_price"] == number and got["currency"] == want, (evidence, got["currency"], got["quote_warnings"])
+        assert got["quote_warnings"] == [], (evidence, got["quote_warnings"])
+        assert ea._currency_codes(evidence) == ({want} if want != "unknown" else set()), (evidence, ea._currency_codes(evidence))
+    # a USD marker is blanked before CNY is tried: 美元 / 美金 never also produce CNY, and a real 元 next to one still does
+    assert ea._currency_codes("3.2美元") == {"USD"} and ea._currency_codes("3.2美金") == {"USD"}
+    assert ea._currency_codes("3.2美元，约23元") == {"USD", "CNY"} and ea._currency_codes("23元(约3.2美元)") == {"USD", "CNY"}
+    # The ordering itself, independent of the digit rule: even with a loose bare-元 CNY pattern, USD is matched first and
+    # its marker blanked, so 美元 / 美金 are never read as CNY.
+    original = ea.CURRENCY_PATTERNS
+    ea.CURRENCY_PATTERNS = (original[0], ("CNY", re.compile(r"元")), original[2])
+    try:
+        assert ea._currency_codes("3.2美元") == {"USD"} and ea._currency_codes("美金3.2") == {"USD"}
+        assert ea._currency_codes("约23元") == {"CNY"} and ea._currency_codes("3.2美元，约23元") == {"USD", "CNY"}
+    finally:
+        ea.CURRENCY_PATTERNS = original
+    # what the model says it quoted in is understood too (a bare 元 included) and compared with the evidence
+    for said, code in [("美元", "USD"), ("美金", "USD"), ("人民币", "CNY"), ("元", "CNY"), ("RMB", "CNY"), ("￥", "CNY"), ("$", "USD"), ("€", "EUR")]:
+        assert ea._currency_code(said) == code, said
+    ok = ea.verify_quote({"sample_unit_price": "3.2", "currency": "美元", "evidence": {"sample_unit_price": "3.2美元"}}, "单价3.2美元")
+    assert ok["currency"] == "USD" and ok["quote_warnings"] == []
+    wrong = ea.verify_quote({"sample_unit_price": "3.2", "currency": "人民币", "evidence": {"sample_unit_price": "3.2美元"}}, "单价3.2美元")
+    assert wrong["currency"] == "USD" and wrong["quote_warnings"] == ["currency: the model said '人民币' but the evidence shows USD"]
+
+
+def test_a_reply_that_mixes_chinese_currencies_is_unknown():
+    reply = "样品价格每件3.2美元，运费80元。"
+    mixed = ea.verify_quote({"sample_unit_price": "3.2", "shipping_cost": "80", "currency": "USD",
+                             "evidence": {"sample_unit_price": "样品价格每件3.2美元", "shipping_cost": "运费80元"}}, reply)
+    assert (mixed["sample_unit_price"], mixed["shipping_cost"]) == ("3.2", "80")           # the numbers are proven...
+    assert mixed["currency"] == "unknown"                                                    # ...but the currency never picks a side
+    assert "currency: the evidence mixes currencies" in mixed["quote_warnings"]
+    assert any(w.startswith("currency: the model said 'USD'") for w in mixed["quote_warnings"])
+    # both markers inside ONE evidence quote mix as well, in either order
+    for evidence in ("每件3.2美元（约23元）", "约23元（每件3.2美元）", "3.2美金 / 23人民币"):
+        number = re.search(r"\d+(?:\.\d+)?", evidence)[0]
+        got = ea.verify_quote({"sample_unit_price": number, "evidence": {"sample_unit_price": evidence}}, evidence)
+        assert got["currency"] == "unknown" and "currency: the evidence mixes currencies" in got["quote_warnings"], evidence
+    # the same marker in two fields is not a mix
+    same = ea.verify_quote({"sample_unit_price": "3.2", "shipping_cost": "35", "evidence": {
+        "sample_unit_price": "每件3.2美元", "shipping_cost": "运费35美金"}}, "每件3.2美元，运费35美金")
+    assert same["currency"] == "USD" and same["quote_warnings"] == []
+
+
+def test_reply_cli_records_and_prints_the_verified_quote():
+    with sandbox() as tmp:
+        path = os.path.join(tmp, "r.xlsx")
+        make_xlsx(path, [row("A1", email="a@x.com", url="http://shop/a1")])
+        raw = {"status": "pricing_provided", "summary": "gave a quote", **QUOTE_CASES[0][2],
+               "bulk_tiers": [{"min_qty": 100, "unit_price": "9.99", "evidence": "invented tier text"}]}
+        ea.summarize_reply = lambda text: raw
+        out = run_cli(["reply", "A1", "--results", path, "--file", os.path.join(FIXTURES, "quote_per_unit.txt")])
+        assert "A1 (Acme): pricing_provided" in out and "sample_quantity=5" in out and "sample_unit_price=3.20" in out
+        assert "WARNING (field set to null): bulk_tiers[0].min_qty: evidence quote not found in the reply text" in out
+        entry = read_state()["A1|shop/a1"]
+        assert entry["sample_quantity"] == 5 and entry["bulk_tiers"] is None and entry["status"] == "pricing_provided"
+        # a second reply is appended and the whole thread is re-verified against the combined text
+        raw2 = {"status": "pricing_provided", "summary": "more", "moq": 100, "evidence": {"moq": "MOQ is 100 pcs"}}
+        ea.summarize_reply = lambda text: raw2 if "--- reply 2" in text else raw
+        run_cli(["reply", "A1", "--results", path, "--file", os.path.join(FIXTURES, "quote_bulk_tiers.txt")])
+        entry = read_state()["A1|shop/a1"]
+        assert entry["moq"] == 100 and entry["sample_quantity"] is None and len(entry["replies"]) == 2
+        # a status outside the existing names is refused and nothing is stored
+        before = json.dumps(read_state(), sort_keys=True)
+        ea.summarize_reply = lambda text: {"status": "great_news", "summary": "x"}
+        try:
+            run_cli(["reply", "A1", "--results", path, "--file", os.path.join(FIXTURES, "quote_rmb.txt")])
+            raise AssertionError("accepted an unknown status")
+        except ValueError as e:
+            assert "bad status" in str(e)
+        assert json.dumps(read_state(), sort_keys=True) == before
+
+
 def test_parse_summary_and_report_rows():
     ok = ea.parse_summary('Sure: {"status": "needs_info", "summary": "Wants quantity."} done')
     assert ok == {"status": "needs_info", "summary": "Wants quantity."}

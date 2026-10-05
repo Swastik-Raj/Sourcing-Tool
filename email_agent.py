@@ -22,7 +22,9 @@ import os
 import re
 import smtplib
 import sys
+import unicodedata
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from email.message import EmailMessage
 from urllib.parse import urlsplit
 
@@ -333,39 +335,225 @@ def confirm_and_send(drafts: list, state: dict, yes: bool = False, send=smtp_sen
 
 # ---------- reply summarization ----------
 
+# Structured quote fields the summarizer may fill. The model extracts; verify_quote() below checks every number against
+# the reply text and nulls what it can't prove. Anything not stated in the reply is None - never guessed.
+QUOTE_INT_FIELDS = ("sample_quantity", "moq", "branding_min_qty", "lead_time_days", "production_lead_time_days")
+QUOTE_MONEY_FIELDS = ("sample_unit_price", "sample_total_price", "branding_fee", "shipping_cost")
+QUOTE_EVIDENCE_FIELDS = QUOTE_INT_FIELDS + QUOTE_MONEY_FIELDS      # each non-null one needs a verbatim evidence quote
+QUOTE_KEYS = ("sample_available", "sample_quantity", "sample_unit_price", "sample_total_price", "price_basis", "moq",
+              "bulk_tiers", "branding_possible", "branding_fee", "branding_min_qty", "lead_time_days",
+              "production_lead_time_days", "shipping_cost", "shipping_terms", "currency", "needs_from_us",
+              "quote_valid_until", "evidence", "quote_warnings")
+PRICE_BASES = ("per_unit", "total_for_quantity", "unclear")
+# Currency counts as USD only if $, US$, USD, 美元 or 美金 is in the evidence; RMB, CNY, the yuan signs, 人民币 or a number
+# followed by 元 mean CNY; EUR and the euro sign mean EUR; anything else is "unknown". One place to extend.
+# ORDER MATTERS: _currency_codes() blanks each marker it finds before trying the next pattern, so USD (which includes
+# 美元 and 美金, both of which contain 元) is matched first and a USD quote is never also read as CNY. A bare 元 only
+# counts right after a digit ("22元"), so words like 单元 (unit) are not read as a currency, and 元件 (component) is skipped.
+CURRENCY_PATTERNS = (("USD", re.compile(r"US\$|USD|\$|美元|美金", re.IGNORECASE)),
+                     ("CNY", re.compile(r"RMB|CNY|¥|￥|人民币|(?<=\d)\s*元(?!件)", re.IGNORECASE)),
+                     ("EUR", re.compile(r"EUR|€", re.IGNORECASE)))
+
+
 def parse_summary(text: str) -> dict:
     data = json.loads(text[text.index("{"): text.rindex("}") + 1])
     if data.get("status") not in REPLY_STATUSES:
         raise ValueError(f"bad status: {data.get('status')!r}")
-    return {"status": data["status"], "summary": str(data.get("summary", ""))}
+    extras = {k: data[k] for k in QUOTE_KEYS if k in data}       # the quote fields travel on, still unverified
+    return {**extras, "status": data["status"], "summary": str(data.get("summary", ""))}
+
+
+QUOTE_PROMPT = (
+    "A manufacturer replied to our sample-order inquiry (possibly several replies, oldest first, in any language). "
+    "Reply with JSON only. Keys: status, summary, and the quote fields below.\n"
+    "status: pricing_provided = gave pricing/availability; needs_info = asks us for more; dead_end = a real person "
+    "declined or the product is not available; auto_reply_or_spam = out-of-office, automated message or spam with no "
+    "real answer.\nsummary: 2-3 sentences, in English.\n"
+    "Quote fields - use null for anything the reply does not state. NEVER guess, infer, convert or calculate:\n"
+    "  sample_available (yes|no|unknown); sample_quantity (integer); sample_unit_price and sample_total_price (strings, "
+    "digits only, either may be null); price_basis (per_unit|total_for_quantity|unclear); moq (integer); "
+    "bulk_tiers (list of {min_qty, unit_price, evidence}); branding_possible (yes|no|unknown); branding_fee; "
+    "branding_min_qty; lead_time_days (sample) and production_lead_time_days (integers); shipping_cost; "
+    "shipping_terms (as stated, e.g. FOB, EXW, DDP); currency (as stated); needs_from_us (list of short strings: what "
+    "the seller asks us for); quote_valid_until (as stated).\n"
+    "evidence: an object mapping each non-null price, quantity, fee or lead-time field name to a SHORT VERBATIM quote "
+    "copied from the reply that contains that exact number. Each bulk tier carries its own evidence. If you cannot quote "
+    "it, set the field to null.\n\n")
 
 
 def summarize_reply(reply: str) -> dict:
     from anthropic import Anthropic
     msg = Anthropic(api_key=cfg("ANTHROPIC_API_KEY")).messages.create(
-        model=MODEL, max_tokens=400,
-        messages=[{"role": "user", "content": (
-            "A manufacturer replied to our sample-order inquiry (possibly several replies, oldest first, in any "
-            "language). Reply with JSON only: "
-            '{"status": "pricing_provided" | "needs_info" | "dead_end" | "auto_reply_or_spam", "summary": "<2-3 sentences, '
-            'in English: sample price/qty, branding/engraving, lead time, anything they need from us>"}.\n'
-            "pricing_provided = gave pricing/availability; needs_info = asks us for more; dead_end = a real person "
-            "declined or the product is not available; auto_reply_or_spam = out-of-office, automated message or "
-            "spam with no real answer.\n\n"
-            f"Reply:\n{reply}")}])
+        model=MODEL, max_tokens=1500, messages=[{"role": "user", "content": f"{QUOTE_PROMPT}Reply:\n{reply}"}])
     return parse_summary(msg.content[0].text)
+
+
+def _currency_codes(text) -> set:
+    """Every currency whose marker appears in the text. A marker that matched is blanked before the next pattern runs,
+    so 美元 / 美金 (USD) can never also be counted as the 元 of CNY."""
+    left, found = str(text), set()
+    for code, pattern in CURRENCY_PATTERNS:
+        if pattern.search(left):
+            found.add(code)
+            left = pattern.sub(" ", left)
+    return found
+
+
+def _currency_code(text):
+    """The currency a model says it quoted in (a bare "元" is accepted here), else None."""
+    said = str(text).strip()
+    if said == "元":
+        return "CNY"
+    codes = _currency_codes(said)
+    return next((code for code, _ in CURRENCY_PATTERNS if code in codes), None)
+
+
+def _norm(text) -> str:
+    """Case, width and whitespace-insensitive form used to find a quote inside the reply."""
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", str(text))).strip().lower()
+
+
+def _numbers(text) -> set:
+    return {Decimal(n.replace(",", "")) for n in re.findall(r"\d[\d,]*(?:\.\d+)?|\.\d+", unicodedata.normalize("NFKC", str(text)))}
+
+
+def _whole_number(value):
+    """Positive whole number from an int, an integer-valued float or a digit string; else None."""
+    if isinstance(value, bool):
+        return None
+    try:
+        d = Decimal(str(value).replace(",", "").strip())
+    except (InvalidOperation, ValueError):
+        return None
+    return int(d) if d.is_finite() and d == d.to_integral_value() and d >= 1 else None
+
+
+def _amount(value):
+    """Non-negative finite Decimal from a number or a string like "$1,200.50"; else None. Money is never a float."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        d = Decimal(str(value).replace(",", "").replace("$", "").strip())
+    except (InvalidOperation, ValueError):
+        return None
+    return d if d.is_finite() and d >= 0 else None
+
+
+def _prove(label: str, number, evidence, text_norm: str, warnings: list) -> bool:
+    """The evidence must appear in the reply text and the number must appear inside the evidence."""
+    if not isinstance(evidence, str) or not evidence.strip():
+        warnings.append(f"{label}: no evidence quote given")
+    elif _norm(evidence) not in text_norm:
+        warnings.append(f"{label}: evidence quote not found in the reply text")
+    elif Decimal(number) not in _numbers(evidence):
+        warnings.append(f"{label}: the number {number} does not appear in its evidence quote")
+    else:
+        return True
+    return False
+
+
+def verify_quote(raw: dict, reply_text: str) -> dict:
+    """Checks the summarizer's quote fields against the reply and returns the verified quote plus `evidence` and
+    `quote_warnings`. A numeric field whose evidence isn't in the reply, or whose number isn't in its evidence, is set
+    to None with a warning naming the field and the reason."""
+    warnings, evidence, out = [], {}, {k: None for k in QUOTE_KEYS}
+    text_norm, given = _norm(reply_text), raw.get("evidence") if isinstance(raw.get("evidence"), dict) else {}
+    used = []                                                              # evidence strings that back a price
+    for field in QUOTE_INT_FIELDS:
+        value = raw.get(field)
+        if value is None:
+            continue
+        n = _whole_number(value)
+        if n is None:
+            warnings.append(f"{field}: {value!r} is not a positive whole number")
+        elif _prove(field, n, given.get(field), text_norm, warnings):
+            out[field], evidence[field] = n, given[field]
+    for field in QUOTE_MONEY_FIELDS:
+        value = raw.get(field)
+        if value is None:
+            continue
+        d = _amount(value)
+        if d is None:
+            warnings.append(f"{field}: {value!r} is not an amount")
+        elif _prove(field, d, given.get(field), text_norm, warnings):
+            out[field], evidence[field] = format(d, "f"), given[field]
+            used.append(given[field])
+    tiers = []
+    for i, tier in enumerate(raw.get("bulk_tiers") or []):
+        label = f"bulk_tiers[{i}]"
+        qty, price = (_whole_number(tier.get("min_qty")), _amount(tier.get("unit_price"))) if isinstance(tier, dict) else (None, None)
+        if qty is None or price is None:
+            warnings.append(f"{label}: needs a positive whole min_qty and an amount unit_price")
+            continue
+        ev = tier.get("evidence")
+        if _prove(f"{label}.min_qty", qty, ev, text_norm, warnings) and _prove(f"{label}.unit_price", price, ev, text_norm, warnings):
+            tiers.append({"min_qty": qty, "unit_price": format(price, "f"), "evidence": ev})
+            used.append(ev)
+    out["bulk_tiers"] = tiers or None
+    for field in ("sample_available", "branding_possible"):
+        value = str(raw.get(field) or "unknown").strip().lower()
+        if value not in ("yes", "no", "unknown"):
+            warnings.append(f"{field}: {value!r} is not yes/no/unknown")
+            value = "unknown"
+        out[field] = value
+    basis = raw.get("price_basis")
+    if basis is not None and basis not in PRICE_BASES:
+        warnings.append(f"price_basis: {basis!r} is not per_unit/total_for_quantity/unclear")
+        basis = None
+    if used and basis is None:
+        basis = "unclear"                                    # a price without a stated basis is not guessed at
+    out["price_basis"] = basis if used else None
+    terms = raw.get("shipping_terms")
+    if terms:
+        if _norm(terms) in text_norm:
+            out["shipping_terms"] = str(terms).strip()
+        else:
+            warnings.append("shipping_terms: not found in the reply text")
+    asks = raw.get("needs_from_us")
+    out["needs_from_us"] = [str(a).strip() for a in asks if str(a).strip()] if isinstance(asks, list) else None
+    out["needs_from_us"] = out["needs_from_us"] or None
+    out["quote_valid_until"] = str(raw["quote_valid_until"]).strip() if raw.get("quote_valid_until") else None
+    # Currency comes from the evidence, not from the model's say-so.
+    if used:
+        found = set().union(*(_currency_codes(u) for u in used))
+        out["currency"] = next(iter(found)) if len(found) == 1 else "unknown"
+        if len(found) > 1:
+            warnings.append("currency: the evidence mixes currencies")
+        said = raw.get("currency")
+        if said and (_currency_code(said) or str(said).strip().upper()) != out["currency"]:
+            warnings.append(f"currency: the model said {said!r} but the evidence shows {out['currency']}")
+    out["evidence"] = evidence
+    out["quote_warnings"] = warnings
+    return out
+
+
+def quote_lines(result: dict) -> list:
+    """What was recorded from a reply's quote, for the terminal: the verified fields and any warnings."""
+    shown = [f"{k}={result[k]}" for k in QUOTE_KEYS if k not in ("evidence", "quote_warnings", "bulk_tiers", "needs_from_us")
+             and result.get(k) not in (None, "unknown")]
+    out = ["Quote recorded: " + (", ".join(shown) if shown else "nothing quantified in this reply")]
+    if result.get("bulk_tiers"):
+        out.append("  bulk tiers: " + "; ".join(f">={t['min_qty']} pcs at {t['unit_price']}" for t in result["bulk_tiers"]))
+    if result.get("needs_from_us"):
+        out.append("  the seller asks us for: " + "; ".join(result["needs_from_us"]))
+    out += [f"  WARNING (field set to null): {w}" for w in result.get("quote_warnings", [])]
+    return out
 
 
 def record_reply(state: dict, draft: dict, text: str, summarize=None) -> dict:
     """Files a reply under this draft's SKU + listing. A second reply is appended to the first, never replacing
-    it, and the whole thread is summarized. Nothing is stored if summarizing fails."""
+    it, and the whole thread is summarized. The summarizer's quote fields are verified against the thread before
+    they are stored. Nothing is stored if summarizing fails."""
     entry = state.get(draft["key"], {})
     replies = list(entry.get("replies", []))
     if not replies or replies[-1]["text"].strip() != text.strip():   # pasting the same reply twice adds nothing
         replies.append({"at": now(), "text": text})
     combined = replies[0]["text"] if len(replies) == 1 else "\n\n".join(
         f"--- reply {i} ({r['at']}) ---\n{r['text']}" for i, r in enumerate(replies, start=1))
-    result = (summarize or summarize_reply)(combined)
+    raw = (summarize or summarize_reply)(combined)
+    if raw.get("status") not in REPLY_STATUSES:
+        raise ValueError(f"bad status: {raw.get('status')!r}")
+    result = {"status": raw["status"], "summary": str(raw.get("summary", "")), **verify_quote(raw, combined)}
     entry = entry_for(state, draft)
     entry.update(replies=replies, reply=combined, **result)
     return result
@@ -504,6 +692,7 @@ def main():
         result = record_reply(state, d, text)
         save_state(state)
         print(f"{d['sku']} ({d['manufacturer'] or d['url']}): {result['status']}\n{result['summary']}")
+        print("\n".join(quote_lines(result)))
     elif args.cmd == "report":
         state = load_state()
         lost = orphaned(state, drafts)

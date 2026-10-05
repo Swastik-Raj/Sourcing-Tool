@@ -1,15 +1,15 @@
 Subject: Sample order inquiry - {product} ({sku})
 
-Hello {manufacturer} team,
+{greeting}
 
-My name is {sender_name} from Zync Technologies. We came across your listing for "{product}" ({url}) and it looks like a good fit for what we need{price_line}.
+My name is {sender_name} from Zync Technologies. We came across {listing_ref} and it looks like a good fit for what we need.
 
 Before placing a larger purchase, we would like to start with a sample order. Could you please let us know:
 
 1. Whether samples are available, in what quantity, and at what cost?
 2. Whether custom branding/engraving is possible at sample quantities?
-3. The estimated lead time for samples?
-{note_line}
+3. The estimated lead time for samples?{note_line}
+
 Sample shipping destination:
 {shipping_address}
 

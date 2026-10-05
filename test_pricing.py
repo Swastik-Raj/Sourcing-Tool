@@ -657,4 +657,29 @@ assert "**BATCH STOPPED EARLY:** BadRequestError: Your credit balance is too low
 tmp = tempfile.mkdtemp()
 done, why, calls = batch([mk("A"), mk("B"), mk("C")], {"A": RuntimeError("x"), "B": good, "C": good}, tmp)
 assert calls == ["A", "B", "C"] and why == "" and run_counts([d[1] for d in done]) == (2, 0, 1)
+
+# --- Listing titles in the Results sheet: appended after every existing column, nothing moved or renamed ---
+from sourcing_agent import (CANDIDATE_XLSX_FIELDS, MAX_CANDIDATES, ORDERING_NOTE_FIELD, PRODUCT_XLSX_FIELDS,
+                            RECOMMENDED_XLSX_FIELDS)
+existing = PRODUCT_XLSX_FIELDS + RECOMMENDED_XLSX_FIELDS + [ORDERING_NOTE_FIELD] + [
+    f"Manufacturer {n} {f}" for n in range(1, MAX_CANDIDATES + 1) for f in CANDIDATE_XLSX_FIELDS]
+titles = ["Recommended Listing Title"] + [f"Manufacturer {n} Listing Title" for n in range(1, MAX_CANDIDATES + 1)]
+pa = cand("Alpha", 0.2, 1, "stated", title="Alpha's own Cat6 Coupler Title")        # the pick: cheap and accurate
+pb = cand("Beta", 15.0, 1, "stated", title="Beta Listing, Panel Mount")             # not the pick: too expensive
+pc = cand("Gamma", 0.3, 1, "stated", title=None)                                    # a candidate with no title at all
+prod = {"sku": "TITLED", "description": "d", "product_name": "p", "lcom_price": 10.0}
+path = os.path.join(tempfile.mkdtemp(), "titles.xlsx")
+write_excel_report([(prod, result(pb, pa, pc)),
+                    ({**prod, "sku": "NOREC"}, result(pb)),                          # no recommendation: titles still listed
+                    ({**prod, "sku": "ERR", "error": "RuntimeError: boom"}, None)], path)
+ws = openpyxl.load_workbook(path).worksheets[0]
+hdr = [c.value for c in ws[1]]
+assert hdr[:len(existing)] == existing and hdr[len(existing):] == titles, hdr   # existing columns untouched, titles last
+rows_by_sku = {r[0].value: dict(zip(hdr, [c.value for c in r])) for r in ws.iter_rows(min_row=2)}
+t = rows_by_sku["TITLED"]
+assert t["Recommended Manufacturer"] == "Alpha" and t["Recommended Listing Title"] == "Alpha's own Cat6 Coupler Title"
+assert [t[f"Manufacturer {n} Listing Title"] for n in (1, 2, 3, 4, 5)] == ["Beta Listing, Panel Mount",
+                                                                         "Alpha's own Cat6 Coupler Title", None, None, None]
+assert rows_by_sku["NOREC"]["Recommended Listing Title"] is None and rows_by_sku["NOREC"]["Manufacturer 1 Listing Title"] == "Beta Listing, Panel Mount"
+assert rows_by_sku["ERR"]["Recommended Listing Title"] is None and rows_by_sku["ERR"]["Recommendation"].startswith("Error researching")
 print("ok")

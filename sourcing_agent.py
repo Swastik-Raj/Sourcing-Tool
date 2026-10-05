@@ -1541,6 +1541,8 @@ def write_excel_report(rows: list, path: str) -> None:
     header = PRODUCT_XLSX_FIELDS + RECOMMENDED_XLSX_FIELDS + [ORDERING_NOTE_FIELD]
     for n in range(1, MAX_CANDIDATES + 1):
         header += [f"Manufacturer {n} {field}" for field in CANDIDATE_XLSX_FIELDS]
+    # Listing titles go after every existing column so no existing column moves (the email agent reads by header name).
+    header += ["Recommended Listing Title"] + [f"Manufacturer {n} Listing Title" for n in range(1, MAX_CANDIDATES + 1)]
     ws.append(header)
     comp.append(["SKU", "Candidate", "Manufacturer", "Accuracy", "Unit Price", "Unit Price Confidence",
                  "vs. L-Com Price", "Recommended"])
@@ -1586,6 +1588,8 @@ def write_excel_report(rows: list, path: str) -> None:
                         cell.fill = GREEN
             else:
                 row += [""] * len(CANDIDATE_XLSX_FIELDS)
+        row.append(candidates[rec_idx].listing_title or "" if rec_idx is not None else "")
+        row += [(candidates[i].listing_title or "") if i < len(candidates) else "" for i in range(MAX_CANDIDATES)]
         if product.get("error"):  # never green: the Recommended cell carries the error text
             comp.append([product["sku"], "ERROR", "", None, None, "", "", rec_reason])
         comp.append([product["sku"], "L-Com", "L-Com (benchmark)", None, lcom])

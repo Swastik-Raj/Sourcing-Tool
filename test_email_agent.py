@@ -97,15 +97,25 @@ def write_exclusions(path, rows):
         w.writerows(rows)
 
 
+def write_near_misses(path, rows):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["sku", "supplier_or_url", "concern", "question"])
+        w.writerows(rows)
+
+
 @contextlib.contextmanager
-def sandbox(exclusions=(("OTHER", "nobody", "placeholder row"),)):
+def sandbox(exclusions=(("OTHER", "nobody", "placeholder row"),), near_misses=()):
     """Temp dir for state and reports, a real-looking SHIPPING_ADDRESS, an exclusions file, no .env, no API key, SMTP
     faked. Nothing leaves the process."""
-    old = (ea.HERE, ea.STATE_PATH, ea.REVIEWER_EXCLUSIONS_CSV, ea.smtplib.SMTP, ea.summarize_reply, dict(os.environ))
+    old = (ea.HERE, ea.STATE_PATH, ea.REVIEWER_EXCLUSIONS_CSV, ea.smtplib.SMTP, ea.summarize_reply, dict(os.environ), ea.NEAR_MISSES_CSV)
     tmp = tempfile.mkdtemp()
     ea.HERE, ea.STATE_PATH = tmp, os.path.join(tmp, "email_state.json")
     ea.REVIEWER_EXCLUSIONS_CSV = os.path.join(tmp, "reviewer_exclusions.csv")
     write_exclusions(ea.REVIEWER_EXCLUSIONS_CSV, exclusions)
+    ea.NEAR_MISSES_CSV = os.path.join(tmp, "near_misses.csv")
+    if near_misses is not None:                       # None = the file does not exist
+        write_near_misses(ea.NEAR_MISSES_CSV, near_misses)
     ea.smtplib.SMTP = FakeSMTP
     os.environ.update(SMTP_HOST="smtp.invalid", SMTP_USER="u@z.example", SMTP_PASSWORD="x",
                       SHIPPING_ADDRESS="Zync Technologies\\n100 Test Way\\nPlano, TX 75024")
@@ -120,6 +130,7 @@ def sandbox(exclusions=(("OTHER", "nobody", "placeholder row"),)):
         yield tmp
     finally:
         ea.HERE, ea.STATE_PATH, ea.REVIEWER_EXCLUSIONS_CSV, ea.smtplib.SMTP, ea.summarize_reply = old[:5]
+        ea.NEAR_MISSES_CSV = old[6]
         os.environ.clear()
         os.environ.update(old[5])
 
@@ -248,6 +259,170 @@ def test_titles_come_from_the_search_agents_own_sheet():
         assert only({"Recommended Listing Title"}, "only_recommended.xlsx") == want
         assert only({"Manufacturer 2 Listing Title"}, "only_manufacturer_n.xlsx") == want
         assert only(set(), "no_titles.xlsx") == ""
+
+
+# ---------- near-miss drafts: opt-in, labelled for us, clean for the seller ----------
+
+NM_HEADER = HEADER + ["Manufacturer 1 Name", "Manufacturer 1 Email", "Manufacturer 2 Name", "Manufacturer 2 Email"]
+NM_ROWS = [  # (sku, seller URL in candidate block 2, concern, the one question for the seller)
+    ("NM1", "http://listing/nm1-near", "Surge rating (18 kA) not stated on the listing", "Could you confirm the surge current rating (in kA) of this arrester?"),
+    ("NM2", "http://listing/nm2-near", "Cat6a not stated; shielding unconfirmed", "Could you confirm the category rating of this coupler and whether it is shielded?"),
+    ("NM3", "http://listing/nm3-near", "Price is a $2-$16 range; the check used $16", "Your listing shows a range of prices. Could you tell us the unit price for our sample quantity?"),
+]
+
+
+def nm_results(path, extra_rows=()):
+    """Two recommended rows (REC1, REC2) plus NM1-NM3: no recommended seller, but a near-miss candidate in block 2."""
+    rows = [row("REC1", maker="Acme", email="sales@acme.com") + ["Acme", "sales@acme.com", "", ""],
+            row("REC2", maker="Beta Ltd") + ["Beta Ltd", "", "", ""]]
+    for sku, url, _, _ in NM_ROWS:
+        r = row(sku, rec=NO_REC, maker=None, url="")
+        r[HEADER.index("Manufacturer 2 URL")], r[HEADER.index("Manufacturer 2 MOQ")] = url, "50"
+        rows.append(r + ["Other Co", "", f"{sku} Maker Ltd", ""])
+    make_xlsx(path, rows + list(extra_rows), NM_HEADER)
+
+
+def default_output(path):
+    return run_cli(["drafts", path])
+
+
+def test_near_miss_is_opt_in_and_default_output_is_unchanged():
+    with sandbox(near_misses=NM_ROWS) as tmp:
+        path = os.path.join(tmp, "r.xlsx")
+        nm_results(path)
+        with_file = default_output(path)                                  # near_misses.csv exists, flag not given
+        os.remove(ea.NEAR_MISSES_CSV)
+        without_file = default_output(path)
+        assert with_file == without_file                                  # the list changes nothing unless asked for
+        assert "NEAR-MISS" not in with_file and "NEEDS HUMAN CHECK" not in with_file and "--near-miss" not in with_file
+        assert with_file.count("=" * 70) == 2 and "2 draft(s); 1 with an email address. Nothing sent." in with_file
+        assert with_file.rstrip().endswith("Nothing sent.") and "NM1" not in with_file
+        # the default layout of a draft header is pinned exactly (this is what `drafts` printed before the flag existed)
+        first = with_file.split("=" * 70 + "\n", 1)[1]
+        assert first.startswith("REC1 | Acme | To: sales@acme.com\nSubject: Sample order inquiry - REC1 keyword (REC1)\n\nHello Acme team,\n")
+        second = with_file.split("=" * 70 + "\n")[2]
+        assert second.startswith("REC2 | Beta Ltd | To: NO EMAIL - inquiry form\nNO EMAIL - submit via the inquiry form at http://listing/REC2\nSubject: ")
+        # the same three drafts through the old code path (make_draft) render exactly as the printed text says
+        drafts = [ea.make_draft(c) for c in ea.load_candidates(path)]
+        assert "\n".join(ea.format_draft(d) for d in drafts) in with_file
+        # the real results file (gitignored, so skipped when absent): the default stays 5 drafts with the real near_misses.csv present
+        real = sorted(glob.glob(os.path.join(HERE, "Excel Output Sheets", "sourcing_results_*.xlsx")), key=os.path.getmtime)[-1:]
+        if real and os.path.exists(os.path.join(HERE, "near_misses.csv")):
+            ea.REVIEWER_EXCLUSIONS_CSV = os.path.join(HERE, "reviewer_exclusions.csv")
+            out = run_cli(["drafts", real[0]])
+            n_drafts = int(re.search(r"^(\d+) draft\(s\)", out, re.M)[1])
+            assert "NEAR-MISS" not in out and "NEEDS HUMAN CHECK" not in out and out.count("=" * 70) == n_drafts
+
+
+def test_near_miss_flag_adds_labelled_drafts_after_the_normal_ones():
+    with sandbox(near_misses=NM_ROWS) as tmp:
+        path = os.path.join(tmp, "r.xlsx")
+        nm_results(path)
+        out = run_cli(["drafts", path, "--near-miss"])
+        normal, _, extra = out.partition("NEAR-MISS DRAFTS")
+        assert "2 draft(s); 1 with an email address. Nothing sent." in normal and normal.count("=" * 70) == 2 and normal.count("#" * 70) == 1
+        assert "the search agent did NOT recommend these" in extra and "Nothing sent." in extra.rstrip().splitlines()[-1]
+        assert extra.rstrip().endswith("3 near-miss draft(s), 0 with an email address. Nothing sent.")
+        for sku, url, concern, question in NM_ROWS:
+            block = extra.split(f"{sku} | ")[1].split("=" * 70)[0]
+            assert f"NEEDS HUMAN CHECK: {concern}\n" in block                 # the concern, in the header
+            assert f"NO EMAIL - submit via the inquiry form at {url}\n" in block and f"4. {question}" in block
+            assert block.index("NEEDS HUMAN CHECK") < block.index("Subject:") < block.index("Hello")
+        assert "NM1 Maker Ltd" in extra and "Other Co" not in extra                # the block the CSV row names (block 2), not block 1
+        assert not state_file_exists() and FakeSMTP.created == 0                   # read only: nothing stored, nothing sent
+
+
+def test_near_miss_label_stays_out_of_the_seller_text_and_asks_one_question():
+    with sandbox(near_misses=NM_ROWS) as tmp:
+        path = os.path.join(tmp, "r.xlsx")
+        nm_results(path)
+        recommended = [ea.make_draft(c) for c in ea.load_candidates(path)]
+        near, notes = ea.near_miss_drafts(path, recommended, ea.load_exclusions(), ea.load_near_misses())
+        assert notes == [] and [d["sku"] for d in near] == ["NM1", "NM2", "NM3"]
+        for d, (sku, url, concern, question) in zip(near, NM_ROWS):
+            text = d["subject"] + "\n" + d["body"]
+            assert d["check"] == concern and d["questions"] == [question]
+            assert "NEEDS HUMAN CHECK" not in text and concern not in text and "near-miss" not in text.lower() and "human" not in text.lower()
+            items = re.findall(r"^(\d+)\. (.*)$", d["body"], re.M)
+            assert [n for n, _ in items] == ["1", "2", "3", "4"] and items[3][1] == question      # one added question, nothing else
+            # reuses the existing generator: the body is exactly make_draft's body for the same candidate, plus that one question
+            plain = ea.make_draft({k: v for k, v in d.items() if k not in ("check", "questions", "subject", "body", "label")})
+            assert d["body"] == plain["body"].replace("3. The estimated lead time for samples?",
+                                                      f"3. The estimated lead time for samples?\n4. {question}")
+            assert d["subject"] == plain["subject"] and d["label"] == plain["label"] and d["key"] == plain["key"]
+            assert d["body"].startswith(f"Hello {d['manufacturer']} team,") and "100 Test Way" in d["body"]
+
+
+def test_near_miss_drafts_pass_the_same_leak_scan():
+    with sandbox(near_misses=NM_ROWS) as tmp:
+        path = os.path.join(tmp, "r.xlsx")
+        nm_results(path)
+        near, _ = ea.near_miss_drafts(path, [], ea.load_exclusions(), ea.load_near_misses())
+        for d in near:
+            found = INTERNAL.search(d["subject"] + "\n" + d["body"])
+            assert not found, (d["sku"], found[0])
+    # the real near_misses.csv and the real latest results file (both kept out of git, so skipped when absent)
+    real_csv = os.path.join(HERE, "near_misses.csv")
+    files = sorted(glob.glob(os.path.join(HERE, "Excel Output Sheets", "sourcing_results_*.xlsx")), key=os.path.getmtime)
+    if os.path.exists(real_csv):
+        rows = ea.load_near_misses(real_csv)
+        assert len(rows) >= 1
+        for r in rows:
+            assert not INTERNAL.search(r["question"]), (r["sku"], r["question"])      # the wording itself is clean
+            assert r["question"].endswith("?") and r["concern"].strip()
+        if files:
+            drafts, _ = ea.load_results(files[-1], ea.load_exclusions(os.path.join(HERE, "reviewer_exclusions.csv")))
+            near, notes = ea.near_miss_drafts(files[-1], [ea.make_draft(c) for c in drafts], ea.load_exclusions(os.path.join(HERE, "reviewer_exclusions.csv")), rows)
+            assert len(near) + len(notes) == len(rows)
+            for d in near:
+                assert not INTERNAL.search(d["subject"] + "\n" + d["body"]), (d["sku"], INTERNAL.search(d["body"])[0])
+                assert "NEEDS HUMAN CHECK" not in d["body"] and d["check"] not in d["body"]
+
+
+def test_near_miss_respects_reviewer_exclusions_duplicates_and_missing_rows():
+    with sandbox(near_misses=NM_ROWS + [("NOSUCH", "http://x", "c", "q?"), ("NM1", "http://not-a-candidate", "c", "q?"),
+                                        ("REC2", "http://listing/REC2", "already recommended", "Could you confirm something?")],
+                 exclusions=[("NM2", "http://listing/nm2-near", "page unavailable")]) as tmp:
+        path = os.path.join(tmp, "r.xlsx")
+        nm_results(path)
+        out = run_cli(["drafts", path, "--near-miss"])
+        extra = out.partition("NEAR-MISS DRAFTS")[2]
+        assert "NM1 | " in extra and "NM3 | " in extra and "NM2 | " not in extra          # NM2 is reviewer-excluded
+        assert "NOTE: near-miss NM2 (NM2 Maker Ltd): excluded by reviewer (page unavailable) - skipped" in extra
+        assert "NOTE: near-miss NOSUCH: not found in the results file (no such SKU) - skipped" in extra
+        assert "NOTE: near-miss NM1: not found in the results file (seller or URL not among its candidates) - skipped" in extra
+        assert "NOTE: near-miss REC2 (Beta Ltd): already a recommended draft - not drafted twice" in extra
+        assert extra.count("NEEDS HUMAN CHECK") == 2 and extra.rstrip().endswith("2 near-miss draft(s), 0 with an email address. Nothing sent.")
+    # a seller name in the CSV (instead of a URL) selects the block too
+    with sandbox(near_misses=[("NM1", "nm1 maker", "name match", "Could you confirm the rating?")]) as tmp:
+        path = os.path.join(tmp, "r.xlsx")
+        nm_results(path)
+        near, notes = ea.near_miss_drafts(path, [], [], ea.load_near_misses())
+        assert [d["manufacturer"] for d in near] == ["NM1 Maker Ltd"] and notes == []
+    # no near_misses.csv at all: a loud warning, the normal drafts are untouched, nothing crashes
+    with sandbox(near_misses=None) as tmp:
+        path = os.path.join(tmp, "r.xlsx")
+        nm_results(path)
+        out = run_cli(["drafts", path, "--near-miss"])
+        assert "!!! WARNING: near_misses.csv is missing - no near-miss drafts were added." in out and "NEEDS HUMAN CHECK" not in out
+        assert "2 draft(s); 1 with an email address. Nothing sent." in out
+
+
+def test_near_miss_is_drafts_only_and_read_only():
+    with sandbox(near_misses=NM_ROWS) as tmp:
+        path = os.path.join(tmp, "r.xlsx")
+        nm_results(path)
+        before = open(ea.NEAR_MISSES_CSV, "rb").read()
+        run_cli(["drafts", path, "--near-miss"])
+        assert open(ea.NEAR_MISSES_CSV, "rb").read() == before and not state_file_exists()
+        assert FakeSMTP.created == 0
+        for cmd in ("send", "report"):                       # the flag does not exist there: they can never include near-miss drafts
+            assert cli_exit([cmd, path, "--near-miss"]) == "2"
+        assert not state_file_exists() and FakeSMTP.created == 0
+        report = run_cli(["report", path])
+        md = open(re.search(r"Wrote (.+\.md)", report)[1], encoding="utf-8").read()
+        assert "NEEDS HUMAN CHECK" not in md and "Other Co" not in md and "NM1 Maker" not in md       # no near-miss seller
+        assert re.search(r"\| NM1 \|.*not contacted", md)                                              # the SKU is still "not contacted"
 
 
 def test_config_values_are_used():

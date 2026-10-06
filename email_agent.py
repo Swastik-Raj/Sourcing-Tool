@@ -36,6 +36,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(HERE, "email_template.txt")
 STATE_PATH = os.path.join(HERE, "email_state.json")  # per SKU + listing: sent / reply / summary
 REVIEWER_EXCLUSIONS_CSV = os.path.join(HERE, "reviewer_exclusions.csv")  # shared with the search agent; read only
+NEAR_MISSES_CSV = os.path.join(HERE, "near_misses.csv")  # sku, supplier_or_url, concern, question; human-maintained, read only
 MODEL = "claude-haiku-4-5"
 DEFAULT_SHIPPING = "Zync Technologies\nPlano, TX"
 REPLY_STATUSES = ("pricing_provided", "needs_info", "dead_end", "auto_reply_or_spam")
@@ -150,6 +151,65 @@ def load_candidates(path: str) -> list:
     return load_results(path)[0]
 
 
+def load_near_misses(path: str = None):
+    """Rows of near_misses.csv (sku, supplier_or_url, concern, question), or None when the file is missing. Never written."""
+    try:
+        with open(path or NEAR_MISSES_CSV, newline="", encoding="utf-8") as f:
+            return [r for r in csv.DictReader(f) if (r.get("sku") or "").strip() and (r.get("supplier_or_url") or "").strip()]
+    except FileNotFoundError:
+        return None
+
+
+def near_miss_drafts(results_path: str, recommended: list, exclusions: list, near_rows: list) -> tuple:
+    """(drafts, notes): one draft per near_misses.csv row whose candidate is in the results file's candidate columns.
+    Opt-in only (drafts --near-miss). The search agent did NOT recommend these, so each draft carries the one concern a
+    human must check (printed in the header, never in the text meant for the seller) and one polite question for the
+    seller. Reviewer exclusions still apply, and a seller already recommended for that SKU is not drafted twice."""
+    wb = openpyxl.load_workbook(results_path, read_only=True, data_only=True)
+    rows = list(wb["Results"].iter_rows(values_only=True))
+    wb.close()
+    header = list(rows[0])
+    by_sku = {}
+    for values in rows[1:]:
+        r = dict(zip(header, values))
+        by_sku.setdefault(str(r["SKU"]).strip().upper(), r)
+    have = {d["key"] for d in recommended}
+    out, notes = [], []
+    for near in near_rows:
+        sku, wanted = near["sku"].strip(), near["supplier_or_url"].strip()
+        r = by_sku.get(sku.upper())
+        block = next((n for n in range(1, 10) if r and f"Manufacturer {n} URL" in r and (
+            (r[f"Manufacturer {n} URL"] or "").strip() == wanted
+            or wanted.lower() in (r.get(f"Manufacturer {n} Name") or "").lower())), None)
+        if block is None:
+            notes.append(f"near-miss {sku}: not found in the results file ({'no such SKU' if r is None else 'seller or URL not among its candidates'}) - skipped")
+            continue
+        url, maker = (r[f"Manufacturer {block} URL"] or "").strip(), (r.get(f"Manufacturer {block} Name") or "").strip()
+        why = excluded_reason(sku, maker, url, exclusions)
+        if why:
+            notes.append(f"near-miss {sku} ({maker or url}): excluded by reviewer ({why}) - skipped")
+            continue
+        key = listing_key(sku, url, maker)
+        if key in have:
+            notes.append(f"near-miss {sku} ({maker or url}): already a recommended draft - not drafted twice")
+            continue
+        have.add(key)
+        out.append(make_draft({
+            "sku": sku, "product": r.get("Product") or "", "description": r.get("Keyword") or "", "manufacturer": maker,
+            "email": (r.get(f"Manufacturer {block} Email") or "").strip(), "url": url, "unit_price": None,
+            "moq": r.get(f"Manufacturer {block} MOQ") or "", "title": r.get(f"Manufacturer {block} Listing Title") or "",
+            "note": "", "key": key, "check": near["concern"].strip(), "questions": [near["question"].strip()]}))
+    return out, notes
+
+
+def format_draft(d: dict) -> str:
+    """One draft as printed by `drafts`. The NEEDS HUMAN CHECK and NO EMAIL lines are for us, above the text for the seller."""
+    to = d["email"] or "NO EMAIL - inquiry form"
+    check = f"NEEDS HUMAN CHECK: {d['check']}\n" if d.get("check") else ""
+    label = f"{d['label']}\n" if d["label"] else ""
+    return f"{'=' * 70}\n{d['sku']} | {d['manufacturer'] or '(unnamed)'} | To: {to}\n{check}{label}Subject: {d['subject']}\n\n{d['body']}"
+
+
 def skip_summary(skipped: list) -> str:
     kinds = {"none": "no recommended seller", "error": "search agent error", "reviewer": "excluded by reviewer_exclusions.csv"}
     parts = [f"{sum(s['kind'] == k for s in skipped)} {label}" for k, label in kinds.items() if any(s["kind"] == k for s in skipped)]
@@ -224,7 +284,8 @@ def render_email(c: dict, template_path: str = TEMPLATE_PATH) -> tuple:
         "sku": c["sku"], "product": c["description"] or c["product"],
         "greeting": "Hello," if not name or PLACEHOLDER_NAME.search(name) else f"Hello {name} team,",
         "listing_ref": listing_ref,
-        "note_line": "".join(f"\n{i}. {q}" for i, q in enumerate(confirmation_questions(c["note"]), start=4)),
+        "note_line": "".join(f"\n{i}. {q}" for i, q in enumerate(
+            confirmation_questions(c["note"]) + list(c.get("questions") or []), start=4)),
         "sender_name": cfg("SENDER_NAME", "Swastik Raj"),
         "shipping_address": shipping_address()[0],
     }
@@ -640,6 +701,10 @@ def main():
     for name in ("drafts", "send", "report"):
         s = sub.add_parser(name)
         s.add_argument("results", help="sourcing_results_*.xlsx")
+        if name == "drafts":
+            s.add_argument("--near-miss", action="store_true",
+                           help="also show drafts for the near-miss candidates listed in near_misses.csv (not recommended by the "
+                                "search agent; each is labelled NEEDS HUMAN CHECK). Read only; send and report never include them.")
         if name == "send":
             s.add_argument("--yes", action="store_true", help="one confirmation for the whole batch")
             s.add_argument("--test-recipient", default="", metavar="ADDRESS",
@@ -662,10 +727,21 @@ def main():
 
     if args.cmd == "drafts":  # read-only: never loads or writes email_state.json
         for d in drafts:
-            to = d["email"] or "NO EMAIL - inquiry form"
-            label = f"{d['label']}\n" if d["label"] else ""
-            print(f"{'=' * 70}\n{d['sku']} | {d['manufacturer'] or '(unnamed)'} | To: {to}\n{label}Subject: {d['subject']}\n\n{d['body']}")
+            print(format_draft(d))
         print(f"{len(drafts)} draft(s); {sum(bool(d['email']) for d in drafts)} with an email address. Nothing sent.")
+        if args.near_miss:
+            near_rows = load_near_misses()
+            if near_rows is None:
+                print_warnings([f"{os.path.basename(NEAR_MISSES_CSV)} is missing - no near-miss drafts were added."])
+            else:
+                extra, notes = near_miss_drafts(results, drafts, exclusions, near_rows)
+                print(f"\n{'#' * 70}\nNEAR-MISS DRAFTS: the search agent did NOT recommend these. Each needs a human check "
+                      f"before anything is sent or submitted.\n{'#' * 70}")
+                for d in extra:
+                    print(format_draft(d))
+                for note in notes:
+                    print(f"NOTE: {note}")
+                print(f"{len(extra)} near-miss draft(s), {sum(bool(d['email']) for d in extra)} with an email address. Nothing sent.")
     elif args.cmd == "send":
         missing = [k for k in ("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD") if not cfg(k)]
         if missing:

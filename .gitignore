@@ -11,3 +11,10 @@ agent_flow.png
 
 Reports
 Excel Output Sheets
+scratch
+Order Sheets/
+decision_state.json
+approvals_log.jsonl
+approved_orders.json
+approved_orders.csv
+email_state.json

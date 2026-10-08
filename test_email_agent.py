@@ -17,6 +17,7 @@ import tempfile
 import openpyxl
 from dotenv import dotenv_values
 
+os.environ["OBS_ENABLED"] = "0"   # tests are offline: never trace, even if .env switches tracing on
 import email_agent as ea
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -646,7 +647,7 @@ def test_smtp_is_reachable_only_through_the_gate():
     # At the real prompt: a copy of the agent runs in a temp dir pointed at a closed local port, so even a bug
     # could only fail to connect - it could not reach anyone.
     with tempfile.TemporaryDirectory() as tmp:
-        for f in ("email_agent.py", "email_template.txt"):
+        for f in ("email_agent.py", "observability.py", "email_template.txt"):
             shutil.copy(os.path.join(HERE, f), tmp)
         make_xlsx(os.path.join(tmp, "r.xlsx"), [row("A1", email="a@x.com"), row("B2", email="b@x.com")])
         env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "SHIPPING_ADDRESS")}

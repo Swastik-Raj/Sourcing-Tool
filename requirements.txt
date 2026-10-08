@@ -1,0 +1,23 @@
+# Tested on Python 3.13.5 (Windows 11). Install: pip install -r requirements.txt
+# Direct imports found by reading every .py file; transitive packages are left to pip.
+
+# --- the agents ---
+anthropic==0.121.0        # sourcing, email, content
+mcp==2.0.0                # sourcing: Nimble MCP client
+httpx2==2.9.1             # sourcing: HTTP client for the Nimble connection
+pydantic==2.12.5          # sourcing: structured results
+openpyxl==3.1.5           # every agent: reads and writes the .xlsx files
+python-dotenv==1.2.2      # sourcing, email, content: loads .env
+
+# --- tests only ---
+httpx==0.28.1             # test_pricing.py, test_observability.py (mock HTTP transports)
+
+# --- tracing (observability.py): only needed when OBS_ENABLED=1; nothing here is imported otherwise ---
+langfuse==4.17.0
+opentelemetry-api==1.45.1
+opentelemetry-sdk==1.45.1
+opentelemetry-exporter-otlp-proto-http==1.45.1
+opentelemetry-instrumentation==0.66b1
+opentelemetry-instrumentation-anthropic==0.62.4
+opentelemetry-semantic-conventions==0.66b1
+opentelemetry-semantic-conventions-ai==0.5.1

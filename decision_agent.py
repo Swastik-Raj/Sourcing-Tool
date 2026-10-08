@@ -28,6 +28,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 import openpyxl
 
 from email_agent import excluded_reason, listing_key, load_exclusions   # same key and exclusion rules as the email agent
+from email_agent import obs   # the shared tracing module (re-exported: test_no_network_llm_or_order_code pins this file's imports)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_PATH = os.path.join(HERE, "decision_state.json")
@@ -52,6 +53,14 @@ REQUIRED_HEADERS = ["SKU", "Product", "Recommendation", "Recommended Manufacture
 
 class AgentError(Exception):
     """A problem to show the user as a plain message, not a traceback."""
+
+
+# Reply-rejection reasons as short codes for tracing (the error text itself quotes the reply, so it is never exported).
+REPLY_REASON_CODES = (("approve_needs_qty_and_max", r"approve line needs"), ("unparseable", r"can't be parsed"),
+                      ("bad_qty", r"qty '"), ("bad_max_price", r"max unit price '"), ("bad_cap", r"cap '"),
+                      ("duplicate_sku", r"appears twice"), ("cap_missing", r"cap is required"),
+                      ("cap_repeated", r"cap appears more than once"), ("sku_not_in_request", r"is not in the request"),
+                      ("over_cap", r"exceeds the cap"))
 
 
 class ReplyError(AgentError):
@@ -629,6 +638,11 @@ def cmd_request(results_path: str, budget=None) -> dict:
         raise AgentError("--budget must be a positive amount.")
     req = build_request(results_path, budget, state)
     req["id"] = f"A-{state['next_request']:04d}"
+    obs.tag(f"request:{req['id']}", *(f"sku:{l['sku']}" for l in req["lines"]))
+    obs.annotate(request_id=req["id"], lines=len(req["lines"]), subtotal=Decimal(req["subtotal"]), budget=req["budget"],
+                 skipped=len(req["skipped"]), lines_left_out=len(req["left_out"]), left_out_moq_total=Decimal(req["left_out_moq_total"]),
+                 waiting=len(req["waiting"]), margin_failed=len(req["margin_failed"]), without_total=len(req["lines_without_total"]),
+                 orphans=len(req["orphans"]))
     req["created_at"] = iso(now())
     req["reply"] = None
     state["next_request"] += 1
@@ -801,13 +815,18 @@ def cmd_record(results_path: str, reply_text: str, request_id=None) -> tuple:
     if req["reply"]:
         raise AgentError(f"Request {req['id']} already has a recorded reply. Run 'request' again for a fresh request "
                          "before recording another reply.")
+    obs.annotate(request_id=req["id"], request_lines=len(req["lines"]))
+    obs.tag(f"request:{req['id']}", *(f"sku:{l['sku']}" for l in req["lines"]))
     plan = check_reply(parse_reply(reply_text), req["lines"])
+    obs.annotate(approvals=len(plan["approvals"]), rejections=len(plan["rejections"]), undecided=len(plan["undecided"]),
+                 cap=plan["cap"], committed=plan["committed"])
     print(render_echo(req, plan, defaulted))
     if ask_user(f"Is this the request Neeraj answered? Type its id ({req['id']}) to confirm: ").strip().upper() != req["id"]:
         print("Request not confirmed. Nothing recorded.")
         return plan, False
     channel = ask_user("Channel the reply came through (e.g. Slack DM, email): ").strip()
     approver = ask_user("Who approved (name as given by the sender): ").strip()
+    obs.protect(channel, approver)   # typed names: masked wherever they could appear in a trace
     if not channel or not approver:
         print("Channel and approver are both required. Nothing recorded.")
         return plan, False
@@ -830,6 +849,7 @@ def cmd_record(results_path: str, reply_text: str, request_id=None) -> tuple:
                 d.update(qty=item["qty"], max_unit_price=str(item["max"]), line_cap=str(item["line_cap"]),
                          expires_at=iso(expires))
             decisions.append(d)
+    obs.annotate(recorded=True, decisions=len(decisions))
     req["reply"] = {"text": reply_text, "channel": channel, "approver": approver, "recorded_at": iso(at),
                     "cap": str(plan["cap"]), "sender_verified": False, "decision_ids": [d["id"] for d in decisions]}
     state["decisions"] += decisions
@@ -897,6 +917,7 @@ def cmd_revoke(sku: str, results_path: str) -> list:
     for d in active:
         d["revoked_at"] = at
     save_state(state)
+    obs.annotate(revoked=len(active))
     current = {l["sku"].upper(): l["seller"] for l in lines}
     for d in active:
         log_event("revoke", approval_id=d["id"], sku=d["sku"], seller=d["seller"], key=d["key"],
@@ -958,6 +979,7 @@ def cmd_export(results_path: str, out_json: str = None, out_csv: str = None) -> 
         w.writerow(EXPORT_FIELDS)
         for o in orders:
             w.writerow([export_cell(o, k) for k in EXPORT_FIELDS])
+    obs.annotate(valid_approvals=len(orders), dropped=dropped, orphans=len(orphans))
     log_event("export", approval_ids=[o["approval_id"] for o in orders], files=[out_json, out_csv],
               source_results_file=os.path.basename(results_path), dropped=dropped, orphaned=len(orphans))
     return {"orders": orders, "dropped": dropped, "orphans": orphans, "json": out_json, "csv": out_csv}
@@ -986,7 +1008,13 @@ def main(argv=None):
     s.add_argument("--results", required=True)
     args = p.parse_args(argv)
     try:
-        run(args)
+        with obs.trace_command("decision_agent", args.cmd, workflow=obs.workflow_id(args.results), sku=getattr(args, "sku", None)):
+            try:
+                run(args)
+            except ReplyError as e:
+                obs.annotate(reply_rejected=True, reason_codes=sorted({next((c for c, pat in REPLY_REASON_CODES if re.search(pat, err)),
+                                                                           "other") for err in e.errors}))
+                raise
     except AgentError as e:
         sys.exit(str(e))
 

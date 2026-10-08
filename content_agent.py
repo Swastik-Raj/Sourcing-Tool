@@ -9,6 +9,7 @@ The language model may only restate facts from product_facts.csv; code checks ev
 Env (.env): ANTHROPIC_API_KEY, BRAND_NAME (required by `generate` only).
 """
 import argparse
+import collections
 import csv
 import io
 import json
@@ -25,6 +26,7 @@ from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+import observability as obs
 from email_agent import excluded_reason, load_exclusions
 from order_sheet import (OrderSheetError, approval_expiry, candidates_of, find_candidate, read_approved,
                          read_results)
@@ -451,12 +453,30 @@ def is_billing_error(exc) -> bool:
     return code in (401, 402, 403) or (code == 400 and bool(BILLING_WORDS.search(str(getattr(exc, "message", "") or exc))))
 
 
+VALIDATOR_RULES = ("limits", "evidence", "spec_token", "forbidden", "brand", "price", "upc", "json")   # first field of a failure
+
+
+def observe_item(sp, item: dict, log: list) -> None:
+    """Telemetry only: status, pass/fail per validator rule, model calls used. Rule names and counts, never listing text."""
+    if not obs.enabled():
+        return
+    failed = collections.Counter(f[0] for f in item["failures"])
+    mine = [e for e in log if e["sku"] == item["sku"]]
+    sp.set(status=item["status"], model_calls=len(mine), cost_usd=sum((e["cost"] for e in mine), Decimal(0)),
+           validators={r: "fail" if failed[r] else "pass" for r in VALIDATOR_RULES}, failures_by_rule=dict(failed),
+           blocked=item["status"] == "BLOCKED")
+    obs.tag(*(f"rule_fail:{r}" for r in failed))
+    obs.score("validator_failures", len(item["failures"]))
+    sp.end()
+
+
 def live_model():
     """call(system, messages, max_tokens) -> (text, input_tokens, output_tokens). The key is read from the environment only."""
     key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not key:
         raise ContentError("ANTHROPIC_API_KEY is not set in .env. Nothing was sent. (Use --dry-run to see the prompts.)")
     from anthropic import Anthropic
+    obs.instrument_anthropic()                      # record each call (tokens, latency) when tracing is on
     client = Anthropic(api_key=key)
 
     def call(system, messages, max_tokens):
@@ -491,6 +511,7 @@ def run_sku(sku, brand, usable, ctx_base, call, log):
     text = ask(messages)
     data = parse_model_json(text)
     if data is None:
+        obs.annotate(json_retry_used=True)
         text = ask(messages + [{"role": "assistant", "content": text}, {"role": "user", "content":
                     "That was not the required JSON. Reply with only the JSON object in the reply_format, no code fence, no commentary."}])
         data = parse_model_json(text)
@@ -499,6 +520,7 @@ def run_sku(sku, brand, usable, ctx_base, call, log):
     ctx = {**ctx_base, "claims": data["claims"]}
     failures = validate_all(data, ctx)
     if failures:                                                      # one repair attempt, validated again
+        obs.annotate(repair_used=True)
         listed = "\n".join(f"- [{r}] {fld}: {why} | {txt[:120]}" for r, fld, txt, why in failures[:25])
         text = ask(messages + [{"role": "assistant", "content": text}, {"role": "user", "content":
                     "Code checks found these problems. Fix them using ONLY the usable facts and reply with corrected JSON only:\n" + listed}])
@@ -794,6 +816,8 @@ def generate(approved_path, results_path, facts_path=None, skus=None, allow_list
     log, items, run_notes = [], [], list(notes)
     stopped = None
     for sku, mine, usable in plans:
+        sp = obs.open_span(f"sku {sku}", sku=sku, repair_used=False, json_retry_used=False)
+        obs.tag(f"sku:{sku}")
         facts_by_id = {r["fact_id"]: r for r in mine}
         usable_by_id = {r["fact_id"]: r for r in usable}
         price_row = next((r for r in mine if r["field"] == "selling_price"), None)
@@ -815,6 +839,7 @@ def generate(approved_path, results_path, facts_path=None, skus=None, allow_list
                 stopped = f"billing/auth error from the API, batch stopped ({e})"
                 run_notes.append(f"{sku}: {stopped}")
                 item.update(status="NOT RUN", failures=[("run", "model", "", f"not run: {stopped}")])
+                observe_item(sp, item, log)
                 items.append(item)
                 continue
             failures = failures + extra
@@ -825,6 +850,7 @@ def generate(approved_path, results_path, facts_path=None, skus=None, allow_list
                 lo, hi = LIMITS["title_recommended"]
                 if not lo <= tl <= hi:
                     run_notes.append(f"{sku}: title is {tl} characters; Walmart recommends {lo}-{hi} (unverified advice, not a block)")
+        observe_item(sp, item, log)
         items.append(item)
     total = sum((e["cost"] for e in log), Decimal(0))
     for e in log:
@@ -914,6 +940,12 @@ def main(argv=None):
             s.add_argument("--out", default=DEFAULT_OUT)
     sub.add_parser("check").add_argument("file")
     args = p.parse_args(argv)
+    workflow = obs.workflow_id(args.results) if hasattr(args, "results") else "lcom-unlinked-" + os.path.splitext(os.path.basename(args.file))[0]
+    with obs.trace_command("content_agent", args.cmd, workflow=workflow):   # `check` is given no results file: it cannot link
+        run(args)
+
+
+def run(args):
     try:
         if args.cmd == "facts-template":
             path, n, notes = facts_template(args.approved, args.results, args.facts)
@@ -938,6 +970,8 @@ def main(argv=None):
                 for r, fld, txt, why in failures:
                     print(f"    [{r}] {fld}: {why}")
                 bad += bool(failures)
+            obs.annotate(skus=len(out["results"]), skus_with_problems=bad,
+                         failures_by_rule=collections.Counter(f[0] for fl in out["results"].values() for f in fl))
             if bad:
                 sys.exit(1)
     except (ContentError, OrderSheetError) as e:

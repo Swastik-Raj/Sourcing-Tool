@@ -4,6 +4,7 @@ import tempfile
 
 import openpyxl
 
+os.environ["OBS_ENABLED"] = "0"   # tests are offline: never trace, even if .env switches tracing on
 from sourcing_agent import (
     AttributeBreakdown, Candidate, SourcingResult, candidate_comment, candidate_score, dedupe_manufacturers,
     implausible_units, is_garbled, pack_size_supported, pick_skus, percentile, recommend, score_summary,

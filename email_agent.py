@@ -16,6 +16,7 @@ ANTHROPIC_API_KEY, and SHIPPING_ADDRESS - one line in double quotes with \\n bet
 or a real multi-line value inside the quotes. Real sends are refused while it is unset or still the default.
 """
 import argparse
+import collections
 import csv
 import json
 import os
@@ -31,6 +32,8 @@ from urllib.parse import urlsplit
 import openpyxl
 from dotenv import load_dotenv
 from openpyxl.styles import Font
+
+import observability as obs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(HERE, "email_template.txt")
@@ -321,7 +324,10 @@ def now() -> str:
 
 
 def entry_for(state: dict, d: dict) -> dict:
-    return state.setdefault(d["key"], {"sku": d["sku"], "seller": d["manufacturer"] or d["url"]})
+    entry = state.setdefault(d["key"], {"sku": d["sku"], "seller": d["manufacturer"] or d["url"]})
+    if obs.current_workflow():                     # extra key, only while tracing is on; no existing key changes
+        entry["workflow_id"] = obs.current_workflow()
+    return entry
 
 
 # ---------- sending (always behind a confirmation) ----------
@@ -444,6 +450,7 @@ QUOTE_PROMPT = (
 
 def summarize_reply(reply: str) -> dict:
     from anthropic import Anthropic
+    obs.instrument_anthropic()                      # record this call (tokens, latency) when tracing is on
     msg = Anthropic(api_key=cfg("ANTHROPIC_API_KEY")).messages.create(
         model=MODEL, max_tokens=1500, messages=[{"role": "user", "content": f"{QUOTE_PROMPT}Reply:\n{reply}"}])
     return parse_summary(msg.content[0].text)
@@ -611,10 +618,15 @@ def record_reply(state: dict, draft: dict, text: str, summarize=None) -> dict:
         replies.append({"at": now(), "text": text})
     combined = replies[0]["text"] if len(replies) == 1 else "\n\n".join(
         f"--- reply {i} ({r['at']}) ---\n{r['text']}" for i, r in enumerate(replies, start=1))
-    raw = (summarize or summarize_reply)(combined)
+    with obs.span("summarize_reply", replies=len(replies), reply_chars=len(combined)):
+        raw = (summarize or summarize_reply)(combined)
     if raw.get("status") not in REPLY_STATUSES:
         raise ValueError(f"bad status: {raw.get('status')!r}")
     result = {"status": raw["status"], "summary": str(raw.get("summary", "")), **verify_quote(raw, combined)}
+    if obs.enabled():                              # what the code-side check did to the model's numbers
+        obs.score("verification_nulls", sum(raw.get(k) is not None and result[k] is None for k in QUOTE_EVIDENCE_FIELDS))
+        obs.score("quote_warnings", len(result["quote_warnings"]))
+        obs.score("currency_detected", result.get("currency") or "none")
     entry = entry_for(state, draft)
     entry.update(replies=replies, reply=combined, **result)
     return result
@@ -716,7 +728,11 @@ def main():
         if name == "reply":
             s.add_argument("--file", help="UTF-8 text file with the reply (default: read stdin)")
     args = p.parse_args()
+    with obs.trace_command("email_agent", args.cmd, workflow=obs.workflow_id(args.results), sku=getattr(args, "sku", None)):
+        run(args)
 
+
+def run(args):
     exclusions = load_exclusions()
     results = args.results
     drafts, skipped = load_results(results, exclusions)
@@ -724,6 +740,8 @@ def main():
     if args.cmd in ("drafts", "send", "report"):
         print_warnings(warnings_for(bool(exclusions)))
         print(skip_summary(skipped))
+        obs.annotate(drafts=len(drafts), drafts_with_email=sum(bool(d["email"]) for d in drafts), skipped=len(skipped),
+                     skipped_by_kind=collections.Counter(s["kind"] for s in skipped))
 
     if args.cmd == "drafts":  # read-only: never loads or writes email_state.json
         for d in drafts:
@@ -745,6 +763,7 @@ def main():
     elif args.cmd == "send":
         missing = [k for k in ("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD") if not cfg(k)]
         if missing:
+            obs.annotate(blocked_sends=len(drafts))
             sys.exit(f"Set {', '.join(missing)} in .env first (nothing sent).")
         if args.test_recipient:
             real = {d["email"].lower() for d in drafts if d["email"]}
@@ -753,16 +772,20 @@ def main():
         try:
             sent = confirm_and_send(drafts, load_state(), args.yes, test_recipient=args.test_recipient)
             print(f"Sent {sent} email(s).")
+            obs.annotate(sent=sent, test_mode=bool(args.test_recipient))
         except SendRefused as e:
+            obs.annotate(blocked_sends=len(drafts))
             sys.exit(f"Refusing to send: {e}")
     elif args.cmd == "mark":
         d = find_draft(drafts, skipped, args.sku, results)
+        obs.annotate(sku=d["sku"], listing_host=obs.url_host(d["url"]))
         state = load_state()
         entry_for(state, d)["sent"] = now()
         save_state(state)
         print(f"{d['sku']} ({d['manufacturer'] or d['url']}): marked as submitted via the inquiry form.")
     elif args.cmd == "reply":
         d = find_draft(drafts, skipped, args.sku, results)
+        obs.annotate(sku=d["sku"], listing_host=obs.url_host(d["url"]))
         text = open(args.file, encoding="utf-8").read() if args.file else sys.stdin.read()
         state = load_state()
         result = record_reply(state, d, text)

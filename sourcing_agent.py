@@ -46,6 +46,8 @@ from pydantic.json_schema import SkipJsonSchema
 from anthropic import APIStatusError, AsyncAnthropic
 from anthropic.lib.tools import beta_async_tool
 
+import observability as obs
+
 MODEL = "claude-haiku-4-5"
 # Haiku 4.5 list pricing, used only to print an estimate - not billed exactly.
 HAIKU_INPUT_PER_MTOK = 1.00
@@ -441,6 +443,8 @@ def make_bounded_tool(tool, session: ClientSession, budget: ToolBudget, sku: str
         log(f"    -> {tool_name}({kwargs})")
         row = {"sku": sku, "tool": tool_name, "site": site_of(kwargs.get("url")), "url": kwargs.get("url"),
                "start": time.monotonic(), "outcome": "ok"}
+        sp = obs.start_span(f"nimble.{tool_name}", sku=sku, tool=tool_name, site=row["site"], url_host=obs.url_host(row["url"]),
+                            **(EXTRACT_GEO if "extract" in tool_name else {}))
         try:
             for attempt in range(NIMBLE_RATE_LIMIT_RETRIES + 1):
                 try:
@@ -455,10 +459,13 @@ def make_bounded_tool(tool, session: ClientSession, budget: ToolBudget, sku: str
                 if not (error_text and is_rate_limited(error_text)) or attempt == NIMBLE_RATE_LIMIT_RETRIES:
                     break
                 NIMBLE_RATE_LIMITS["count"] += 1
+                sp.set(rate_limit_backoffs=attempt + 1)
                 log(f"    Nimble rate-limited - retrying in {2 ** (attempt + 1)}s")
                 await asyncio.sleep(2 ** (attempt + 1))
+            sp.set(response_chars=sum(len(getattr(b, "text", "") or "") for b in result.content), tool_error=bool(error_text))
         except MCPError as exc:  # timeout or tool-side error: tell Claude, don't hang the batch
             row["outcome"] = "timeout" if "timed out" in str(exc).lower() else "error"
+            sp.set(error=str(exc)[:200])
             log(f"    <- FAILED after {time.monotonic() - row['start']:.1f}s: {exc}")
             return f"This {tool_name} call failed ({exc}). Try a different page or query, or give your answer."
         except Exception as exc:
@@ -470,6 +477,7 @@ def make_bounded_tool(tool, session: ClientSession, budget: ToolBudget, sku: str
         finally:
             row["secs"] = time.monotonic() - row["start"]
             CALL_LOG.append(row)
+            sp.end(outcome=row["outcome"], secs=round(row["secs"], 2))
         text = " ".join(
             block.text for block in result.content if getattr(block, "type", None) == "text"
         )
@@ -551,7 +559,10 @@ async def research_once(client: AsyncAnthropic, session: ClientSession, tools, p
 
     total_in, total_out = 0, 0
     last_message = None
+    turn_started = time.monotonic()
     async for message in runner:
+        observe_turn(message, product, turn_started, prompt if last_message is None else None)
+        turn_started = time.monotonic()
         last_message = message
         i, o = usage_tokens(message)
         total_in += i
@@ -849,6 +860,7 @@ async def research_product(client: AsyncAnthropic, session: ClientSession, tools
         total_in, total_out, calls = total_in + tin, total_out + tout, calls + used
         if not is_garbled(parsed):
             return parsed, total_in, total_out, calls
+        obs.annotate(garbled_responses=attempt)
         log(f"  Response text came back garbled (attempt {attempt}) - "
               + ("retrying." if attempt == 1 else "dropping it."))
     return None, total_in, total_out, calls
@@ -1081,6 +1093,55 @@ def run_counts(rows: list) -> tuple:
     errored = sum(bool(p.get("error")) for p, _ in rows)
     recommended = sum(not p.get("error") and product_recommendation(p, r)[0] is not None for p, r in rows)
     return recommended, len(rows) - errored - recommended, errored
+
+
+def observe_turn(message, product: dict, turn_started: float, prompt: Optional[str]) -> None:
+    """Telemetry only. The instrumentation does not see the beta tool runner's model calls, so each turn is recorded here.
+    Latency is time since the previous turn, so after the first turn it includes the Nimble calls the model asked for."""
+    if not obs.enabled():
+        return
+    try:
+        tin, tout = usage_tokens(message)
+        obs.record_generation("claude.turn", MODEL, tin, tout, latency_s=round(time.monotonic() - turn_started, 2),
+                              stop_reason=getattr(message, "stop_reason", None), sku=product["sku"], includes_tool_time=prompt is None,
+                              agent_cost_usd=round(tin / 1e6 * HAIKU_INPUT_PER_MTOK + tout / 1e6 * HAIKU_OUTPUT_PER_MTOK, 6),
+                              prompt=prompt, response=" ".join(b.text for b in message.content if b.type == "text"))
+    except Exception as e:  # noqa: BLE001 - never let telemetry touch the run
+        print(f"[obs] turn telemetry skipped: {obs.mask_exc(e)}", file=sys.stderr)
+
+
+def observe_product(sp, product: dict, done_entry) -> None:
+    """Telemetry only (changes nothing): the product's outcome, candidates found, which exclusion rules fired and which
+    of the two 80% bars (accuracy, margin vs L-Com) candidates missed. Counts and rule names, no text."""
+    if not obs.enabled():
+        return
+    try:
+        result = done_entry[1][1]
+        outcome = "error" if product.get("error") else ("recommended" if product_recommendation(product, result)[0] is not None
+                                                        else "no_match")
+        cands = result.candidates if result else []
+        rules = collections.Counter()
+        for c in cands:
+            form, notes = c.listing_form or "", " ".join(c.code_notes)
+            if not c.same_product_form:
+                rules["reviewer_exclusion" if form.startswith("excluded by reviewer") else "contact_type" if form.startswith("wrong contact")
+                      else "cable_form" if form.startswith("cable") else "model_said_other_form"] += 1
+            rules["antenna_band_port"] += "Category/spec set to 0" in notes
+            rules["price_range_high_end"] += "listed range" in notes
+            rules["promo_price"] += "promo" in notes
+        failed = collections.Counter()
+        for i, c in enumerate(cands):
+            acc = candidate_score(c)[0]
+            vs = price_vs_lcom(checked_unit(result, i), product.get("lcom_price"))
+            failed["accuracy_below_80"] += acc is None or acc < MIN_RECOMMEND_ACCURACY
+            failed["margin_below_80"] += vs is None or vs[1] < MIN_MARGIN_PCT
+            failed["no_url"] += not (c.url or "").strip()
+        sp.set(outcome=outcome, candidates=len(cands), rule_exclusions={k: v for k, v in rules.items() if v},
+               failed_80_rules={k: v for k, v in failed.items() if v})
+        obs.tag(f"outcome:{outcome}")
+        obs.score("sku_outcome", outcome)
+    except Exception as e:  # noqa: BLE001 - never let telemetry touch the run
+        print(f"[obs] product telemetry skipped: {obs.mask_exc(e)}", file=sys.stderr)
 
 
 def ps_quote(text: str) -> str:
@@ -1813,6 +1874,12 @@ async def run_batch(products: list, research, report_path: str, excel_path: str,
     stop = {"reason": ""}
 
     async def run_one(idx: int, product: dict):
+        with obs.span(f"product {product['sku']}", sku=product["sku"], keyword=product.get("description")) as sp:
+            obs.tag(f"sku:{product['sku']}")
+            await run_one_inner(idx, product, sp)
+            observe_product(sp, product, done[idx])
+
+    async def run_one_inner(idx: int, product: dict, sp):
         CURRENT_SKU.set(product["sku"])
         async with slots:
             log(f"Product {idx + 1} of {len(products)} ...")
@@ -1837,12 +1904,17 @@ async def run_batch(products: list, research, report_path: str, excel_path: str,
                 log(f"  Time:       {secs:.0f}s  (Nimble {nimble:.0f}s, Anthropic+other {secs - nimble:.0f}s, "
                     f"{calls_used} tool calls)")
                 log(f"  Stopped:    {stopped}")
+                sp.set(tokens_in=tin, tokens_out=tout, agent_cost_usd=round(cost, 6), tool_calls=calls_used, stop=stopped,
+                       wall_s=round(secs, 1), nimble_s=round(nimble, 1))
+                obs.score("cost_usd", round(cost, 6))
                 done[idx] = (format_result_markdown(product, result, calls_used, tin, tout, cost), (product, result))
             except Exception as exc:  # noqa: BLE001 - POC: keep going on any per-product failure
                 reason = str(exc) if isinstance(exc, BatchStopped) else error_text(exc)
                 product["error"] = reason
+                sp.set(error=reason)
                 if is_fatal_api_error(exc) and not stop["reason"]:
                     stop["reason"] = reason
+                    sp.set(billing_stop=True)
                     log("!" * 72)
                     log(f"!!! BILLING / CREDIT / AUTH ERROR - stopping the batch: {reason}")
                     log("!!! Products already finished are saved; the rest will not be run.")
@@ -1866,6 +1938,11 @@ async def run_batch(products: list, research, report_path: str, excel_path: str,
 
 
 async def main_async():
+    with obs.trace_command("sourcing_agent", "search"):
+        await run_search()
+
+
+async def run_search():
     args = parse_args()
     load_dotenv()  # .env next to where you run it; real env vars still win
     print_input_file_warnings(check_input_files())
@@ -1898,6 +1975,7 @@ async def main_async():
         sys.exit(1)
 
     apply_lcom_prices(products)
+    obs.tag(*(f"sku:{p['sku']}" for p in products))
     client = AsyncAnthropic(api_key=anthropic_key, max_retries=ANTHROPIC_MAX_RETRIES)
 
     print("Competitive Sourcing Research POC")
@@ -1942,6 +2020,7 @@ async def main_async():
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 report_path = f"sourcing_report_{timestamp}.md"
                 excel_path = args.output or f"sourcing_results_{timestamp}.xlsx"
+                obs.set_workflow(obs.workflow_id(excel_path))  # the id every later command uses for this results file
                 print(f"Saving results after every product to {report_path} / {excel_path}")
                 print(f"Running up to {MAX_CONCURRENT_PRODUCTS} products at once")
 
@@ -1960,6 +2039,12 @@ async def main_async():
                 )
 
                 rows = [d[1] for d in done if d]
+                rec, norec, err = run_counts(rows)
+                obs.annotate(products=len(products), wall_s=round(time.monotonic() - run_started, 1), nimble_calls=len(CALL_LOG),
+                             nimble_timeouts=sum(c["outcome"] == "timeout" for c in CALL_LOG), tokens_in=totals["in"],
+                             tokens_out=totals["out"], agent_cost_usd=round(totals["cost"], 6), recommended=rec, no_match=norec,
+                             errored=err, anthropic_retries=dict(ANTHROPIC_RETRIES), nimble_rate_limit_retries=NIMBLE_RATE_LIMITS["count"],
+                             batch_stopped=stopped_why or None, results_file=os.path.basename(excel_path))
                 print("\n".join(line.replace("**", "") for line in summary_lines(rows, len(products), args.input, stopped_why)
                                 if not line.startswith("Re-run")))
                 if rerun_command(rows, args.input):

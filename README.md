@@ -1,47 +1,95 @@
-# Competitive Sourcing Research Agent
+# Sourcing and Listing Pipeline (POC)
 
-A POC tool that automates competitive sourcing research: for each product (SKU +
-description), it searches Chinese sourcing/manufacturing sites (AliExpress, Alibaba,
-Made-in-China) for equivalent products, scores each candidate against a 5-attribute rubric,
-and returns up to 5 ranked candidates per product with pricing, MOQ, and supplier info.
+Tested on **Python 3.13.5, Windows 11, PowerShell**.
 
-It uses Claude (Haiku, for cost) with a hard tool-call budget per product, connected to the
-[Nimble](https://nimbleway.com) MCP server for web search/extraction.
+This tool finds cheaper equivalents of L-Com products on Chinese sourcing sites, drafts the sample-order emails, turns a
+manager's approval into an order sheet, and drafts Walmart listing text. Every step reads and writes local files, and a
+person decides at each gate. Nothing sends email, places an order or publishes a listing on its own.
 
-## How it works
+Pipeline order (run from the project folder, in PowerShell):
 
-For each product, Claude is given:
-- The product's SKU and description
-- A hard budget of tool calls (search + extract combined)
-- Two tools: a site-search extractor (hits each site's own on-site search page directly,
-  since generic web search barely indexes individual listings on these platforms) and a
-  page extractor (for pulling detail from an individual listing when needed)
+1. **Search** - `python sourcing_agent.py --sku HDFF FOA-020C` (or `--input <products.xlsx>`) writes `sourcing_results_<timestamp>.xlsx`.
+2. **Emails** - `python email_agent.py drafts <results.xlsx>`, then `send`, `mark`, `reply`, `report` (same results file).
+3. **Approvals** - `python decision_agent.py request <results.xlsx>`, then `record --results <results.xlsx> --request A-000N`, `export --results <results.xlsx>`.
+4. **Order sheet** - `python order_sheet.py build --approved approved_orders.csv --results <results.xlsx>`.
+5. **Listing content** - `python content_agent.py facts-template --approved approved_orders.csv --results <results.xlsx>`, fill `product_facts.csv`, then `generate ... --facts product_facts.csv`, then `check <walmart_listings_*.xlsx>`.
 
-Claude scores each candidate it finds against a 5-attribute rubric (product type,
-category/spec, shielding/material, mount/form factor, gender/pins — 20 points each, 100
-total), awarding 0 for anything not *explicitly* stated in the listing text — no benefit of
-the doubt. It returns up to 5 distinct candidates (different manufacturers, ranked by a
-balance of match quality and price), or reports no match with a reason if nothing plausible
-was found.
+Each script prints its full usage at the top of its `.py` file.
 
-**Why not 1688.com?** Its search results sit behind a Taobao/Alibaba login wall regardless
-of browser driver tier — confirmed unreachable, so it's excluded rather than silently
-wasting tool-call budget on it.
+## Setup (PowerShell)
 
-## Setup
-
-```bash
-pip install "anthropic[mcp]" pydantic openpyxl python-dotenv
+```powershell
+cd "C:\path\to\Search Tool POC"
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env
+notepad .env
+$env:PYTHONIOENCODING = "utf-8"
 ```
 
-Create a `.env` file in the project folder (already gitignored):
+`.env` is ignored by git; never commit it. Set `PYTHONIOENCODING` in each new PowerShell window (it stops Chinese text in
+listings and replies from crashing redirected output). If script activation is blocked, run
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once. Variables set in the shell win over `.env`.
 
-```bash
-ANTHROPIC_API_KEY=sk-ant-...   # your Anthropic API key
-NIMBLE_API_KEY=...             # your Nimble API key (used as the MCP bearer token)
+| Needed for | Variables in `.env` |
+|---|---|
+| Search (`sourcing_agent.py`) | `ANTHROPIC_API_KEY`, `NIMBLE_API_KEY` |
+| Emails (`email_agent.py`) | `drafts`, `report`, `mark`: none. `reply`: `ANTHROPIC_API_KEY`. `send`: `SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD`, `SHIPPING_ADDRESS` (`SMTP_PORT`, `SMTP_FROM`, `SENDER_NAME` optional) |
+| Approvals (`decision_agent.py`) | none |
+| Order sheet (`order_sheet.py`) | none (`ORDER_SHEET_RECALC_PY` optional) |
+| Listing content (`content_agent.py`) | `generate`: `ANTHROPIC_API_KEY`, `BRAND_NAME` |
+| Tracing (optional) | `OBS_ENABLED=1`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL` - see [OBSERVABILITY.md](OBSERVABILITY.md) |
+
+`.env.example` lists every variable with a note on what it is. Tracing is on only if `OBS_ENABLED=1`.
+
+## Human steps (nothing happens without them)
+
+- **Search**: you choose the products and read the results; it only reads public pages and writes files.
+- **Emails**: `drafts` only shows text. `send` shows each email and asks `y` per email, or you type `yes` once for the batch;
+  it refuses while `SHIPPING_ADDRESS` is unset. Use `--test-recipient you@example.com` to send test copies to yourself only.
+  Seller replies are pasted in by a person with `reply`.
+- **Approvals**: the request is a text file for a manager. A person pastes the manager's reply into `record`, then types the
+  request id, the channel, the approver's name and a final `yes`. Approvals expire after 7 days and can be revoked.
+- **Order sheet**: a person places the orders by hand from the sheet. The tool never buys anything.
+- **Listing content**: a person fills in the product facts, reviews the drafts and uploads them to Walmart by hand.
+
+## Tests (offline)
+
+No network, no keys needed. The one-line check (prints `FAILED: <name>` for anything that does not pass):
+
+```powershell
+$env:OBS_ENABLED = "0"; foreach ($t in "test_pricing","test_email_agent","test_decision_agent","test_order_sheet","test_content_agent","test_observability") { python "$t.py"; if ($LASTEXITCODE -ne 0) { "FAILED: $t" } }
 ```
 
-Environment variables that are already set in the shell take precedence over `.env`.
+Each suite ends with `ok` or `... tests passed`. `python test_observability.py --mutations` runs a slow extra check (about 10 minutes).
+
+## Files the tools create (all local to your machine, not shared between machines)
+
+| Where | What |
+|---|---|
+| project folder | `sourcing_results_<timestamp>.xlsx` and `sourcing_report_<timestamp>.md` from a search (move the results to `Excel Output Sheets\` to keep them tidy) |
+| `Reports\` | approval requests (`approval_request_A-000N.txt/.md`) and email reports |
+| `Order Sheets\` | `order_sheet_<timestamp>.xlsx` |
+| `Walmart Listings\` | `walmart_listings_<timestamp>.xlsx/.md` |
+| state files | `email_state.json` (what was sent and replied), `decision_state.json`, `approvals_log.jsonl` (append-only audit log), `approved_orders.csv/.json` |
+| you edit | `product_facts.csv` (facts the listing text may use), `reviewer_exclusions.csv`, `lcom_prices.csv`, `near_misses.csv` |
+
+Copying the project to another machine does not copy this state unless you copy the files too.
+
+## Known limits
+
+- The independent recalculation check in `order_sheet.py` needs LibreOffice (`soffice`) and the xlsx skill's `recalc.py`. If either
+  is missing the script prints `skipped (...)` for that check and carries on; the built-in formula evaluator still checks every
+  formula and total, and the build stops if that fails.
+- Walmart character limits in `content_agent.py` are unverified assumptions; check them against Seller Center.
+- L-Com reference prices in `lcom_prices.csv` are mostly unverified (labelled "unverified" in the results).
+- Tracing needs a Langfuse server you control; see [OBSERVABILITY.md](OBSERVABILITY.md). It adds about 5 seconds per command.
+- Supplier sites are flaky; a "no match" can mean the pages did not load (see Known limitations below).
+
+## Docker
+
+The project is not containerised yet. If it is later, pass the keys at run time (never bake `.env` into an image) and mount the state files and output folders from the host.
 
 ## Usage
 
@@ -214,7 +262,7 @@ Every run produces three things:
 - Cost is printed per-product and as a running total at the end of every run - check it on
   a small `--limit` run before committing to a large batch.
 
-## Known limitations
+## Known limitations (search)
 
 - Site extraction is occasionally flaky (JS rendering timing, geo/locale redirects,
   anti-bot throttling) - a "no match" result sometimes means the search pages didn't

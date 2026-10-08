@@ -13,6 +13,7 @@ from decimal import Decimal as D
 
 import openpyxl
 
+os.environ["OBS_ENABLED"] = "0"   # tests are offline: never trace, even if .env switches tracing on
 import decision_agent as da
 from email_agent import listing_key
 from sourcing_agent import (CANDIDATE_XLSX_FIELDS, MAX_CANDIDATES, ORDERING_NOTE_FIELD, PRODUCT_XLSX_FIELDS,

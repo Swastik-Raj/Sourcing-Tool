@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
+import observability as obs
 from decision_agent import APPROVAL_TTL_DAYS, LARGE_TOTAL, NOT_AN_ORDER, parse_moq   # one source for the 7 days and the limit
 from email_agent import excluded_reason, listing_key, load_exclusions
 
@@ -968,8 +969,17 @@ def main(argv=None):
     try:
         if duty is None:
             raise OrderSheetError(f"--duty '{args.duty}' is not a number.")
-        b = build(args.approved, args.results, duty, args.out)
-        print_summary(b, args.approved, args.results)
+        with obs.trace_command("order_sheet", "build", workflow=obs.workflow_id(args.results)):
+            b = build(args.approved, args.results, duty, args.out)
+            obs.annotate(rows=len(b["rows"]), expired=len(b["expired"]), could_not_build=len(b["could_not_build"]),
+                         excluded_by_reviewer=len(b["excluded"]), not_usd=len(b["non_usd"]), invalid_rows=len(b["invalid"]),
+                         below_moq=sum(w.startswith("BELOW MOQ") for w in b["warnings"]),
+                         large_total_warnings=sum(w.startswith("MOQ COST OVER LIMIT") for w in b["warnings"]),
+                         warnings=len(b["warnings"]), formulas=b["formulas"], recalculation="built-in evaluator ok; " + b["libreoffice"],
+                         line_cost=b["totals"]["K"], with_duty=b["totals"]["L"])
+            obs.tag(*(f"sku:{r['sku']}" for r in b["rows"]),
+                    *{f"request:{r['ap']['request_id']}" for r in b["rows"] if r["ap"].get("request_id")})
+            print_summary(b, args.approved, args.results)
     except OrderSheetError as e:
         sys.exit(f"Order sheet NOT built: {e}")
 

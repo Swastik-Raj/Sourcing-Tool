@@ -34,6 +34,7 @@ from dotenv import load_dotenv
 from openpyxl.styles import Font
 
 import observability as obs
+import statefile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(HERE, "email_template.txt")
@@ -315,8 +316,7 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    with open(STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
+    statefile.atomic_write(STATE_PATH, json.dumps(state, indent=2))     # temp file + rename: a failure keeps the old file
 
 
 def now() -> str:
@@ -359,12 +359,13 @@ def duplicate_recipients(todo: list) -> dict:
 
 
 def confirm_and_send(drafts: list, state: dict, yes: bool = False, send=smtp_send, ask=input,
-                     test_recipient: str = "") -> int:
+                     test_recipient: str = "", confirm_count=None) -> int:
     """Sends only after an explicit confirmation: 'y' for one email, or the word 'yes' for the whole batch.
     Anything else (Enter, 'n', 'q', typos) sends nothing. Real mode sends only drafts that have an email and
     aren't already sent, and refuses while SHIPPING_ADDRESS is unset or still the default. With test_recipient,
     EVERY draft (even those without an email) goes to that address only, marked [TEST], and is not recorded
-    as sent."""
+    as sent. With confirm_count (the UI's way to confirm without a terminal) the number of emails left AFTER all of the
+    checks above must equal it, or nothing is sent; when it matches, nothing is asked."""
     if test_recipient:
         todo = [as_test(d, test_recipient) for d in drafts]
     else:
@@ -375,9 +376,13 @@ def confirm_and_send(drafts: list, state: dict, yes: bool = False, send=smtp_sen
     dups = {} if test_recipient else duplicate_recipients(todo)
     for email, skus in dups.items():
         print(f"WARNING: {len(skus)} separate emails ({', '.join(skus)}) are addressed to the same recipient {email}.")
+    if confirm_count is not None:
+        if len(todo) != confirm_count:
+            raise SendRefused(f"--confirm-count is {confirm_count} but {len(todo)} email(s) would be sent. Nothing was sent.")
+        yes = True
     if yes:
         print(f"Batch send{' (TEST to ' + test_recipient + ')' if test_recipient else ''}: {len(todo)} email(s).")
-        if ask("Type 'yes' to send all: ").strip().lower() != "yes":
+        if confirm_count is None and ask("Type 'yes' to send all: ").strip().lower() != "yes":
             return 0
     sent = 0
     for d in todo:
@@ -703,6 +708,12 @@ def find_draft(drafts: list, skipped: list, sku: str, results: str) -> dict:
     sys.exit(f"{sku}: not a SKU in {results}. SKUs with a recommended seller: {known}. Nothing stored.")
 
 
+def busy_exit(e) -> int:
+    """Exit code 3 = the state file is busy (another command holds its lock). The message goes to stderr."""
+    print(f"email_agent: {e}", file=sys.stderr)
+    return 3
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # piped output defaults to cp1252 on Windows
     if hasattr(sys.stdin, "reconfigure"):
@@ -721,6 +732,9 @@ def main():
             s.add_argument("--yes", action="store_true", help="one confirmation for the whole batch")
             s.add_argument("--test-recipient", default="", metavar="ADDRESS",
                            help="send every email ONLY to this address, subject prefixed [TEST], nothing marked as sent")
+            s.add_argument("--confirm-count", type=int, metavar="N",
+                           help="send without any prompt, but only if exactly N emails would be sent (after every check); "
+                                "otherwise nothing is sent")
     for name in ("mark", "reply"):
         s = sub.add_parser(name)
         s.add_argument("sku")
@@ -728,8 +742,13 @@ def main():
         if name == "reply":
             s.add_argument("--file", help="UTF-8 text file with the reply (default: read stdin)")
     args = p.parse_args()
-    with obs.trace_command("email_agent", args.cmd, workflow=obs.workflow_id(args.results), sku=getattr(args, "sku", None)):
-        run(args)
+    if getattr(args, "confirm_count", None) is not None and args.confirm_count < 0:
+        p.error("--confirm-count must be 0 or more")
+    try:
+        with obs.trace_command("email_agent", args.cmd, workflow=obs.workflow_id(args.results), sku=getattr(args, "sku", None)):
+            run(args)
+    except statefile.StateBusy as e:
+        sys.exit(busy_exit(e))
 
 
 def run(args):
@@ -769,27 +788,34 @@ def run(args):
             real = {d["email"].lower() for d in drafts if d["email"]}
             if "@" not in args.test_recipient or args.test_recipient.lower() in real:
                 sys.exit("--test-recipient must be a test address, not a manufacturer's.")
+        extra = {} if args.confirm_count is None else {"confirm_count": args.confirm_count}
         try:
-            sent = confirm_and_send(drafts, load_state(), args.yes, test_recipient=args.test_recipient)
+            with statefile.locked(STATE_PATH):
+                sent = confirm_and_send(drafts, load_state(), args.yes, test_recipient=args.test_recipient, **extra)
             print(f"Sent {sent} email(s).")
             obs.annotate(sent=sent, test_mode=bool(args.test_recipient))
         except SendRefused as e:
             obs.annotate(blocked_sends=len(drafts))
             sys.exit(f"Refusing to send: {e}")
+        except EOFError:     # no terminal to ask on (closed stdin): nothing was sent
+            sys.exit("Nothing sent: there is no terminal to confirm on. Run it in a terminal, or pass --confirm-count N "
+                     "with the number of emails you expect to send.")
     elif args.cmd == "mark":
         d = find_draft(drafts, skipped, args.sku, results)
         obs.annotate(sku=d["sku"], listing_host=obs.url_host(d["url"]))
-        state = load_state()
-        entry_for(state, d)["sent"] = now()
-        save_state(state)
+        with statefile.locked(STATE_PATH):
+            state = load_state()
+            entry_for(state, d)["sent"] = now()
+            save_state(state)
         print(f"{d['sku']} ({d['manufacturer'] or d['url']}): marked as submitted via the inquiry form.")
     elif args.cmd == "reply":
         d = find_draft(drafts, skipped, args.sku, results)
         obs.annotate(sku=d["sku"], listing_host=obs.url_host(d["url"]))
         text = open(args.file, encoding="utf-8").read() if args.file else sys.stdin.read()
-        state = load_state()
-        result = record_reply(state, d, text)
-        save_state(state)
+        with statefile.locked(STATE_PATH):
+            state = load_state()
+            result = record_reply(state, d, text)
+            save_state(state)
         print(f"{d['sku']} ({d['manufacturer'] or d['url']}): {result['status']}\n{result['summary']}")
         print("\n".join(quote_lines(result)))
     elif args.cmd == "report":

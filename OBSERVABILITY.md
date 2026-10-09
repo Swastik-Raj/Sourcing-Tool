@@ -65,6 +65,9 @@ instrumentation version starts capturing the runner, that test fails on purpose,
   to nothing) before using a shared or cloud project. `decision_agent` and `order_sheet` never send it, whatever the setting.
 - **Always masked, before anything leaves the process**: API keys (Anthropic, Nimble, Langfuse, SMTP password), email
   addresses, phone numbers, the shipping address, and the approver name and channel typed into `decision_agent record`.
+  Assignments are masked by name whatever the value looks like: `ANTHROPIC_API_KEY`, `NIMBLE_API_KEY`, `SMTP_PASSWORD`,
+  `LANGFUSE_SECRET_KEY`, `LANGFUSE_PUBLIC_KEY`, `SHIPPING_ADDRESS` and any `api_key`, `secret`, `password` or `token`, as
+  `NAME=value`, `NAME: value` or `"NAME": "value"`. Plain sentences that only mention a name are left alone.
   This applies to attributes, inputs, outputs, exception messages, span events and Langfuse's own log lines. `.env` is never logged.
 - `decision_agent` and `order_sheet` export only the exception **class** on an error (their messages quote SKUs and reply lines).
 

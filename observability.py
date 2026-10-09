@@ -55,7 +55,12 @@ def _warn(msg: str) -> None:
 
 _EMAIL = re.compile(r"[\w.+'\-]+@[\w\-]+(?:\.[\w\-]+)+")
 _KEYLIKE = re.compile(r"\b(?:sk-ant-|sk-lf-|pk-lf-|sk-|pk-)[A-Za-z0-9_\-]{8,}")
-_ASSIGN = re.compile(r"(?i)\b((?:api[_-]?key|x-api-key|token|password|passwd|secret|authorization)\s*[=:]\s*)(?:Bearer\s+)?\S+")
+# NAME=value, NAME: value, "NAME": "value" (also \"NAME\": \"value\" inside repr'd JSON) for any name ending in api_key / secret_key /
+# password / public_key (so ANTHROPIC_API_KEY, NIMBLE_API_KEY, SMTP_PASSWORD, LANGFUSE_SECRET_KEY, LANGFUSE_PUBLIC_KEY), the bare names
+# secret and token (not spec_token: an ordinary metadata key), plus x-api-key, authorization and SHIPPING_ADDRESS. The VALUE is masked whatever it looks like: quoted (may hold spaces) or bare.
+# Prose without an = or : after the name ("the API key is missing") is untouched.
+_ASSIGN = re.compile(r"""(?i)((?<!\w)(?:[\w-]*?(?:api[_-]?key|secret[_-]?key|passw(?:or)?d|public[_-]?key)|secret|token|authorization|shipping[_-]?address)"""
+                     r"""\\?["']?\s*[=:]\s*)(?:Bearer\s+)?(?:"(?:[^"\\]|\\.)*"|'[^']*'|\S+)""")
 _BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=\-]{8,}")
 # Phone numbers: 3+ digit groups joined by space . - or parentheses, a +country number, or a Chinese mobile. 9-15 digits;
 # dates ("2026-10-08") and money ("1500.00 2000.00") are not phone numbers.

@@ -1,0 +1,57 @@
+<!doctype html>
+{% from "_macros.html" import badge %}
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page_title ~ ' - ' if page_title }}{{ app_name }}</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to main content</a>
+<header class="top">
+  <div class="top-inner">
+    <a class="brand" href="/">{{ app_name }}</a>
+    <nav class="nav" aria-label="Main">
+      <a href="/{{ '?wf=' ~ wf if wf else '' }}" {% if active == 'workflow' %}aria-current="page"{% endif %}>Workflow</a>
+      <a href="/jobs" {% if active == 'jobs' %}aria-current="page"{% endif %}>Jobs</a>
+      <a href="/health" {% if active == 'health' %}aria-current="page"{% endif %}>Health</a>
+    </nav>
+  </div>
+</header>
+{% if running %}
+<div class="banner" role="status">
+  <div class="banner-inner">
+    <span>A job is running: <strong>{{ running.label }}</strong> (started {{ running.started_at }}).</span>
+    <a href="/jobs/{{ running.id }}">View progress</a>
+    <form method="post" action="/jobs/{{ running.id }}/cancel">
+      <input type="hidden" name="csrf_token" value="{{ csrf }}">
+      <button type="submit" class="btn-danger">Cancel</button>
+    </form>
+  </div>
+</div>
+{% endif %}
+<div class="layout">
+  <aside class="rail" aria-label="Workflow">
+    {% if workflows %}
+    <form method="get" action="/">
+      <label for="wf">Workflow</label>
+      <select id="wf" name="wf" data-autosubmit>
+        {% for w in workflows %}<option value="{{ w.stem }}" {{ 'selected' if w.stem == wf }}>{{ w.label }}</option>{% endfor %}
+      </select>
+      <noscript><button type="submit" class="btn">Show</button></noscript>
+    </form>
+    <ol class="stepper" aria-label="Steps">
+      {% for st in steps %}
+      <li><a href="/step/{{ st.slug }}?wf={{ wf }}" {% if step_name == st.name %}aria-current="page"{% endif %}>{{ st.name }} {{ badge(st.status) }}</a></li>
+      {% endfor %}
+    </ol>
+    {% else %}
+    <p class="muted small">No results files yet. A workflow appears here after a search has produced one.</p>
+    {% endif %}
+  </aside>
+  <main id="main">{% block main %}{% endblock %}</main>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

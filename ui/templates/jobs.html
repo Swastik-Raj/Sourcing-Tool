@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge %}
+{% block main %}
+<h1>Jobs</h1>
+{% if not jobs %}
+<div class="card empty">
+  <p><strong>No jobs yet.</strong></p>
+  <p>Jobs appear here when you run a step.</p>
+</div>
+{% else %}
+<div class="table-wrap">
+  <table class="stack">
+    <caption class="sr">Jobs, newest first</caption>
+    <thead><tr><th scope="col">Job</th><th scope="col">Status</th><th scope="col">Started</th><th scope="col" class="num">Duration</th><th scope="col">Log</th></tr></thead>
+    <tbody>
+    {% for j in jobs %}
+    <tr>
+      <th scope="row">{{ j.label }}</th>
+      <td data-label="Status">{{ badge(job_badge(j.status)) }}</td>
+      <td data-label="Started">{{ j.started_at|replace('T', ' ') }}</td>
+      <td data-label="Duration" class="num">{{ (j.duration_s ~ ' s') if j.duration_s is not none else 'running' }}</td>
+      <td data-label="Log"><a href="/jobs/{{ j.id }}">View log</a></td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+<details>
+  <summary>Diagnostics</summary>
+  <p class="muted">A technical check for whoever maintains this tool. It runs a program's built-in help text and changes nothing.</p>
+  <form method="post" action="/jobs/run" class="inline">
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <label for="command">Check</label>
+    <select id="command" name="command">
+      {% for c in commands %}<option value="{{ c.id }}">{{ c.label }}</option>{% endfor %}
+    </select>
+    <button type="submit" class="btn">Run check</button>
+  </form>
+</details>
+{% endblock %}

@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge %}
+{% block main %}
+<h1>{{ step_name }}</h1>
+{% for st in steps if st.name == step_name %}
+<p>{{ badge(st.status) }}</p>
+<p>{{ st.detail }}</p>
+{% if st.blocked %}<div class="notice warn"><strong>Blocked:</strong> {{ st.blocked }}</div>{% endif %}
+{% endfor %}
+<h2>What this step does</h2>
+<p>{{ step_text }}</p>
+<div class="notice"><strong>Not available yet.</strong> This screen has not been built. Until it is, this step is done with the command line, and this page only shows its status.</div>
+<p><a href="/{{ '?wf=' ~ wf if wf }}">Back to the workflow</a></p>
+{% endblock %}

@@ -647,7 +647,7 @@ def test_smtp_is_reachable_only_through_the_gate():
     # At the real prompt: a copy of the agent runs in a temp dir pointed at a closed local port, so even a bug
     # could only fail to connect - it could not reach anyone.
     with tempfile.TemporaryDirectory() as tmp:
-        for f in ("email_agent.py", "observability.py", "email_template.txt"):
+        for f in ("email_agent.py", "observability.py", "statefile.py", "email_template.txt"):
             shutil.copy(os.path.join(HERE, f), tmp)
         make_xlsx(os.path.join(tmp, "r.xlsx"), [row("A1", email="a@x.com"), row("B2", email="b@x.com")])
         env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "SHIPPING_ADDRESS")}
@@ -661,8 +661,8 @@ def test_smtp_is_reachable_only_through_the_gate():
         for stdin in ("\n\n", "n\nn\n", "x\nq\n"):
             p = send(stdin)
             assert "Sent 0 email(s)" in p.stdout and "refused" not in p.stderr.lower(), (stdin, p.stdout, p.stderr)
-        p = send("")                                       # stdin closed: crashes at the prompt, sends nothing
-        assert p.returncode != 0 and "EOFError" in p.stderr and "refused" not in p.stderr.lower()
+        p = send("")                                       # stdin closed: a clean exit 1 at the prompt (was an EOFError traceback), sends nothing
+        assert p.returncode == 1 and "Traceback" not in p.stderr and "no terminal to confirm on" in p.stderr and "refused" not in p.stderr.lower()
         p = send("no\n", "--yes")
         assert "Sent 0 email(s)" in p.stdout and "refused" not in p.stderr.lower()
         p = send("y\ny\n", shipping=False)                 # default shipping address: refused before any prompt

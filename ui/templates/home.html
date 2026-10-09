@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge %}
+{% block main %}
+<h1>Workflow</h1>
+{% if not workflows %}
+<div class="card empty">
+  <p><strong>No workflows yet.</strong></p>
+  <p>A workflow appears here once a search has produced a results file in <code>Excel Output Sheets</code>.</p>
+</div>
+{% else %}
+<div class="latest">
+  <h2>{{ current.label }}</h2>
+  <span class="muted small">Latest results file: <code>{{ current.file }}</code></span>
+</div>
+<p class="muted">The statuses below only say which files exist. They do not mean anything has been checked or approved.</p>
+<div class="table-wrap">
+  <table class="stack">
+    <caption class="sr">Steps for this workflow</caption>
+    <thead><tr><th scope="col">Step</th><th scope="col">Status</th><th scope="col">Detail</th></tr></thead>
+    <tbody>
+    {% for st in steps %}
+    <tr>
+      <th scope="row"><a href="/step/{{ st.slug }}?wf={{ wf }}">{{ st.name }}</a></th>
+      <td data-label="Status">{{ badge(st.status) }}</td>
+      <td data-label="Detail">{{ st.detail }}{% if st.blocked %}{% if st.detail %}<br>{% endif %}<strong>Blocked:</strong> {{ st.blocked }}{% endif %}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<h2>Recent workflows</h2>
+<ul class="list card">
+  {% for w in recent %}
+  <li><a href="/?wf={{ w.stem }}" {% if w.stem == wf %}aria-current="true"{% endif %}>{{ w.label }}</a>
+    <span class="muted small">{{ w.file }}</span></li>
+  {% endfor %}
+</ul>
+{% if all_count > recent|length %}
+<details>
+  <summary>Show all ({{ all_count }})</summary>
+  <ul class="list">
+    {% for w in workflows %}
+    <li><a href="/?wf={{ w.stem }}">{{ w.label }}</a> <span class="muted small">{{ w.file }}</span></li>
+    {% endfor %}
+  </ul>
+</details>
+{% endif %}
+{% endif %}
+{% endblock %}

@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block main %}
+<h1>That did not work</h1>
+<div class="notice danger">{{ message }}</div>
+{% if error_id %}<p>If you ask for help, quote this reference: <code>{{ error_id }}</code>. The details are kept in a private log on this computer.</p>{% endif %}
+<p><a href="/">Back to the workflow</a></p>
+{% endblock %}

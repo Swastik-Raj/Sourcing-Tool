@@ -1,0 +1,3 @@
+{% macro badge(label, kind=None) -%}
+<span class="badge badge-{{ kind or badge_kind(label) }}">{{ label }}</span>
+{%- endmacro %}

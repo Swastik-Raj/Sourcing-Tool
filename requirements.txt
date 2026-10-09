@@ -9,6 +9,12 @@ pydantic==2.12.5          # sourcing: structured results
 openpyxl==3.1.5           # every agent: reads and writes the .xlsx files
 python-dotenv==1.2.2      # sourcing, email, content: loads .env
 
+# --- UI (run_ui.py): server-rendered pages, no build step ---
+fastapi==0.124.4          # ui: web framework
+uvicorn==0.38.0           # ui: server (run_ui.py)
+Jinja2==3.1.6             # ui: templates (autoescape on)
+python-multipart==0.0.32  # ui: form posts (CSRF-protected buttons)
+
 # --- tests only ---
 httpx==0.28.1             # test_pricing.py, test_observability.py (mock HTTP transports)
 

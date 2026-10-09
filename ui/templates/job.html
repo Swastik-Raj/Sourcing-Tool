@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge %}
+{% block main %}
+<h1>{{ job.label }}</h1>
+<p><span id="job-badge">{{ badge(job_badge(job.status)) }}</span>
+  Started {{ job.started_at|replace('T', ' ') }}{% if job.duration_s is not none %}, took {{ job.duration_s }} s{% endif %}.
+  {% if job.exit_code is not none %}Exit code {{ job.exit_code }}: {{ job.exit_meaning }}{% endif %}</p>
+{% if job.note %}<div class="notice warn" role="alert">{{ job.note }}</div>{% endif %}
+{% if job.status == 'running' %}
+<progress aria-label="Job running"></progress>
+<form method="post" action="/jobs/{{ job.id }}/cancel">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <button type="submit" class="btn-danger">Cancel job</button>
+</form>
+{% endif %}
+{% if job.status == 'failed' and job.tail %}
+<h2>Last lines</h2>
+<pre>{{ job.tail|join('\n') }}</pre>
+{% endif %}
+<h2>Log</h2>
+<p class="muted small">Wording differs from the raw log file.</p>
+<pre id="log" data-job="{{ job.id }}" data-offset="{{ offset }}" data-running="{{ 'yes' if job.status == 'running' else 'no' }}">{{ log }}</pre>
+<p><a href="/jobs">Back to jobs</a></p>
+{% endblock %}

@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge %}
+{% block main %}
+<h1>Health</h1>
+<p class="muted">Checks that this computer is ready to run the steps. Python {{ python }}. Only whether a setting exists is shown, never its value.</p>
+
+<h2>Folders</h2>
+<div class="table-wrap">
+  <table class="stack">
+    <caption class="sr">Folders</caption>
+    <thead><tr><th scope="col">Folder</th><th scope="col">Status</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">Project folder</th><td data-label="Status">{{ badge('Found', 'set') if project_ok else badge('Missing', 'not-set') }}</td></tr>
+      <tr><th scope="row">Job logs folder</th><td data-label="Status">{{ badge('Found', 'set') if data_ok else badge('Missing', 'not-set') }}</td></tr>
+      {% for n, ok in folders %}
+      <tr><th scope="row">{{ n }}</th><td data-label="Status">{{ badge('Found', 'set') if ok else badge('Not created yet', 'not-started') }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<h2>Settings</h2>
+<p class="muted">Settings come from the environment or the <code>.env</code> file. A missing one blocks the work listed beside it.</p>
+<div class="table-wrap">
+  <table class="stack">
+    <caption class="sr">Settings</caption>
+    <thead><tr><th scope="col">Setting</th><th scope="col">Status</th><th scope="col">Needed for</th></tr></thead>
+    <tbody>
+    {% for v in env %}
+    <tr>
+      <th scope="row"><code>{{ v.name }}</code></th>
+      <td data-label="Status">{{ badge('Set', 'set') if v.set else badge('Not set', 'not-set') }}</td>
+      <td data-label="Needed for">{{ v.blocks }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<h2>Tracing</h2>
+<p>Run tracing is <strong>{{ 'on' if obs_on else 'off' }}</strong>. It is an optional record of what each run did, kept for the people maintaining the tool.</p>
+{% if langfuse %}<p>Tracing server: {{ langfuse }}</p>{% endif %}
+{% endblock %}

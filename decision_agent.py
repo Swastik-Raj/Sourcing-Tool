@@ -28,6 +28,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 import openpyxl
 
 from email_agent import excluded_reason, listing_key, load_exclusions   # same key and exclusion rules as the email agent
+from email_agent import statefile   # shared atomic write + lock (re-exported like obs: test_no_network_llm_or_order_code pins this file's imports)
 from email_agent import obs   # the shared tracing module (re-exported: test_no_network_llm_or_order_code pins this file's imports)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -396,10 +397,7 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, STATE_PATH)
+    statefile.atomic_write(STATE_PATH, json.dumps(state, indent=2, ensure_ascii=False))
 
 
 def log_event(event: str, **fields) -> None:
@@ -633,6 +631,11 @@ def render_markdown(req: dict) -> str:
 
 
 def cmd_request(results_path: str, budget=None) -> dict:
+    with statefile.locked(STATE_PATH):
+        return _request(results_path, budget)
+
+
+def _request(results_path: str, budget=None) -> dict:
     state = load_state()
     if budget is not None and (budget <= 0):
         raise AgentError("--budget must be a positive amount.")
@@ -786,27 +789,59 @@ def pick_request(state: dict, results_file: str, request_id=None) -> tuple:
                      + ". Say which one Neeraj answered with --request A-000N.")
 
 
+NO_TERMINAL = ("Can't ask for the request id, channel, approver and confirmation: there is no terminal to type on (stdin is "
+               "closed, piped or used up). Nothing was recorded. Run it in a terminal with the reply in a file (--file), or give "
+               "--channel, --approver and --confirm-request together.")
+
+
 def read_console(prompt: str) -> str:
-    """input(); if stdin was already consumed (a pasted reply ended with Ctrl-Z), fall back to the console device."""
+    """input(), only on a real terminal. Never opens the console device: a program started by something else must not
+    read the keyboard of whatever terminal launched it."""
+    stdin = sys.stdin
+    if stdin is None or stdin.closed or not stdin.isatty():
+        raise AgentError(NO_TERMINAL)
     try:
         return input(prompt)
     except EOFError:
-        device = "CON" if os.name == "nt" else "/dev/tty"
-        try:
-            with open(device, encoding="utf-8") as tty:
-                print(prompt, end="", flush=True)
-                return tty.readline().rstrip("\n")
-        except OSError:
-            raise AgentError("Can't ask for the channel, approver and confirmation: stdin is used up. "
-                             "Save the reply to a file and use --file so the prompts can use the keyboard.")
+        raise AgentError(NO_TERMINAL)
 
 
 ask_user = read_console   # tests replace this
 
 
-def cmd_record(results_path: str, reply_text: str, request_id=None) -> tuple:
+def cmd_record(results_path: str, reply_text: str, request_id=None, gate=None) -> tuple:
     """Parse, echo back, ask which request this answers, the channel, the approver and a final yes, and only then
-    store. Returns (plan, stored?)."""
+    store. Returns (plan, stored?). `gate` = (confirm_request, channel, approver) answers the same four questions without
+    a terminal (see check_gate); the prompts' own validation then runs unchanged."""
+    with statefile.locked(STATE_PATH):
+        return _record(results_path, reply_text, request_id, gate)
+
+
+def check_gate(request_id, confirm_request, channel, approver):
+    """All-or-nothing validation of --confirm-request, --channel and --approver. Returns None when none were given,
+    else (confirm_request, channel, approver). Typed by a person on every call: no default is ever taken."""
+    given = {"--confirm-request": confirm_request, "--channel": channel, "--approver": approver}
+    if all(v is None for v in given.values()):
+        return None
+    missing = [k for k, v in given.items() if v is None]
+    if missing:
+        raise AgentError(f"{', '.join(missing)} missing: give --confirm-request, --channel and --approver together, or none "
+                         "of them to be asked at the keyboard. Nothing was recorded.")
+    if request_id is None:
+        raise AgentError("--confirm-request needs --request (the request id being answered). Nothing was recorded.")
+    for flag, v in given.items():
+        if not v.strip() or any(c in v for c in "\r\n\x00"):
+            raise AgentError(f"{flag} must be a non-empty single line. Nothing was recorded.")
+    if confirm_request.strip().upper() != request_id.strip().upper():
+        raise AgentError(f"--confirm-request {confirm_request.strip()!r} is not the same as --request {request_id.strip()!r}. Nothing was recorded.")
+    return confirm_request, channel, approver
+
+
+def _record(results_path: str, reply_text: str, request_id=None, gate=None) -> tuple:
+    ask = ask_user
+    if gate is not None:
+        answers = iter([gate[0], gate[1], gate[2], "yes"])        # the prompts' questions, in their order
+        ask = lambda _prompt: next(answers)                       # noqa: E731
     state = load_state()
     req, defaulted = pick_request(state, os.path.basename(results_path), request_id)
     if file_sha256(results_path) != req["results_sha256"]:
@@ -821,16 +856,16 @@ def cmd_record(results_path: str, reply_text: str, request_id=None) -> tuple:
     obs.annotate(approvals=len(plan["approvals"]), rejections=len(plan["rejections"]), undecided=len(plan["undecided"]),
                  cap=plan["cap"], committed=plan["committed"])
     print(render_echo(req, plan, defaulted))
-    if ask_user(f"Is this the request Neeraj answered? Type its id ({req['id']}) to confirm: ").strip().upper() != req["id"]:
+    if ask(f"Is this the request Neeraj answered? Type its id ({req['id']}) to confirm: ").strip().upper() != req["id"]:
         print("Request not confirmed. Nothing recorded.")
         return plan, False
-    channel = ask_user("Channel the reply came through (e.g. Slack DM, email): ").strip()
-    approver = ask_user("Who approved (name as given by the sender): ").strip()
+    channel = ask("Channel the reply came through (e.g. Slack DM, email): ").strip()
+    approver = ask("Who approved (name as given by the sender): ").strip()
     obs.protect(channel, approver)   # typed names: masked wherever they could appear in a trace
     if not channel or not approver:
         print("Channel and approver are both required. Nothing recorded.")
         return plan, False
-    if ask_user("Type 'yes' to record these approvals (nothing will be ordered): ").strip().lower() != "yes":
+    if ask("Type 'yes' to record these approvals (nothing will be ordered): ").strip().lower() != "yes":
         print("Nothing recorded.")
         return plan, False
     at = now()
@@ -906,6 +941,11 @@ def cmd_status(results_path: str) -> list:
 
 
 def cmd_revoke(sku: str, results_path: str) -> list:
+    with statefile.locked(STATE_PATH):
+        return _revoke(sku, results_path)
+
+
+def _revoke(sku: str, results_path: str) -> list:
     state = load_state()
     lines, _ = current_lines(results_path)
     active = [d for d in state["decisions"] if d["sku"].upper() == sku.strip().upper() and d["decision"] == "approve"
@@ -938,8 +978,22 @@ def export_cell(order: dict, field: str) -> str:
     return json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else ("" if value is None else value)
 
 
+class _Buffer:
+    """What csv.writer writes into, so the whole file can go through statefile.atomic_write in one piece."""
+    def __init__(self):
+        self.parts = []
+
+    def write(self, s):
+        self.parts.append(s)
+
+
 def cmd_export(results_path: str, out_json: str = None, out_csv: str = None) -> dict:
     """Writes the approvals that are valid now: approved, not expired, not revoked, and still the recommended seller."""
+    with statefile.locked(STATE_PATH):
+        return _export(results_path, out_json, out_csv)
+
+
+def _export(results_path: str, out_json: str = None, out_csv: str = None) -> dict:
     state = load_state()
     lines, _ = current_lines(results_path)
     at = now()
@@ -970,15 +1024,15 @@ def cmd_export(results_path: str, out_json: str = None, out_csv: str = None) -> 
                        "quote_warnings": (d.get("quote") or {}).get("quote_warnings") or []})
     orphans = orphaned(state, set(by_key))
     out_json, out_csv = out_json or EXPORT_JSON, out_csv or EXPORT_CSV
-    with open(out_json, "w", encoding="utf-8") as f:
-        json.dump({"notice": NOT_AN_ORDER, "generated_at": iso(at), "source_results_file": os.path.basename(results_path),
-                   "valid_approvals": len(orders), "orders": orders}, f, indent=2, ensure_ascii=False)
-    with open(out_csv, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow([NOT_AN_ORDER])
-        w.writerow(EXPORT_FIELDS)
-        for o in orders:
-            w.writerow([export_cell(o, k) for k in EXPORT_FIELDS])
+    statefile.atomic_write(out_json, json.dumps({"notice": NOT_AN_ORDER, "generated_at": iso(at), "source_results_file": os.path.basename(results_path),
+                                                 "valid_approvals": len(orders), "orders": orders}, indent=2, ensure_ascii=False))
+    buf = _Buffer()
+    w = csv.writer(buf)
+    w.writerow([NOT_AN_ORDER])
+    w.writerow(EXPORT_FIELDS)
+    for o in orders:
+        w.writerow([export_cell(o, k) for k in EXPORT_FIELDS])
+    statefile.atomic_write(out_csv, "".join(buf.parts), newline="")
     obs.annotate(valid_approvals=len(orders), dropped=dropped, orphans=len(orphans))
     log_event("export", approval_ids=[o["approval_id"] for o in orders], files=[out_json, out_csv],
               source_results_file=os.path.basename(results_path), dropped=dropped, orphaned=len(orphans))
@@ -1001,6 +1055,10 @@ def main(argv=None):
     s.add_argument("--request", help="the request id the reply answered, e.g. A-0002 (optional only when exactly one "
                                      "request is open for the results file)")
     s.add_argument("--file", help="UTF-8 text file with the reply (default: read stdin)")
+    s.add_argument("--confirm-request", metavar="A-000N", help="with --channel and --approver: answer the prompts without a terminal. "
+                   "Must equal --request. All three, or none.")
+    s.add_argument("--channel", help="the channel the reply came through, typed by a person (with --confirm-request and --approver)")
+    s.add_argument("--approver", help="who approved, typed by a person; never defaulted (with --confirm-request and --channel)")
     for name in ("status", "export"):
         sub.add_parser(name).add_argument("--results", required=True)
     s = sub.add_parser("revoke")
@@ -1017,6 +1075,9 @@ def main(argv=None):
                 raise
     except AgentError as e:
         sys.exit(str(e))
+    except statefile.StateBusy as e:
+        print(f"decision_agent: {e}", file=sys.stderr)
+        sys.exit(3)                                              # 3 = state file busy
 
 
 def run(args) -> None:
@@ -1030,10 +1091,13 @@ def run(args) -> None:
         print(render_text(req))
         print(f"\n(also saved: Reports/approval_request_{req['id']}.txt and .md)")
     elif args.cmd == "record":
+        gate = check_gate(args.request, args.confirm_request, args.channel, args.approver)   # before anything is read or written
         text = open(args.file, encoding="utf-8").read() if args.file else sys.stdin.read()
-        _, stored = cmd_record(args.results, text, args.request)
+        _, stored = cmd_record(args.results, text, args.request, gate)
         if stored:
             print("Recorded. Nothing has been ordered.")
+        elif gate is not None:
+            raise AgentError("Nothing was recorded (see above).")
     elif args.cmd == "status":
         rows, orphans, skipped = cmd_status(args.results)
         for r in rows:

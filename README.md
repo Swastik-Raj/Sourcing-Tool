@@ -48,18 +48,48 @@ listings and replies from crashing redirected output). If script activation is b
 - **Search**: you choose the products and read the results; it only reads public pages and writes files.
 - **Emails**: `drafts` only shows text. `send` shows each email and asks `y` per email, or you type `yes` once for the batch;
   it refuses while `SHIPPING_ADDRESS` is unset. Use `--test-recipient you@example.com` to send test copies to yourself only.
-  Seller replies are pasted in by a person with `reply`.
+  Seller replies are pasted in by a person with `reply`. With no terminal (a program running it), `send --confirm-count N`
+  sends without asking, but only if exactly N emails would go out after every check; any other number sends nothing. It does
+  not skip any other check. Without a terminal and without that flag, `send` stops with exit code 1 and sends nothing.
 - **Approvals**: the request is a text file for a manager. A person pastes the manager's reply into `record`, then types the
   request id, the channel, the approver's name and a final `yes`. Approvals expire after 7 days and can be revoked.
+  With no terminal, give all three of `--confirm-request A-000N` (must equal `--request`), `--channel` and `--approver`
+  (typed by a person, never defaulted); one or two of them is refused. The prompts need a real terminal: if there is none the
+  command stops (it no longer falls back to the console device) and records nothing.
 - **Order sheet**: a person places the orders by hand from the sheet. The tool never buys anything.
 - **Listing content**: a person fills in the product facts, reviews the drafts and uploads them to Walmart by hand.
+
+## Run the UI (Stage 1: skeleton only)
+
+A local web page that shows each workflow's progress and runs allowlisted commands as jobs. It has no login, so it only listens on this computer.
+
+```powershell
+$env:OBS_ENABLED = "0"      # optional: switch tracing off for this session
+python run_ui.py            # then open http://127.0.0.1:8000/
+```
+
+The pages use neutral wording (all display wording lives in `ui/wording.py`; job logs and files on disk are never changed, and a displayed log says so). Stage 1 can only run each agent's `--help`; the search, email, approval and order screens come in Stage 2. Job logs and metadata are written to `ui_data\` (add it to `.gitignore`). `UI_HOST`, `UI_PORT`, `PROJECT_DIR` and `UI_DATA_DIR` change where it listens and which folders it uses, and `UI_APP_NAME` changes the name shown in the header (default "Sourcing Tool"); a non-loopback host is refused unless `UI_ALLOW_NON_LOOPBACK=1`. Test with `python test_ui.py`.
+
+## State files, locks and exit codes
+
+`email_state.json`, `decision_state.json`, `approved_orders.json` and `approved_orders.csv` are written atomically (temp file,
+then rename). Commands that change `email_state.json` or `decision_state.json` (`send`, `mark`, `reply`, `request`, `record`,
+`revoke`, `export`) take a lock file next to it (`<state file>.lock`) and wait up to 10 seconds (`STATE_LOCK_WAIT_SECONDS`
+changes that); a lock left by a stopped program is taken over after 15 minutes. `drafts`, `report` and `status` never lock.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Finished |
+| 1 | The command stopped with a message and did nothing further (also `content_agent check`: problems found in the listings) |
+| 2 | Bad command line |
+| 3 | State file busy: another command holds its lock. Nothing was changed; try again |
 
 ## Tests (offline)
 
 No network, no keys needed. The one-line check (prints `FAILED: <name>` for anything that does not pass):
 
 ```powershell
-$env:OBS_ENABLED = "0"; foreach ($t in "test_pricing","test_email_agent","test_decision_agent","test_order_sheet","test_content_agent","test_observability") { python "$t.py"; if ($LASTEXITCODE -ne 0) { "FAILED: $t" } }
+$env:OBS_ENABLED = "0"; foreach ($t in "test_pricing","test_email_agent","test_decision_agent","test_order_sheet","test_content_agent","test_observability","test_gates") { python "$t.py"; if ($LASTEXITCODE -ne 0) { "FAILED: $t" } }
 ```
 
 Each suite ends with `ok` or `... tests passed`. `python test_observability.py --mutations` runs a slow extra check (about 10 minutes).

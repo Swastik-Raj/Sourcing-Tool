@@ -36,11 +36,14 @@ def is_mounted(path: Path) -> bool:
 
 
 def check_zone(name, zones: Path = ZONES) -> None:
-    """The pages show local time, and an unknown zone name silently means UTC, so a missing or misspelt TZ stops the start."""
-    if not name:
-        raise Refused("TZ is not set. Add your time zone to .env, for example TZ=Asia/Kolkata, so the times on the pages are your local time.")
+    """The pages show local time, and an unknown zone name silently means UTC, so a missing or misspelt TZ stops the start.
+    The compose file passes TZ through as it is (empty when .env has none): this is the one place that refuses."""
+    if not name or not name.strip():
+        raise Refused("TZ is not set. Add your time zone to .env, for example TZ=Asia/Kolkata, then start again with "
+                      "`docker compose up -d`. The pages show local time, so the tool does not start without it.")
     if not re.fullmatch(r"[A-Za-z0-9_+\-]+(/[A-Za-z0-9_+\-]+){0,2}", name) or not (zones / name).is_file():
-        raise Refused("TZ is set to a name this system does not know. Use a name such as Asia/Kolkata or America/Chicago.")
+        raise Refused("TZ in .env is not a time zone name this system knows. Set it to a name such as Asia/Kolkata or "
+                      "America/Chicago, then start again with `docker compose up -d`.")
 
 
 def check_data(data: Path, mounted=is_mounted) -> None:

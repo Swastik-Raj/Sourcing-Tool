@@ -35,8 +35,9 @@ services:
       UI_ENABLE_STUB: "0"
       PROJECT_DIR: /data
       UI_DATA_DIR: /data/ui_data
-      # Required: the pages show local time, and without a zone that would silently be UTC.
-      TZ: "${TZ:?Set TZ in .env to your time zone, for example TZ=Asia/Kolkata}"
+      # Passed through as it is, empty when .env has none, so stop, down, ps, logs and config always work. The container
+      # itself refuses to start the UI without a time zone it knows: see `docker compose logs ui`.
+      TZ: "${TZ:-}"
       # Tracing is off unless LCOM_TRACING=1 is set. OBS_ENABLED in .env has no effect in the container.
       OBS_ENABLED: "${LCOM_TRACING:-0}"
       # A Langfuse on this computer is reached through Docker's name for the host, never through localhost.

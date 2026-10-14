@@ -1325,7 +1325,7 @@ MOUNTED, NOT_MOUNTED = (lambda p: True), (lambda p: False)
 
 
 @test
-def container_start_refuses_a_missing_mount_the_source_folder_and_a_bad_time_zone(env):
+def container_start_refuses_a_missing_mount_and_the_source_folder(env):
     ep = entrypoint_module()
     app, zones, data = fake_image(env.root), fake_zones(env.root), env.root / "data_folder"
     data.mkdir()
@@ -1351,20 +1351,49 @@ def container_start_refuses_a_missing_mount_the_source_folder_and_a_bad_time_zon
                 assert "looks like the source folder" in str(e) and mark in str(e), (mark, str(e))
                 assert tree(src) == before and (src / "email_agent.py").read_bytes() == planted, mark
             assert ep.SOURCE_MARKS == (".git", "ui", "run_ui.py", "Dockerfile")
-            # the time zone: required, and it must be one the system knows (an unknown name would silently mean UTC)
-            ep.check_zone("Asia/Kolkata", zones)
-            ep.check_zone("UTC", zones)
-            for bad in (None, "", "Asia/Kolkatta", "Asia", "../zones/UTC", "/etc/passwd", "Asia/Kolkata; x", " UTC", "Mars/Olympus"):
-                raises(ep.Refused, ep.check_zone, bad, zones)
-            for bad, why in ((None, "TZ is not set"), ("Asia/Kolkatta", "does not know")):
-                with env_vars(TZ=bad):
-                    e = raises(SystemExit, ep.main, data, MOUNTED, zones, lambda: started.append("ui"))
-                    assert why in str(e) and list(data.iterdir()) == [], (bad, str(e))
-            assert "Kolkatta" not in str(e), "a refusal never repeats a setting's value"
         assert started == [], "a refused start must not start the UI"
     finally:
         ep.APP = real_app
 
+
+@test
+def container_start_needs_a_time_zone_it_knows(env):
+    """The compose file passes TZ through as it is (empty when .env has none); the entrypoint is the one that refuses."""
+    ep = entrypoint_module()
+    app, zones, data = fake_image(env.root), fake_zones(env.root), env.root / "data_folder"
+    data.mkdir()
+    started, real_app = [], ep.APP
+    ep.APP = app
+    rest = dict(PROJECT_DIR=None, UI_DATA_DIR=None, UI_SHIPPED_DIR=None, UI_HOST=None, UI_ALLOW_NON_LOOPBACK=None, UI_ENABLE_STUB=None)
+    try:
+        for empty in (None, "", "   "):                                                # not in .env, empty, or only spaces
+            with env_vars(TZ=empty, **rest):
+                e = str(raises(SystemExit, ep.main, data, MOUNTED, zones, lambda: started.append("ui")))
+            assert e.startswith("NOT STARTED: TZ is not set.") and "Add your time zone to .env, for example TZ=Asia/Kolkata" in e, (empty, e)
+            assert "docker compose up -d" in e and list(data.iterdir()) == [] and started == [], (empty, e)
+        for unknown in ("Asia/Kolkatta", "Mars/Olympus", "Asia", "../zones/UTC", "/etc/passwd", "Asia/Kolkata; x", " UTC", "UTC "):
+            with env_vars(TZ=unknown, **rest):
+                e = str(raises(SystemExit, ep.main, data, MOUNTED, zones, lambda: started.append("ui")))
+            assert e.startswith("NOT STARTED: TZ in .env is not a time zone name this system knows.") and "such as Asia/Kolkata" in e, (unknown, e)
+            assert unknown.strip() not in e.replace("Asia/Kolkata or", ""), "a refusal never repeats the value that was set"
+            assert list(data.iterdir()) == [] and started == [], unknown
+        import contextlib
+        import io
+        for known in ("Asia/Kolkata", "UTC"):                                            # accepted: the UI starts, once each
+            with env_vars(TZ=known, **rest), contextlib.redirect_stdout(io.StringIO()) as said:
+                ep.main(data, MOUNTED, zones, lambda: started.append(known))
+            assert said.getvalue().endswith("data folder ready, starting the UI\n"), said.getvalue()
+        assert started == ["Asia/Kolkata", "UTC"]
+    finally:
+        ep.APP = real_app
+
+
+@test
+def compose_never_fails_a_command_because_a_setting_is_missing(env):
+    """`${NAME:?message}` would make stop, down, ps, logs and config fail too. The compose file has none, and passes TZ through."""
+    compose = (Path(__file__).parent / "docker-compose.yml").read_text(encoding="utf-8")
+    assert ":?" not in compose and "${TZ:-}" in compose, "TZ is passed through as it is; the container refuses, not compose"
+    assert [line.strip() for line in compose.splitlines() if line.strip().startswith("TZ:")] == ['TZ: "${TZ:-}"'], "one TZ line, passed through"
 
 @test
 def container_start_writes_only_the_program_files_and_leaves_everything_else_alone(env):

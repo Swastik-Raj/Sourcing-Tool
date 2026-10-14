@@ -1,0 +1,38 @@
+# An allowlist. The first line leaves everything out; only what is named after it goes to Docker.
+# Never add .env, a state file or an output folder here.
+*
+
+# ---------- runtime image ----------
+!requirements.txt
+!run_ui.py
+!sourcing_agent.py
+!email_agent.py
+!decision_agent.py
+!order_sheet.py
+!content_agent.py
+!observability.py
+!statefile.py
+!email_template.txt
+!reviewer_exclusions.csv
+!near_misses.csv
+!lcom_prices.csv
+!ui/*.py
+!ui/templates/*.html
+!ui/static/app.css
+!ui/static/app.js
+!docker/entrypoint.py
+!docker/constraints.txt
+
+# ---------- test image only (built by docker/verify.ps1) ----------
+!test_*.py
+!.env.example
+!tests/test_ui_pipeline.py
+!tests/shim/*.py
+!tests/fixtures/*
+!test_fixtures/email_replies/*.txt
+!scratch/pre_gates/decision_agent.py
+!scratch/pre_gates/email_agent.py
+
+# ---------- never, wherever it is ----------
+**/__pycache__
+**/*.pyc

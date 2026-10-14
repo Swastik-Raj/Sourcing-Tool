@@ -1,0 +1,26 @@
+{# The export an order sheet or listings are built from: whether it belongs to the selected results file, and each approval's expiry. #}
+<h2>The export this is built from</h2>
+{% if not view.export.exists %}
+<div class="notice warn"><strong>There is no export yet.</strong> Export the valid approvals on the <a href="/step/approvals?wf={{ wf }}">Approvals</a> tab first.</div>
+{% elif not view.export.mine %}
+<div class="notice danger"><strong>The export on disk belongs to a different results file.</strong> It was made from <code>{{ view.export.source or 'an unnamed file' }}</code>; the results file selected here is <code>{{ current.file }}</code>. Nothing can be built from it here. Export again on the <a href="/step/approvals?wf={{ wf }}">Approvals</a> tab for this results file.</div>
+{% else %}
+<p>Exported from <code>{{ view.export.source }}</code> at {{ view.export.at }}: {{ view.export.count }} valid approval{{ 's' if view.export.count != 1 }} at that time.</p>
+{% if view.export.orders %}
+<div class="table-wrap">
+  <table class="stack words">
+    <caption class="sr">Approvals in the export, with their expiry</caption>
+    <thead><tr><th scope="col">Product</th><th scope="col">Seller</th><th scope="col" class="num">Quantity</th><th scope="col">Approval expires</th><th scope="col">Now</th></tr></thead>
+    <tbody>
+    {% for o in view.export.orders %}
+    <tr><th scope="row">{{ o.sku }}</th><td data-label="Seller">{{ o.seller }}</td><td data-label="Quantity" class="num">{{ o.qty if o.qty is not none }}</td>
+      <td data-label="Approval expires">{{ o.expires }}</td><td data-label="Now">{{ 'Expired' if o.expired else 'Still valid' }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% if view.export.orders|selectattr('expired')|list %}
+<div class="notice warn gap">Some approvals have expired since the export. The agent skips them and says so in its output; export again after a new approval to include them.</div>
+{% endif %}
+{% endif %}
+{% endif %}

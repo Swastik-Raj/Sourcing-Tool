@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge %}
+{% block main %}
+<h1>Order sheet</h1>
+<p>{{ step_text }}</p>
+{% include "_strip.html" %}
+{% if error %}<div class="notice danger" role="alert">{{ error }}</div>{% endif %}
+{% if current %}
+{% include "_joblog.html" %}
+<div class="notice"><strong>This only creates a file.</strong> No cart link is possible: nothing is added to a cart and nothing is ordered. Payment and checkout stay manual, done by a person on each seller's site.</div>
+{% include "_export.html" %}
+<form method="post" action="/order/build" class="gap">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <input type="hidden" name="wf" value="{{ wf }}">
+  <button type="submit" class="btn-primary" {{ 'disabled' if running or not view.export.mine }}>Build the order sheet</button>
+  <span class="muted small">The order sheet tool checks each approval again (expiry, seller, price) and says what it left out.</span>
+</form>
+
+<h2>Order sheets</h2>
+{% if view.sheets %}
+<ul class="list card">
+  {% for f in view.sheets %}<li><a href="/files/Order Sheets/{{ f.name }}">{{ f.name }}</a> <span class="muted small">written {{ f.at }}</span></li>{% endfor %}
+</ul>
+<p class="muted small">A sheet is not tied to a results file by its name. Use one written after the export shown above. Downloaded files keep their original wording.</p>
+{% else %}
+<div class="card empty"><p><strong>No order sheet has been built yet.</strong></p></div>
+{% endif %}
+{% endif %}
+{% endblock %}

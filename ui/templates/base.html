@@ -13,7 +13,9 @@
   <div class="top-inner">
     <a class="brand" href="/">{{ app_name }}</a>
     <nav class="nav" aria-label="Main">
-      <a href="/{{ '?wf=' ~ wf if wf else '' }}" {% if active == 'workflow' %}aria-current="page"{% endif %}>Workflow</a>
+      <a href="/{{ '?wf=' ~ wf if wf else '' }}" {% if active == 'workflow' and not step_name %}aria-current="page"{% endif %}>Home</a>
+      {% for name, slug in tabs %}<a href="/step/{{ slug }}{{ '?wf=' ~ wf if wf else '' }}" {% if step_name == name %}aria-current="page"{% endif %}>{{ name }}</a>
+      {% endfor %}
       <a href="/jobs" {% if active == 'jobs' %}aria-current="page"{% endif %}>Jobs</a>
       <a href="/health" {% if active == 'health' %}aria-current="page"{% endif %}>Health</a>
     </nav>
@@ -22,12 +24,16 @@
 {% if running %}
 <div class="banner" role="status">
   <div class="banner-inner">
-    <span>A job is running: <strong>{{ running.label }}</strong> (started {{ running.started_at }}).</span>
-    <a href="/jobs/{{ running.id }}">View progress</a>
+    <span>A job is running: <strong>{{ running.label }}</strong> (started {{ running.started_at|replace('T', ' ') }}).</span>
+    {% if running.command == 'search' %}
+    <a href="/step/search?job={{ running.id }}">View progress or cancel</a>
+    {% else %}
+    <a href="{% if running.step %}/step/{{ running.step }}?wf={{ running.wf }}&amp;job={{ running.id }}{% else %}/jobs/{{ running.id }}{% endif %}">View progress</a>
     <form method="post" action="/jobs/{{ running.id }}/cancel">
       <input type="hidden" name="csrf_token" value="{{ csrf }}">
       <button type="submit" class="btn-danger">Cancel</button>
     </form>
+    {% endif %}
   </div>
 </div>
 {% endif %}
@@ -35,7 +41,8 @@
   <aside class="rail" aria-label="Workflow">
     {% if workflows %}
     <form method="get" action="/">
-      <label for="wf">Workflow</label>
+      {% if step_name %}<input type="hidden" name="step" value="{{ step_name }}">{% endif %}
+      <label for="wf">Results file</label>
       <select id="wf" name="wf" data-autosubmit>
         {% for w in workflows %}<option value="{{ w.stem }}" {{ 'selected' if w.stem == wf }}>{{ w.label }}</option>{% endfor %}
       </select>
@@ -48,6 +55,7 @@
     </ol>
     {% else %}
     <p class="muted small">No results files yet. A workflow appears here after a search has produced one.</p>
+    <p class="small"><a href="/step/search">Go to Search</a></p>
     {% endif %}
   </aside>
   <main id="main">{% block main %}{% endblock %}</main>

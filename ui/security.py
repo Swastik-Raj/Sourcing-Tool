@@ -8,7 +8,9 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException, Request
 from starlette.responses import PlainTextResponse
 
-from .config import DOWNLOAD_EXTENSIONS, OUTPUT_FOLDERS, Settings
+from .config import DOWNLOAD_EXTENSIONS, MAX_UPLOAD_BYTES, OUTPUT_FOLDERS, Settings
+
+BODY_OVERHEAD = 64 * 1024           # room for the form's other fields and the multipart framing around an upload
 
 HEADERS = {
     "Content-Security-Policy": "default-src 'self'",
@@ -49,6 +51,11 @@ def install(app, s: Settings) -> None:
                 origin = f"{ref.scheme}://{ref.netloc}" if ref.scheme else ""
             if origin not in origins:
                 return PlainTextResponse("Cross-site request refused.", 403, headers=HEADERS)
+            size = request.headers.get("content-length", "")           # refused here, before any of the body is read or stored
+            if not size.isdigit():
+                return PlainTextResponse("A request body needs a Content-Length.", 411, headers=HEADERS)
+            if int(size) > MAX_UPLOAD_BYTES + BODY_OVERHEAD:
+                return PlainTextResponse("That upload is too large.", 413, headers=HEADERS)
         sid = request.cookies.get(COOKIE) or secrets.token_urlsafe(24)
         new = COOKIE not in request.cookies
         request.state.sid = sid                                          # state lives in the ASGI scope, shared with the route's Request
@@ -58,6 +65,21 @@ def install(app, s: Settings) -> None:
         if new:
             response.set_cookie(COOKIE, sid, httponly=True, samesite="strict", path="/")
         return response
+
+
+PROJECT_FILES = ("approved_orders.csv",)      # the only files served from the project folder itself, by exact name
+
+
+def safe_project_file(s: Settings, name: str):
+    """approved_orders.csv in the project folder, or None: an exact name, a regular file, not a link to somewhere else."""
+    if name not in PROJECT_FILES:
+        return None
+    root = s.project.resolve()
+    try:
+        target = (root / name).resolve(strict=True)
+    except (OSError, ValueError):
+        return None
+    return target if target.parent == root and target.name == name and target.is_file() else None
 
 
 def safe_output_file(s: Settings, folder: str, rel: str):

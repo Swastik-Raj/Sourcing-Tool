@@ -14,7 +14,8 @@ def main() -> None:
         print("*" * 70 + f"\nWARNING: listening on {s.host} with NO LOGIN. Anyone who can reach this port can run the agents.\n" + "*" * 70)
     import uvicorn
     from ui.app import create_app
-    print(f"L-Com agents UI: http://{s.host}:{s.port}/   (Ctrl+C to stop)")
+    open_at = "127.0.0.1" if s.host in ("0.0.0.0", "::") else s.host      # "every interface" is where it listens, not an address to open
+    print(f"L-Com agents UI: http://{open_at}:{s.port}/   (Ctrl+C to stop)")
     uvicorn.run(create_app(s), host=s.host, port=s.port, log_level="warning")
 
 

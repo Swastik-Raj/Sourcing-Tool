@@ -943,6 +943,11 @@ def test_every_command_on_one_results_file_shares_one_session_id():
         sessions["order"] = {attr(s)["session.id"] for s in spans(run) if s.parent is None}
     env = TC.Env()
     try:
+        # ca.main() reads the real clock, so this test gets its own approval dated from it (the shared fixture's fixed dates expire)
+        from datetime import datetime, timedelta, timezone
+        approved_at = datetime.now(timezone.utc) - timedelta(days=1)
+        TO.approved_file(env.box.approved, [{"approved_at": f"{approved_at:%Y-%m-%dT%H:%M:%SZ}",
+                                             "expires_at": f"{approved_at + timedelta(days=7):%Y-%m-%dT%H:%M:%SZ}"}])
         with tracing("content_agent") as run:
             ns = type("A", (), {"cmd": "generate", "results": RESULTS})()
             os.environ["BRAND_NAME"] = "Acme"

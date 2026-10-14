@@ -4,11 +4,12 @@ import json
 import os
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -47,8 +48,9 @@ def write_json_atomic(path: Path, data: dict) -> None:
 
 
 class JobManager:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, popen=None):
         self.settings = settings
+        self._popen = popen                        # tests pass their own, to see the exact arguments without running anything
         self.commands = build_allowlist(settings)
         self.jobs_dir = settings.jobs
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
@@ -57,6 +59,9 @@ class JobManager:
         self._procs: dict = {}                     # id -> Popen
         self._cancelled: set = set()
         self.recover()
+        self.prune()
+        for p in (settings.data / "inputs").glob("*.txt"):     # pasted text left by a run that was cut off: no job is running now
+            self.discard_input(p.name)
 
     # ---- metadata ----
     def _meta_path(self, jid: str) -> Path:
@@ -94,7 +99,29 @@ class JobManager:
         return self.get(jid) if jid else None
 
     # ---- start ----
-    def start(self, cmd_id: str, params: Optional[dict] = None) -> dict:
+    def prune(self) -> int:
+        """Remove the log and metadata of jobs that finished more than retention_days ago. Only '<job id>.json' and
+        '<job id>.log' inside the jobs folder, and only for jobs that are no longer running. Returns how many jobs went."""
+        days = self.settings.retention_days
+        if days <= 0:
+            return 0
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+        removed = 0
+        for p in list(self.jobs_dir.glob("*.json")):
+            m = self.get(p.stem)                        # None unless the file name is a job id and the file is job metadata
+            if not isinstance(m, dict) or m.get("status") == RUNNING or p.stem in self._procs:
+                continue
+            if not m.get("finished_at") or str(m["finished_at"]) >= cutoff:
+                continue
+            for f in (self._meta_path(p.stem), self.log_path(p.stem)):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            removed += 1
+        return removed
+
+    def start(self, cmd_id: str, params: Optional[dict] = None, extra: Optional[dict] = None) -> dict:
         cmd: Optional[Command] = self.commands.get(cmd_id)
         if cmd is None:
             raise JobRejected("That command is not allowed.")
@@ -107,9 +134,11 @@ class JobManager:
                 if self._state_job is not None:
                     raise JobBusy("Another job that changes data is running. Wait for it to finish or cancel it.")
                 self._state_job = jid
-        meta = {"id": jid, "command": cmd.id, "label": cmd.label, "args": args, "state_changing": cmd.state_changing,
+        meta = {"id": jid, "command": cmd.id, "label": cmd.label, "args": cmd.recorded(args), "state_changing": cmd.state_changing,
                 "status": RUNNING, "started_at": datetime.now().isoformat(timespec="seconds"), "finished_at": None,
-                "duration_s": None, "exit_code": None, "exit_meaning": "", "pid": None, "note": "", "tail": []}
+                "duration_s": None, "exit_code": None, "exit_meaning": "", "pid": None, "note": "", "tail": [],
+                "script": script, "cwd": str(self.settings.project),
+                **(extra or {})}                         # extra: what the page that started it wants to remember
         try:
             self._save(meta)
             self.log_path(jid).write_text("", encoding="utf-8")
@@ -132,9 +161,10 @@ class JobManager:
                     raise JobBusy("lost the state-changing slot")
             env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
             flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0
-            proc = subprocess.Popen(argv, cwd=self.settings.project, env=env, shell=False, stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=flags,
-                                    encoding="utf-8", errors="replace")
+            own_group = {} if os.name == "nt" else {"start_new_session": True}      # not Windows: its own process group, so cancel can stop its children too
+            proc = (self._popen or subprocess.Popen)(argv, cwd=self.settings.project, env=env, shell=False, stdin=subprocess.DEVNULL,
+                                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=flags,
+                                                     encoding="utf-8", errors="replace", **own_group)
             self._procs[jid] = proc
             meta["pid"] = proc.pid
             self._save(meta)
@@ -154,11 +184,28 @@ class JobManager:
                 log.write(mask_line(f"runner error: {type(e).__name__}: {e}") + "\n")
         finally:
             self._procs.pop(jid, None)
+            self.discard_input(meta.get("input_file"))      # text a person pasted for this command: the agent has read it by now
             meta.update(finished_at=datetime.now().isoformat(timespec="seconds"), duration_s=round(time.monotonic() - t0, 1))
             if meta["status"] in (FAILED,):
                 meta["tail"] = self.tail(jid, 15)
             self._release(jid)          # before the final save, so a viewer who sees 'finished' can already start the next job
             self._save(meta)
+
+    # ---- pasted text ----
+    def save_input(self, text: str) -> str:
+        """Saves pasted text as ui_data\\inputs\\<random>.txt for one command to read with --file. Returns the file name."""
+        folder = self.settings.data / "inputs"
+        folder.mkdir(parents=True, exist_ok=True)
+        name = secrets.token_hex(8) + ".txt"
+        (folder / name).write_text(text, encoding="utf-8", newline="")
+        return name
+
+    def discard_input(self, name) -> None:
+        if isinstance(name, str) and re.fullmatch(r"[0-9a-f]{16}\.txt", name):
+            try:
+                (self.settings.data / "inputs" / name).unlink()
+            except OSError:
+                pass
 
     # ---- cancel / log ----
     def cancel(self, jid: str) -> bool:
@@ -170,7 +217,14 @@ class JobManager:
             subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], stdin=subprocess.DEVNULL,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         else:
-            proc.kill()
+            try:                                    # the whole group, but only if this process leads one (the runner started it that way)
+                leads_group = os.getpgid(proc.pid) == proc.pid
+            except OSError:
+                leads_group = False
+            try:
+                os.killpg(proc.pid, signal.SIGKILL) if leads_group else proc.kill()
+            except ProcessLookupError:              # it ended in between
+                pass
         return True
 
     def read_log(self, jid: str, offset: int = 0, whole_lines_only: bool = False) -> tuple:

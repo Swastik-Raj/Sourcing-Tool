@@ -59,16 +59,18 @@ listings and replies from crashing redirected output). If script activation is b
 - **Order sheet**: a person places the orders by hand from the sheet. The tool never buys anything.
 - **Listing content**: a person fills in the product facts, reviews the drafts and uploads them to Walmart by hand.
 
-## Run the UI (Stage 1: skeleton only)
+## Run the UI (the whole pipeline)
 
-A local web page that shows each workflow's progress and runs allowlisted commands as jobs. It has no login, so it only listens on this computer.
+A local web page that shows each workflow's progress and runs allowlisted commands as jobs. It has no login, so it only listens on this computer. Every tab, every human gate and the commands to test it are described in [UI.md](UI.md).
 
 ```powershell
 $env:OBS_ENABLED = "0"      # optional: switch tracing off for this session
 python run_ui.py            # then open http://127.0.0.1:8000/
 ```
 
-The pages use neutral wording (all display wording lives in `ui/wording.py`; job logs and files on disk are never changed, and a displayed log says so). Stage 1 can only run each agent's `--help`; the search, email, approval and order screens come in Stage 2. Job logs and metadata are written to `ui_data\` (add it to `.gitignore`). `UI_HOST`, `UI_PORT`, `PROJECT_DIR` and `UI_DATA_DIR` change where it listens and which folders it uses, and `UI_APP_NAME` changes the name shown in the header (default "Sourcing Tool"); a non-loopback host is refused unless `UI_ALLOW_NON_LOOPBACK=1`. Test with `python test_ui.py`.
+The pages use neutral wording (all display wording lives in `ui/wording.py`; job logs and files on disk are never changed, and a displayed log says so). The tabs follow the pipeline: Search, Emails, Approvals, Order sheet, Listing content. Each starts the agent's own command only after its own confirmation, and the Jobs page can run each agent's `--help` as a check.
+
+**Search step.** Upload a product sheet (`.xlsx`, saved under `Uploads\`) or pick the products another way (a 3-product test, all built-in products, a ticked list of built-in products, or an `.xlsx` in the project folder with an optional row limit and an optional "Also include the built-in products"), read the estimate (about $0.08 and 56 seconds per product, from one 15-product batch and not measured on your run), then type the number of products to start. The page needs `ANTHROPIC_API_KEY` and `NIMBLE_API_KEY` (in the environment or `.env`; only whether they are set is shown) and refuses to start while another job that changes data is running. It runs `python sourcing_agent.py [--sku ...] [--input FILE [--limit N] [--add-builtin]] --output "Excel Output Sheets\sourcing_results_<timestamp>.xlsx"`, shows progress and the agent's own cost figure while it runs, and afterwards shows a read-only results table. Cancelling keeps the products finished so far; that run is then shown as partial. The built-in products are the agent's own `PRODUCTS` list (what `--sku` looks up when there is no input file). The agent writes its `.md` report to the project folder; when the run ends the page copies it into `Reports\` (the original is left alone) and links the copy, or says why it could not. Finished job logs under `ui_data\jobs` are removed after `UI_LOG_RETENTION_DAYS` days (default 30, `0` keeps them). Job logs and metadata are written to `ui_data\` (add it to `.gitignore`). `UI_HOST`, `UI_PORT`, `PROJECT_DIR` and `UI_DATA_DIR` change where it listens and which folders it uses, and `UI_APP_NAME` changes the name shown in the header (default "Sourcing Tool"); a non-loopback host is refused unless `UI_ALLOW_NON_LOOPBACK=1`. Test with `python test_ui.py`.
 
 ## State files, locks and exit codes
 

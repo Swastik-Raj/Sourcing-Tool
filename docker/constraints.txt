@@ -1,0 +1,4 @@
+# Exact versions of every package in the image, including the ones the pinned packages in requirements.txt pull in.
+# Written by:  powershell -File docker\verify.ps1 -WriteConstraints   (from "pip freeze" inside the first image built)
+# NOT FILLED IN YET: no image has been built. Until it is, the packages pulled in by the pinned ones are not fixed,
+# and docker\verify.ps1 reports that as a failure.

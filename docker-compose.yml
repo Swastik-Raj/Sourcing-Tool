@@ -1,0 +1,77 @@
+# Sourcing tool in a container. Every setting comes from the .env file beside this file (copy .env.docker.example).
+#
+#   docker compose build       build the image (runtime only)
+#   docker compose up -d       start;  then open http://127.0.0.1:8010/
+#   docker compose stop        stop;   docker compose start   starts it again
+#
+# One data folder, one running copy: never start a second container, or the native UI, on the same data folder.
+name: lcom
+
+services:
+  ui:
+    image: ${LCOM_IMAGE:-lcom-ui:local}
+    build:
+      context: .
+      target: runtime
+      labels:
+        com.zync.lcom: "1"
+    container_name: ${LCOM_NAME:-lcom-ui}
+    labels:
+      com.zync.lcom: "1"
+
+    # Reachable from this computer only. The same port number is used inside and outside, so the address in the
+    # browser is the one the UI expects; a request that names any other host or port is refused.
+    ports:
+      - "127.0.0.1:${LCOM_PORT:-8010}:${LCOM_PORT:-8010}"
+
+    # Keys and mail settings: read from .env when the container starts, never stored in the image.
+    env_file:
+      - .env
+    # These win over .env.
+    environment:
+      UI_PORT: "${LCOM_PORT:-8010}"
+      UI_HOST: "0.0.0.0"
+      UI_ALLOW_NON_LOOPBACK: "1"
+      UI_ENABLE_STUB: "0"
+      PROJECT_DIR: /data
+      UI_DATA_DIR: /data/ui_data
+      # Required: the pages show local time, and without a zone that would silently be UTC.
+      TZ: "${TZ:?Set TZ in .env to your time zone, for example TZ=Asia/Kolkata}"
+      # Tracing is off unless LCOM_TRACING=1 is set. OBS_ENABLED in .env has no effect in the container.
+      OBS_ENABLED: "${LCOM_TRACING:-0}"
+      # A Langfuse on this computer is reached through Docker's name for the host, never through localhost.
+      LANGFUSE_BASE_URL: "${LCOM_LANGFUSE_URL:-http://host.docker.internal:3000}"
+      LANGFUSE_HOST: "${LCOM_LANGFUSE_URL:-http://host.docker.internal:3000}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # All work lives in one folder on this computer. It survives the container being removed or rebuilt.
+    volumes:
+      - "${LCOM_DATA:-./data}:/data"
+
+    # The container changes nothing but the data folder: read-only system, no extra rights, an ordinary user.
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+
+    restart: "no"
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - lcom
+
+networks:
+  lcom:
+    name: ${LCOM_NAME:-lcom-ui}-net
+    labels:
+      com.zync.lcom: "1"

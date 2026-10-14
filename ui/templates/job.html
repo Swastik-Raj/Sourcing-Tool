@@ -20,5 +20,5 @@
 <h2>Log</h2>
 <p class="muted small">Wording differs from the raw log file.</p>
 <pre id="log" data-job="{{ job.id }}" data-offset="{{ offset }}" data-running="{{ 'yes' if job.status == 'running' else 'no' }}">{{ log }}</pre>
-<p><a href="/jobs">Back to jobs</a></p>
+<p>{% if job.command == 'search' %}<a href="/step/search?job={{ job.id }}">Open the search view</a> · {% endif %}<a href="/jobs">Back to jobs</a></p>
 {% endblock %}

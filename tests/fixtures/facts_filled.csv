@@ -1,0 +1,10 @@
+sku,fact_id,field,value,status,source
+TST-100,F1,product_type,Cat6 RJ45 inline coupler,page_read,filled in by the test
+TST-100,F2,connector_a,RJ45 female,page_read,filled in by the test
+TST-100,F3,connector_b,RJ45 female,page_read,filled in by the test
+TST-100,F4,shielding,shielded,sample_inspected,filled in by the test
+TST-100,F5,category_rating,Cat6,page_read,filled in by the test
+TST-100,F6,pack_contents,pack of 2,sample_inspected,filled in by the test
+TST-100,F7,mounting,panel mount,listing_title,filled in by the test
+TST-100,F8,certifications,RoHS,unverified,filled in by the test
+TST-100,F9,material,brass,unverified,filled in by the test

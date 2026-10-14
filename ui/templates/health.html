@@ -3,6 +3,10 @@
 {% block main %}
 <h1>Health</h1>
 <p class="muted">Checks that this computer is ready to run the steps. Python {{ python }}. Only whether a setting exists is shown, never its value.</p>
+<p>Times on these pages are shown in <strong>{{ zone }}</strong>, the time zone of the computer or container that runs this tool.</p>
+{% if changed %}
+<div class="notice warn"><strong>Reference files in your data folder that differ from the ones that came with this version:</strong> {{ changed|join(', ') }}. The copies in your data folder are the ones in use. To take this version's copy of a file, stop the tool, move your copy out of the data folder, and start the tool again.</div>
+{% endif %}
 
 <h2>Folders</h2>
 <div class="table-wrap">

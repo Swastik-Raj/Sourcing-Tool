@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge %}
+{% block main %}
+<h1>Emails</h1>
+<p>{{ step_text }}</p>
+{% include "_strip.html" %}
+{% if error %}<div class="notice danger" role="alert">{{ error }}</div>{% endif %}
+{% if current %}
+{% if plan %}
+<h2>{{ 'Check the TEST send' if plan.test else 'Check who will be emailed' }}</h2>
+{% if plan.test %}
+<div class="notice warn"><strong>This is a TEST.</strong> Every email below goes only to <strong>{{ plan.test_recipient }}</strong>, with [TEST] in its subject. No seller is contacted and nothing is marked as sent.</div>
+{% else %}
+<div class="notice warn"><strong>This sends real emails to sellers.</strong> It cannot be undone. Each seller below gets one email.</div>
+{% endif %}
+<div class="table-wrap">
+  <table class="stack words">
+    <caption>{{ plan.count }} email{{ 's' if plan.count != 1 }} would be sent</caption>
+    <thead><tr><th scope="col">Product</th><th scope="col">Seller</th><th scope="col">Goes to</th>{% if plan.test %}<th scope="col">Would really go to</th>{% endif %}</tr></thead>
+    <tbody>
+    {% for r in plan.recipients %}
+    <tr><th scope="row">{{ r.sku }}</th><td data-label="Seller">{{ r.seller }}</td><td data-label="Goes to">{{ r.to }}</td>
+      {% if plan.test %}<td data-label="Would really go to">{{ r.really or 'nobody: no address, inquiry form only' }}</td>{% endif %}</tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+<form method="post" action="/emails/send" class="confirm gap">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <input type="hidden" name="wf" value="{{ wf }}">
+  <input type="hidden" name="test_recipient" value="{{ plan.test_recipient }}">
+  <label for="confirm_count">Type the number of emails to confirm</label>
+  <div class="inline-fields">
+    <input type="text" id="confirm_count" name="confirm_count" inputmode="numeric" autocomplete="off" size="6" required>
+    <button type="submit" class="{{ 'btn' if plan.test else 'btn-danger' }}" {{ 'disabled' if running or not plan.count }}>{{ 'Send the TEST emails' if plan.test else 'Send to sellers' }}</button>
+    <a href="/step/emails?wf={{ wf }}">Back without sending</a>
+  </div>
+  <p class="muted small">The email agent counts again before it sends. If its count differs from yours, it sends nothing.</p>
+</form>
+
+{% else %}
+{% include "_joblog.html" %}
+{% if view.problem %}<div class="notice danger">{{ view.problem }}</div>{% endif %}
+{% if not view.known %}
+<div class="notice warn">The email agent's rules could not be read for this results file, so this page cannot list drafts or send. The file may be open in Excel, or it is not a search results file.</div>
+{% else %}
+<h2>Sellers the search recommended</h2>
+<p class="muted">Read from <code>{{ current.file }}</code> with the email agent's own rules. A recommendation is unverified until a person checks it.</p>
+{% if view.drafts %}
+<div class="table-wrap">
+  <table class="stack words">
+    <caption class="sr">One row per email that can be drafted</caption>
+    <thead><tr><th scope="col">Product</th><th scope="col">Seller</th><th scope="col">Address</th><th scope="col">Recorded so far</th></tr></thead>
+    <tbody>
+    {% for d in view.drafts %}
+    <tr><th scope="row">{{ d.sku }}</th><td data-label="Seller">{{ d.seller }}</td>
+      <td data-label="Address">{% if d.email %}{{ d.email }}{% else %}No address: use the seller's inquiry form, then record it below{% endif %}</td>
+      <td data-label="Recorded so far">{% if d.sent %}Marked sent {{ d.sent }}{% else %}Not sent{% endif %}{% if d.replied %}; reply recorded{% if d.status %} ({{ d.status|replace('_', ' ') }}){% endif %}{% endif %}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="card empty"><p><strong>Nothing in this results file can be drafted.</strong></p></div>
+{% endif %}
+{% if view.skipped %}
+<details>
+  <summary>Products with no email ({{ view.skipped|length }})</summary>
+  <ul class="list">{% for x in view.skipped %}<li><strong>{{ x.sku }}</strong> <span class="muted small">{{ x.reason }}</span></li>{% endfor %}</ul>
+</details>
+{% endif %}
+
+<h2>1. Write the drafts</h2>
+<form method="post" action="/emails/drafts">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <input type="hidden" name="wf" value="{{ wf }}">
+  <p><label class="plain"><input type="checkbox" name="near_miss" value="1" {{ 'disabled' if not view.near_miss_file }}> Also draft the near-miss candidates <span class="muted">(drafts only: the search did not recommend them, and they are never sent from here)</span></label></p>
+  <button type="submit" class="btn-primary" {{ 'disabled' if running or not view.drafts }}>Write the drafts</button>
+  <span class="muted small">Sends nothing and stores nothing. The drafts appear in the log on this page.</span>
+</form>
+
+<h2>2. Send</h2>
+<div class="table-wrap">
+  <table class="stack words">
+    <caption class="sr">Settings that sending needs</caption>
+    <thead><tr><th scope="col">Setting</th><th scope="col">Status</th></tr></thead>
+    <tbody>{% for name, is_set in view.settings %}<tr><th scope="row"><code>{{ name }}</code></th><td data-label="Status">{{ badge('Set', 'set') if is_set else badge('Not set', 'not-set') }}</td></tr>{% endfor %}</tbody>
+  </table>
+</div>
+<p class="muted small">Only whether a setting has a value is shown, never the value. The email agent itself refuses to send while the shipping address is unset or still its placeholder.</p>
+{% if view.send_missing %}<div class="notice warn">Sending is not possible yet: {{ view.send_missing|join(', ') }} {{ 'is' if view.send_missing|length == 1 else 'are' }} not set.</div>{% endif %}
+<form method="post" action="/emails/send/review" class="gap">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <input type="hidden" name="wf" value="{{ wf }}">
+  <button type="submit" class="btn-primary" {{ 'disabled' if view.send_missing or not view.to_send }}>Review {{ view.to_send|length }} email{{ 's' if view.to_send|length != 1 }} to sellers</button>
+  <span class="muted small">Nothing is sent yet. The next page lists every recipient and asks you to type the count.</span>
+</form>
+<form method="post" action="/emails/send/review" class="confirm gap">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <input type="hidden" name="wf" value="{{ wf }}">
+  <label for="test_recipient">Or send a TEST of every draft to one address of your own</label>
+  <div class="inline-fields">
+    <input type="text" id="test_recipient" name="test_recipient" inputmode="email" autocomplete="off" size="32" required>
+    <button type="submit" class="btn" {{ 'disabled' if view.send_missing or not view.drafts }}>Review the TEST send</button>
+  </div>
+</form>
+
+<h2>3. Record what happened</h2>
+{% if view.drafts %}
+<form method="post" action="/emails/mark" class="confirm">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <input type="hidden" name="wf" value="{{ wf }}">
+  <label for="mark_sku">A seller's inquiry form was submitted by hand</label>
+  <div class="inline-fields">
+    <select id="mark_sku" name="sku" required><option value="">Choose a product</option>{% for d in view.drafts %}<option value="{{ d.sku }}">{{ d.sku }} ({{ d.seller }})</option>{% endfor %}</select>
+    <label class="plain"><input type="checkbox" name="confirm" value="1" required> I submitted this form myself</label>
+    <button type="submit" class="btn" {{ 'disabled' if running }}>Record it as sent</button>
+  </div>
+</form>
+<form method="post" action="/emails/reply" class="confirm gap">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <input type="hidden" name="wf" value="{{ wf }}">
+  <label for="reply_sku">A seller replied</label>
+  <select id="reply_sku" name="sku" required><option value="">Choose a product</option>{% for d in view.drafts %}<option value="{{ d.sku }}">{{ d.sku }} ({{ d.seller }})</option>{% endfor %}</select>
+  <label for="reply" class="gap">Paste the seller's reply</label>
+  <textarea id="reply" name="reply" rows="8" required autocomplete="off"></textarea>
+  <p class="muted small">The email agent sends this text to the AI service to summarise it, checks every number against the text, and stores the result. That call costs a little money.</p>
+  <button type="submit" class="btn" {{ 'disabled' if running }}>Record the reply</button>
+</form>
+{% else %}
+<p class="muted">There is no seller to record anything for.</p>
+{% endif %}
+{% endif %}
+{% endif %}
+{% endif %}
+{% endblock %}

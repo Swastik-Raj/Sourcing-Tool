@@ -20,6 +20,8 @@ from ui.config import PROGRAM_FILES, REFERENCE_FILES    # noqa: E402  (one list,
 DATA = Path("/data")
 ZONES = Path("/usr/share/zoneinfo")
 SOURCE_MARKS = (".git", "ui", "run_ui.py", "Dockerfile")    # any of these in the data folder means it is the source folder
+PROXY_EXCEPTIONS = ("localhost", "127.0.0.1", "host.docker.internal")    # reached directly, never through a proxy
+PROXY_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
 
 
 class Refused(Exception):
@@ -104,6 +106,23 @@ def install(app: Path, data: Path, say=print) -> None:
             say(f"NOTE: your {name} differs from the one in this version. Yours is kept and used. The Health page lists these files.")
 
 
+def merge_no_proxy(environ) -> tuple:
+    """A proxy set for the internet must not catch this container's own addresses (the UI itself, a Langfuse on this
+    computer). Both spellings of NO_PROXY get one list: every entry the person set, in their order (NO_PROXY's first),
+    then the names in PROXY_EXCEPTIONS that are missing, each once. Returns (entries kept, names added): counts only,
+    because the entries are the person's own settings."""
+    kept, seen = [], set()
+    for name in ("NO_PROXY", "no_proxy"):
+        for entry in (environ.get(name) or "").split(","):
+            entry = entry.strip()
+            if entry and entry.lower() not in seen:
+                kept.append(entry)
+                seen.add(entry.lower())
+    added = [h for h in PROXY_EXCEPTIONS if h not in seen]
+    environ["NO_PROXY"] = environ["no_proxy"] = ",".join(kept + added)
+    return len(kept), len(added)
+
+
 def main(data: Path = DATA, mounted=is_mounted, zones: Path = ZONES, start=None) -> None:
     try:
         check_zone(os.environ.get("TZ"), zones)
@@ -111,15 +130,19 @@ def main(data: Path = DATA, mounted=is_mounted, zones: Path = ZONES, start=None)
         install(APP, data)
     except Refused as e:
         sys.exit(f"NOT STARTED: {e}")
+    kept, added = merge_no_proxy(os.environ)
+    proxies = sorted({n.upper() for n in PROXY_NAMES if os.environ.get(n)})      # names only: a proxy address can hold a password
+    print(f"proxy settings present: {', '.join(proxies) or 'none'}; reached directly: {kept} name(s) from your settings "
+          f"and {added} added ({', '.join(PROXY_EXCEPTIONS)})", flush=True)
     # These five belong to the container, whatever the settings file says: where the data is, and how the UI listens.
     os.environ.update(PROJECT_DIR=str(data), UI_DATA_DIR=str(data / "ui_data"), UI_SHIPPED_DIR=str(APP), UI_HOST="0.0.0.0",
                       UI_ALLOW_NON_LOOPBACK="1")
     os.environ.pop("UI_ENABLE_STUB", None)                               # the test stub is not in this image
     print("data folder ready, starting the UI", flush=True)
-    if start is None:
-        import run_ui
-        start = run_ui.main
-    start()
+    if start is None:      # the UI runs as a fresh process started with exactly this environment (so /proc shows what it really has)
+        os.execv(sys.executable, [sys.executable, str(APP / "run_ui.py")])
+    else:
+        start()
 
 
 if __name__ == "__main__":

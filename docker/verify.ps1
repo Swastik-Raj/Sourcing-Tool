@@ -58,6 +58,9 @@ $Protected = @("sourcing_agent.py", "email_agent.py", "decision_agent.py", "orde
                "test_order_sheet.py", "test_content_agent.py", "test_observability.py",
                "email_state.json", "decision_state.json", "approvals_log.jsonl", "approved_orders.csv", "approved_orders.json", "product_facts.csv")
 $RealFolders = @("Excel Output Sheets", "Reports", "Order Sheets", "Walmart Listings", "Uploads", "ui_data", "data")
+# The single approved change to a protected file (2026-10-14: workflow_id treats \ like /, so a Windows path gives the same
+# id on Linux). V24 accepts this file differing from a run's start only when it now has exactly this hash.
+$ApprovedChanges = @{ "observability.py" = "d0b4b1ee38e0ac52b2f31000c871512c8a989c27f169a54947f2251ad1d2a1b4" }
 $Results = New-Object System.Collections.ArrayList
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 $script:Stopped = ""
@@ -77,17 +80,19 @@ function Fail($detail) { $script:Ok = $false; $script:Detail = $detail }
 function Info($detail) { $script:Ok = $null; $script:Detail = $detail }
 function Judge($problems, $good) { if (@($problems).Count -gt 0) { Fail (@($problems) -join "; ") } else { Pass $good } }
 
-function Check($id, $check, [scriptblock]$body) {
-    if ($Mode -eq "stage" -and $StageOf[$id] -ne [int]$Stage) { return }
-    if ($Mode -eq "only" -and $Only -notcontains $id) { return }
+function Check($checkId, $checkName, [scriptblock]$body) {
+    # (parameter names must not repeat a script variable: PowerShell ignores case, so a parameter $id would hide the run's $Id
+    # inside every check body)
+    if ($Mode -eq "stage" -and $StageOf[$checkId] -ne [int]$Stage) { return }
+    if ($Mode -eq "only" -and $Only -notcontains $checkId) { return }
     if ($Mode -eq "cleanup" -or $script:Stopped) { return }
     $script:Ok = $false; $script:Detail = "the check set no result"
     try { & $body | Out-Null } catch { Fail ("could not run: " + $_.Exception.Message) }
-    Add-Result $id $check $script:Ok $script:Detail
+    Add-Result $checkId $checkName $script:Ok $script:Detail
     if ($Mode -eq "stage" -and $script:Ok -eq $false) {
-        $script:Stopped = "$id $check"
+        $script:Stopped = "$checkId $checkName"
         Say ""
-        Say "STAGE $Stage STOPPED at $id ($check): $($script:Detail)"
+        Say "STAGE $Stage STOPPED at $checkId ($checkName): $($script:Detail)"
     }
 }
 
@@ -110,13 +115,27 @@ function Dk {
     return $out
 }
 
-function Invoke-Compose($dir, $project) {
-    $out = & docker.exe compose -p $project --project-directory $dir -f "$dir\docker-compose.yml" --env-file "$dir\.env" @args
-    if ($LASTEXITCODE -ne 0) { throw ("docker compose " + ($args -join " ") + " ended with code $LASTEXITCODE") }
+function Invoke-Compose {
+    # folder, project, then the compose arguments. No named parameters on purpose: PowerShell would bind a docker flag such
+    # as -d to a parameter whose name starts with d.
+    $dir = $args[0]; $project = $args[1]
+    $rest = @($args | Select-Object -Skip 2)          # always a list: one word such as "stop" would otherwise be spread into letters
+    $out = & docker.exe compose -p $project --project-directory $dir -f "$dir\docker-compose.yml" --env-file "$dir\.env" @rest
+    if ($LASTEXITCODE -ne 0) { throw ("docker compose " + (@($rest) -join " ") + " ended with code $LASTEXITCODE") }
     return $out
 }
 
 function Compose { return (Invoke-Compose $Proj "lcom-verify" @args) }
+
+function Split-Docker {
+    # exit code, output lines and error lines of one docker command, kept apart; never throws
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { $all = @(& docker.exe @args 2>&1) } finally { $ErrorActionPreference = $old }
+    return [pscustomobject]@{ Code = $LASTEXITCODE
+                              Out = @($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" })
+                              Err = @($all | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" }) }
+}
 
 function Quiet-Docker {
     # stdout of a docker command whose error text is not wanted; never throws. (In Windows PowerShell, redirecting a
@@ -165,6 +184,8 @@ function Get-Tree($folder) {
     if (-not (Test-Path -LiteralPath $folder)) { return @() }
     return @(Get-ChildItem -LiteralPath $folder -Recurse -File | ForEach-Object { "{0}|{1}" -f $_.FullName.Substring($folder.Length + 1), (Get-FileHash -LiteralPath $_.FullName).Hash } | Sort-Object)
 }
+
+function Get-FileSha($path) { if (Test-Path -LiteralPath $path) { return (Get-FileHash -LiteralPath $path).Hash.ToLower() } else { return "absent" } }
 
 function Get-TextHash($text) {
     $sha = [System.Security.Cryptography.SHA256]::Create()
@@ -217,7 +238,8 @@ if (($Mode -eq "stage" -and $Stage -eq "1") -or $Mode -eq "only") {
         exit 1
     }
     $rootDir = if ($Root) { (Resolve-Path $Root).Path } else { $Real }
-    $Run = [pscustomobject]@{ Id = (Get-Date -Format "yyyyMMddHHmmss"); Root = $rootDir; Port = (Get-FreePort); Done = @(); Stopped = ""; Before = $null; Others = $null }
+    $Run = [pscustomobject]@{ Id = (Get-Date -Format "yyyyMMddHHmmss"); Root = $rootDir; Port = (Get-FreePort); Done = @(); Stopped = ""; Before = $null; Others = $null
+                              Head = ""; ConstraintsStart = ""; ConstraintsWritten = ""; RecordedLater = "" }
 }
 else {
     if (-not $open) { Say "There is no open run. Start one with -Stage 1. Nothing was changed."; exit 1 }
@@ -236,6 +258,7 @@ $Ctx = "$Work\ctx"; $Proj = "$Work\compose"; $Data = "$Work\data"
 $Image = "lcom-ui:verify-$Id"; $TestImage = "lcom-ui:verify-test-$Id"; $ProbeImage = "lcom-ui:verify-ctx-$Id"
 $Needle = "sk-ant-FAKE-verify-PLANTED-$Id"                                  # planted in the build context; must never be in an image
 $StateNeedle = "planted-state-file-$Id"
+$ProxyUser = "fakeproxyuser$Id"; $ProxyPass = "FAKE-proxy-pass-$Id"          # in the fake proxy settings; must appear nowhere
 $State = @{ Built = $false; Up = $false; Stem = "sourcing_results_20260101_100000" }
 
 # ---------- preparations (each runs once, when a check first needs it; a later stage finds them done) ----------
@@ -251,7 +274,8 @@ function New-FakeEnv($dir, $port, $container, $data, [switch]$NoZone) {
                 'SHIPPING_ADDRESS="Test Receiving\n1 Test Street\nTestville, TX 00000"', "BRAND_NAME=TestBrand", 'SENDER_NAME="Test Sender"',
                 "OBS_ENABLED=1", "LANGFUSE_BASE_URL=http://localhost:3000", "LANGFUSE_HOST=http://localhost:3000", "LANGFUSE_PUBLIC_KEY=pk-lf-FAKE-verify",
                 "LANGFUSE_SECRET_KEY=sk-lf-FAKE-verify", "UI_HOST=10.9.8.7", "UI_ENABLE_STUB=1", "PROJECT_DIR=/tmp/elsewhere",
-                "HTTPS_PROXY=http://127.0.0.1:9", "HTTP_PROXY=http://127.0.0.1:9")
+                "HTTPS_PROXY=http://${ProxyUser}:${ProxyPass}@127.0.0.1:9", "HTTP_PROXY=http://${ProxyUser}:${ProxyPass}@127.0.0.1:9",
+                "NO_PROXY=internal.example")
     Write-Text "$dir\.env" (($lines -join "`n") + "`n")
     Copy-Item -LiteralPath (Join-Path $Root "docker-compose.yml") -Destination "$dir\docker-compose.yml" -Force
 }
@@ -321,21 +345,48 @@ function Start-Ui {
 
 function Finish-Run {
     # V24: the real project and other projects' containers and volumes are as they were; then only this run's objects go.
+    # Pass or fail rests on the hashes of the protected files, the real state files and output folders, and
+    # docker\constraints.txt. git status and HEAD are secondary evidence: reported, never a failure on their own.
     $after = Get-RealState
-    $changed = @($Run.Before.PSObject.Properties | Where-Object { $_.Value -ne (Prop $after $_.Name) } | ForEach-Object { $_.Name })
+    $gitKey = "git status --short"
+    $changed = @($Run.Before.PSObject.Properties | Where-Object { $_.Name -ne $gitKey -and $_.Value -ne (Prop $after $_.Name) } | ForEach-Object { $_.Name })
+    $approvedNote = @()
+    foreach ($name in $ApprovedChanges.Keys) {
+        $now = Get-FileSha (Join-Path $Real $name)
+        $approvedNote += "$name is " + $(if ($now -eq $ApprovedChanges[$name]) { "the approved version (sha256 $now)" } else { "NOT the approved version (sha256 $now)" })
+        if ($changed -contains $name -and $now -eq $ApprovedChanges[$name]) { $changed = @($changed | Where-Object { $_ -ne $name }) }   # the one approved exception
+    }
+    $approvedNote = $approvedNote -join "; "
+    $cNow = Get-FileSha (Join-Path $Root "docker\constraints.txt")
+    $cStart = Prop $Run "ConstraintsStart"; $cWritten = Prop $Run "ConstraintsWritten"
+    if ($cStart -and $cNow -eq $cStart) { $cNote = "docker\constraints.txt is unchanged since the run started" }
+    elseif ($cWritten -and $cNow -eq $cWritten) { $cNote = "docker\constraints.txt differs from the start only by what this run wrote with -WriteConstraints (same hash as recorded then)" }
+    else { $changed += "docker\constraints.txt"; $cNote = "docker\constraints.txt changed, and not to what this run wrote" }
+    $headStart = Prop $Run "Head"; $headNow = "$(& git -C $Real rev-parse HEAD)".Trim()
+    $statusNow = @(& git -C $Real status --short)
+    if ($headStart -and $headNow -ne $headStart) { $gitNote = "HEAD changed during the run: $headStart -> $headNow (a commit made outside this run); git status is not compared" }
+    elseif ((Prop $Run.Before $gitKey) -eq (Prop $after $gitKey)) { $gitNote = "HEAD unchanged; git status --short is the same as at the start" }
+    else { $gitNote = "HEAD unchanged; git status --short differs from the start (secondary evidence, not a failure). Now: " + ($statusNow -join "; ") }
     $othersAfter = Get-Others
     $sameContainers = Same-List $Run.Others.Containers $othersAfter.Containers
     $sameVolumes = Same-List $Run.Others.Volumes $othersAfter.Volumes
     Say ""
     Say "The real project, before (stage 1) and now (sha256, first 16 characters; values are never read into this report):"
-    foreach ($p in $Run.Before.PSObject.Properties) { Say ("  {0,-28} {1}  ->  {2}  {3}" -f $p.Name, $p.Value, (Prop $after $p.Name), $(if ($p.Value -eq (Prop $after $p.Name)) { "same" } else { "CHANGED" })) }
-    Say "Containers that are not this tool's (name and state), before:  $(@($Run.Others.Containers) -join ', ')"
-    Say "Containers that are not this tool's (name and state), now:     $(@($othersAfter.Containers) -join ', ')"
+    foreach ($p in $Run.Before.PSObject.Properties) {
+        $tag = if ($p.Name -eq $gitKey) { "(secondary)" } elseif ($p.Value -eq (Prop $after $p.Name)) { "same" } else { "CHANGED" }
+        Say ("  {0,-28} {1}  ->  {2}  {3}" -f $p.Name, $p.Value, (Prop $after $p.Name), $tag)
+    }
+    Say "  $cNote"
+    Say "  approved exception: $approvedNote"
+    Say "  $gitNote"
+    if (Prop $Run "RecordedLater") { Say "  Note: $($Run.RecordedLater)" }
+    Say "Containers that are not this tool's (name | image | state), before:  $(@($Run.Others.Containers) -join ', ')"
+    Say "Containers that are not this tool's (name | image | state), now:     $(@($othersAfter.Containers) -join ', ')"
     Say "Volumes that are not this tool's, before:  $(@($Run.Others.Volumes) -join ', ')"
     Say "Volumes that are not this tool's, now:     $(@($othersAfter.Volumes) -join ', ')"
     $ok = $changed.Count -eq 0 -and $sameContainers -and $sameVolumes
-    Add-Result "V24" "after" $ok $(if ($ok) { "the real project's {0} items are unchanged; containers and volumes of other projects are identical before and after" -f @($Run.Before.PSObject.Properties).Count }
-                                   else { "changed in the real project: " + ($changed -join ", ") + "; other containers identical: $sameContainers; other volumes identical: $sameVolumes" })
+    Add-Result "V24" "after" $ok $(if ($ok) { "all {0} recorded items (protected files, real state files, output folders) are unchanged or the approved exception; {1}; {2}; containers and volumes of other projects identical; {3}" -f (@($Run.Before.PSObject.Properties).Count - 1), $approvedNote, $cNote, $gitNote }
+                                   else { "changed: " + ($changed -join ", ") + "; other containers identical: $sameContainers; other volumes identical: $sameVolumes; $gitNote" })
 
     $containers = @(& docker.exe ps -a --filter "label=$Label" --format "{{.Names}}")
     $images = @(& docker.exe images --filter "label=$Label" --format "{{.Repository}}:{{.Tag}}")
@@ -382,6 +433,8 @@ if ($Mode -eq "only" -or ($Mode -eq "stage" -and $Stage -eq "1")) {
 if ($Mode -eq "only" -or ($Mode -eq "stage" -and $Stage -eq "1")) {
     $Run.Before = Get-RealState
     $Run.Others = Get-Others
+    $Run.Head = "$(& git -C $Real rev-parse HEAD)".Trim()
+    $Run.ConstraintsStart = Get-FileSha (Join-Path $Root "docker\constraints.txt")
     Add-Result "V02" "before" $null ("recorded {0} items of the real project; containers not from this tool: {1}; volumes not from this tool: {2}" -f @($Run.Before.PSObject.Properties).Count, (@($Run.Others.Containers) -join ", "), (@($Run.Others.Volumes) -join ", "))
     if ($Mode -eq "stage") { Save-Run }
 }
@@ -431,6 +484,7 @@ try {
         if ($WriteConstraints) {
             $head = @(Get-Content $pinsFile | Where-Object { $_ -like "#*" -and $_ -notlike "# NOT FILLED IN*" -and $_ -notlike "# and docker*" })
             Write-Text $pinsFile ((@($head) + $freeze) -join "`n")
+            $Run.ConstraintsWritten = Get-FileSha $pinsFile                 # V24 accepts this file changing only to exactly this
             Copy-Item -LiteralPath $pinsFile -Destination "$Ctx\docker\constraints.txt" -Force
             foreach ($i in @($Image, $TestImage)) { & docker.exe rmi $i | Out-Null }
             $State.Built = $false
@@ -469,13 +523,13 @@ try {
         foreach ($pair in @(@($Image, "runtime"), @($TestImage, "test"))) {
             $tar = "$Work\$($pair[1]).tar"
             Dk save $pair[0] -o $tar | Out-Null
-            $r = Helper scan $tar $pair[1] $Needle $StateNeedle
+            $r = Helper scan $tar $pair[1] $Needle $StateNeedle $ProxyUser $ProxyPass
             Remove-Item -LiteralPath $tar -Force
             if (Prop $r "error") { $p += "$($pair[1]): the scan failed: $($r.error)" }
             elseif (-not $r.ok) { $p += "$($pair[1]): forbidden names: " + (@($r.bad_names) -join ", ") + "; planted text found in: " + (@($r.needle_hits) -join ", ") }
             else { $told += "{0}: {1} layers, {2} files" -f $pair[1], $r.layers, $r.files }
         }
-        Judge $p ("no .env, state file, output folder or planted text in any layer or in the image settings (" + ($told -join "; ") + ")")
+        Judge $p ("no .env, state file, output folder, planted text or fake proxy credentials in any layer or in the image settings (" + ($told -join "; ") + ")")
     }
 
     Check "V08" "image-config" {
@@ -587,6 +641,35 @@ print(json.dumps({n: (hashlib.sha256(os.environ[n].encode('utf-8')).hexdigest() 
         if ($differ.Count) { $p += "these settings differ between the container and python-dotenv's reading of the same file (names only): " + ($differ -join ", ") }
         if ($notSet.Count) { $p += "the Health page does not show these as Set: " + ($notSet -join ", ") }
         Judge $p ("{0} settings (double quotes, single quotes with `$ and #, \n, spaces) are identical by SHA-256 to python-dotenv's reading; Health shows them as Set" -f $EnvNames.Count)
+        # Information only, no pass or fail: how compose and python-dotenv read four shapes the settings above do not use.
+        # Each shape gets its own made-up settings file, so one shape that compose refuses cannot hide another.
+        try {
+            $shapes = [ordered]@{
+                "a multi-line value in double quotes" = @("SHAPE_MULTILINE", "SHAPE_MULTILINE=`"line one`nline two`"")
+                "a `${...} reference to another line" = @("SHAPE_REF", "SHAPE_REF_BASE=base-value`nSHAPE_REF=`${SHAPE_REF_BASE}-suffix")
+                "an export prefix" = @("SHAPE_EXPORT", "export SHAPE_EXPORT=exported-value")
+                "an unquoted `$" = @("SHAPE_DOLLAR", "SHAPE_DOLLAR=pa`$word")
+            }
+            $i = 0
+            foreach ($shape in $shapes.Keys) {
+                $i++
+                $varName, $line = $shapes[$shape]
+                $dir = "$Work\shape$i"
+                New-Item -ItemType Directory -Force $dir | Out-Null
+                Copy-Item -LiteralPath (Join-Path $Root "docker-compose.yml") -Destination "$dir\docker-compose.yml" -Force
+                Write-Text "$dir\.env" ("TZ=$Zone`nLCOM_DATA=$($Data -replace '\\', '/')`nLCOM_NAME=lcom-verify-shape$i`nLCOM_IMAGE=$Image`n$line`n")
+                $r = Split-Docker compose -p "lcom-verify-shape$i" --project-directory $dir -f "$dir\docker-compose.yml" --env-file "$dir\.env" config --format json
+                $warn = (@($r.Err) | Where-Object { $_ }) -join " "
+                if ($r.Code -ne 0) { $composeSays = "compose refused the file ($warn)" }
+                else {
+                    $v = Prop (Prop (($r.Out -join "`n" | ConvertFrom-Json).services.ui) "environment") $varName
+                    $composeSays = $(if ($null -eq $v) { "(not set)" } else { ConvertTo-Json "$v" -Compress }) + $(if ($warn) { " with the warning: $warn" } else { "" })
+                }
+                $dot = Prop (Helper envvalues "$dir\.env" $varName) $varName
+                Say ("  V13 observation, {0}: compose gives {1}; python-dotenv gives {2}" -f $shape, $composeSays, $(if ($null -eq $dot) { "(not set)" } else { ConvertTo-Json "$dot" -Compress }))
+            }
+        }
+        catch { Say "  V13 observations could not run: $($_.Exception.Message)" }
     }
 
     # ================= stage 3: V14-V19 =================
@@ -599,6 +682,10 @@ print(json.dumps({n: (hashlib.sha256(os.environ[n].encode('utf-8')).hexdigest() 
         else { Fail ((@($r.steps) | Where-Object { -not $_.ok } | ForEach-Object { $_.step + " (" + $_.detail + ")" }) -join "; ") }
     }
 
+    $AppNameCode = @'
+import json, os
+print(json.dumps({'app_name': os.environ.get('UI_APP_NAME'), 'sender': os.environ.get('SENDER_NAME')}))
+'@
     Check "V15" "survives" {
         Start-Ui
         $before = Get-Tree $Data
@@ -616,7 +703,40 @@ print(json.dumps({n: (hashlib.sha256(os.environ[n].encode('utf-8')).hexdigest() 
         if (-not (Same-List $before $afterRecreate)) { $p += "files changed across remove and recreate" }
         if (-not $before.Count) { $p += "the data folder is empty, so there was nothing to compare" }
         if (-not $page.ok) { $p += "after recreate the pages lost something: " + (@($page.problems) -join ", ") }
-        Judge $p ("{0} files on the host have the same hashes after stop/start and after remove/recreate; the UI still shows the results file, the request, the approval and the order sheet" -f $before.Count)
+        # Does a plain `docker compose up -d` pick up a changed settings file? Settled by doing it (DOCKER.md says what this finds).
+        $marker = "Verify Settings Change $Id"
+        $first = (In-Container $AppNameCode).app_name
+        Write-Text "$Proj\.env" ([System.IO.File]::ReadAllText("$Proj\.env") + "UI_APP_NAME=$marker`n")
+        Compose up -d --no-build | Out-Null
+        Wait-Healthy
+        $plain = (In-Container $AppNameCode).app_name
+        $plainPage = (Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$($Run.Port)/health").Content -match [regex]::Escape($marker)
+        $forced = "not needed"
+        if ($plain -ne $marker) {
+            Compose up -d --no-build --force-recreate | Out-Null
+            Wait-Healthy
+            $forced = if ((In-Container $AppNameCode).app_name -eq $marker) { "picked it up" } else { "did NOT pick it up" }
+        }
+        if ($first -eq $marker) { $p += "the new setting was already there before the settings file changed" }
+        if ($plain -ne $marker -and $forced -ne "picked it up") { $p += "neither plain 'up -d' nor 'up -d --force-recreate' picked up a changed settings file" }
+        if ($plain -eq $marker -and -not $plainPage) { $p += "plain 'up -d' set the new value in the container, but the page does not show it" }
+        $settled = if ($plain -eq $marker) { "plain 'docker compose up -d' DID pick up an ADDED setting (container recreated; page shows it)" } else { "plain 'docker compose up -d' did NOT pick up an added setting; 'up -d --force-recreate' $forced" }
+        # Then CHANGE settings that already exist: SENDER_NAME (there from the start) and UI_APP_NAME (added above), plain `up -d` again.
+        $marker2 = "Verify Settings Changed Again $Id"; $sender2 = "Verify Sender $Id"
+        $before2 = In-Container $AppNameCode
+        $text = [System.IO.File]::ReadAllText("$Proj\.env") -replace "(?m)^UI_APP_NAME=.*$", "UI_APP_NAME=$marker2"
+        $text = $text -replace "(?m)^SENDER_NAME=.*$", "SENDER_NAME=`"$sender2`""
+        Write-Text "$Proj\.env" $text
+        Compose up -d --no-build | Out-Null
+        Wait-Healthy
+        $after2 = In-Container $AppNameCode
+        $page2 = (Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$($Run.Port)/health").Content -match [regex]::Escape($marker2)
+        $changedOk = $after2.app_name -eq $marker2 -and $after2.sender -eq $sender2
+        if ($before2.sender -eq $sender2 -or $before2.app_name -eq $marker2) { $p += "a changed value was already there before the settings file changed" }
+        if (-not $changedOk) { $p += "plain 'up -d' did not pick up CHANGED settings (container shows the old values)" }
+        if ($changedOk -and -not $page2) { $p += "plain 'up -d' changed the value in the container, but the page does not show it" }
+        $settled += $(if ($changedOk -and $page2) { "; and DID pick up CHANGED existing settings (SENDER_NAME and UI_APP_NAME new in the container; the page shows the new name)" } else { "; did NOT pick up changed existing settings" })
+        Judge $p ("{0} files on the host have the same hashes after stop/start and after remove/recreate; the UI still shows the results file, the request, the approval and the order sheet. Settings file: {1}" -f $before.Count, $settled)
     }
 
     $SingleCode = @'
@@ -655,30 +775,96 @@ print(json.dumps({'tz': os.environ.get('TZ'), 'offset': time.strftime('%z')}))
         Judge $p "with TZ=$Zone the container's offset is $ZoneOffset and the Health page says $(Prop $page 'zone')"
     }
 
+    # Runs inside the container as the container user. It takes the UI process's own environment from /proc (the UI is
+    # started by the entrypoint as a new process carrying the merged NO_PROXY), switches to exactly that environment, and
+    # makes its requests the way the libraries do by default, with the settings file's dead proxy still set. It returns
+    # setting NAMES, the NO_PROXY lists (made-up test values) and outcomes; never a proxy value.
     $TraceCode = @'
 import json, os, socket, urllib.request
-out = {'obs': os.environ.get('OBS_ENABLED'), 'base': os.environ.get('LANGFUSE_BASE_URL'), 'host': os.environ.get('LANGFUSE_HOST'), 'get': 'not tried'}
+def ui_pid():
+    for pid in os.listdir('/proc'):
+        if pid.isdigit():
+            try:
+                parts = open('/proc/%s/cmdline' % pid, 'rb').read().split(b'\0')
+            except OSError:
+                continue
+            if any(p.endswith(b'run_ui.py') for p in parts):
+                return pid
+pid = ui_pid()
+env = {}
+if pid:
+    raw = open('/proc/%s/environ' % pid, 'rb').read().decode('utf-8', 'replace')
+    env = dict(item.split('=', 1) for item in raw.split('\0') if '=' in item)
+out = {'pid': pid, 'obs': env.get('OBS_ENABLED'), 'base': env.get('LANGFUSE_BASE_URL'), 'host': env.get('LANGFUSE_HOST'),
+       'no_proxy': env.get('NO_PROXY'), 'no_proxy_lower': env.get('no_proxy'),
+       'proxy_names': sorted(n for n in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy') if env.get(n))}
 try:
     out['resolves'] = bool(socket.gethostbyname('host.docker.internal'))
 except OSError:
     out['resolves'] = False
-if DO_GET:
+os.environ.clear()
+os.environ.update(env)
+def attempt(fn):
     try:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open((out['base'] or '').rstrip('/') + '/api/public/health', timeout=4) as r:
-            out['get'] = 'reachable (HTTP %d)' % r.status
+        return 'direct %s' % fn()
     except Exception as e:
-        out['get'] = 'not reachable (%s)' % type(e).__name__
+        reason = getattr(e, 'reason', None)
+        refused = isinstance(reason, ConnectionRefusedError) or isinstance(e, ConnectionRefusedError) or 'refused' in str(e).lower()
+        return 'refused by the dead proxy' if refused else 'failed (%s)' % type(e).__name__
+def by_urllib(url):
+    with urllib.request.build_opener().open(url, timeout=4) as r:
+        return r.status
+import httpx, requests
+local = 'http://127.0.0.1:' + env.get('UI_PORT', '8000') + '/static/app.css'
+out['local'] = {'urllib': attempt(lambda: by_urllib(local)), 'httpx': attempt(lambda: httpx.get(local, timeout=4).status_code),
+                'requests': attempt(lambda: requests.get(local, timeout=4).status_code)}
+out['langfuse_bypass'] = bool(urllib.request.proxy_bypass_environment('host.docker.internal'))
+out['langfuse_get'] = attempt(lambda: by_urllib((env.get('LANGFUSE_BASE_URL') or '').rstrip('/') + '/api/public/health')) if DO_GET else 'not tried'
+out['control_bypass'] = bool(urllib.request.proxy_bypass_environment('example.invalid'))
+out['control_get'] = attempt(lambda: by_urllib('http://example.invalid/'))
 print(json.dumps(out))
 '@
-    Check "V18" "tracing-default" {
+    Check "V18" "tracing-and-proxy" {
         Start-Ui
         $t = In-Container ($TraceCode.Replace("DO_GET", $(if ($NoLangfuseGet) { "False" } else { "True" })))
+        $merged = "internal.example,localhost,127.0.0.1,host.docker.internal"
         $p = @()
         if ($t.obs -ne "0") { $p += "OBS_ENABLED is '$($t.obs)' although the settings file says 1 and LCOM_TRACING is not set" }
         if ($t.base -ne "http://host.docker.internal:3000" -or $t.host -ne "http://host.docker.internal:3000") { $p += "the Langfuse address is not http://host.docker.internal:3000 in both variables (the settings file says localhost)" }
         if (-not $t.resolves) { $p += "host.docker.internal does not resolve inside the container" }
-        Judge $p ("tracing off although the settings file switches it on; both Langfuse addresses are http://host.docker.internal:3000; the name resolves; one read-only GET of the health address: $($t.get). No trace was sent.")
+        # step 1: the UI process's own environment
+        if (-not $t.pid) { $p += "the UI process (run_ui.py) was not found" }
+        if ($t.no_proxy -ne $merged -or $t.no_proxy_lower -ne $merged) { $p += "the UI process's NO_PROXY and no_proxy are not exactly the person's entry followed by the three added names: [$($t.no_proxy)] [$($t.no_proxy_lower)]" }
+        if ((@($t.proxy_names) -join ",") -ne "HTTPS_PROXY,HTTP_PROXY") { $p += "the dead proxy is not set in the UI process (names: $(@($t.proxy_names) -join ', ')), so the proof would prove nothing" }
+        # step 2: this container's own address, by urllib, httpx and requests, with that environment
+        foreach ($lib in @("urllib", "httpx", "requests")) { if ((Prop $t.local $lib) -ne "direct 200") { $p += "${lib} to 127.0.0.1: $(Prop $t.local $lib)" } }
+        # step 3: Langfuse on this computer, bypassing the proxy (the one read-only GET)
+        if (-not $t.langfuse_bypass) { $p += "host.docker.internal would go through the proxy" }
+        if (-not $NoLangfuseGet -and $t.langfuse_get -ne "direct 200") { $p += "the GET of Langfuse's health address: $($t.langfuse_get)" }
+        # step 4: the control: everything else still goes to the proxy
+        if ($t.control_bypass -or $t.control_get -ne "refused by the dead proxy") { $p += "a request to example.invalid did not go to the proxy: $($t.control_get)" }
+        # the fake proxy credentials appear nowhere: container log (the entrypoint's lines included), stored job logs, pages
+        # an address with a user name and password, planted in a real job's output (the email agent's drafts print seller
+        # names and listing addresses), and the container's own proxy setting next to it: masked in the stored log and on pages
+        $plantUser = "plantuser$Id"; $plantPass = "FAKE-plant-pass-$Id"
+        $plant = Helper plantjob $Run.Port $Data $plantUser $plantPass "http://${ProxyUser}:${ProxyPass}@127.0.0.1:9"
+        if (Prop $plant "error") { $p += "the planted address: $($plant.error)" }
+        elseif (-not $plant.ok) { $p += "a planted address was not masked: job $($plant.job); masked addresses in the log $($plant.masked_addresses_in_log); found in the stored log [$(@($plant.found_in_stored_log) -join ',')], on pages [$(@($plant.found_on_pages) -join ',')]" }
+        $needles = @($ProxyUser, $ProxyPass, $plantUser, $plantPass)
+        $log = (@(cmd /c "docker logs $Name 2>&1") -join "`n")
+        if (@($needles | Where-Object { $log.Contains($_) }).Count) { $p += "the container log holds the fake proxy credentials" }
+        $want = "proxy settings present: HTTPS_PROXY, HTTP_PROXY; reached directly: 1 name(s) from your settings and 3 added (localhost, 127.0.0.1, host.docker.internal)"
+        if (-not $log.Contains($want)) { $p += "the entrypoint's proxy line is missing or different" }
+        $jobFiles = @(Get-ChildItem -LiteralPath "$Data\ui_data\jobs" -File -ErrorAction SilentlyContinue)
+        $inJobs = @($jobFiles | Where-Object { $text = [System.IO.File]::ReadAllText($_.FullName); @($needles | Where-Object { $text.Contains($_) }).Count } | ForEach-Object { $_.Name })
+        if ($inJobs.Count) { $p += "stored job files hold the fake proxy credentials: " + ($inJobs -join ", ") }
+        $scan = Helper pagescan $Run.Port $State.Stem @needles
+        if (-not $scan.ok) { $p += "pages hold the fake proxy credentials: " + (@($scan.hits) -join ", ") }
+        Judge $p ("tracing off although the settings file switches it on; both Langfuse addresses are http://host.docker.internal:3000 and the name resolves. " +
+                  "With the dead proxy set: the UI process's NO_PROXY and no_proxy are '$merged'; urllib, httpx and requests reach 127.0.0.1 directly; " +
+                  "Langfuse's health address bypasses the proxy (GET: $($t.langfuse_get)); example.invalid still goes to the proxy and is refused there. " +
+                  "A drafts job whose output carried a planted user:password address and the proxy setting showed both masked ($(Prop $plant 'masked_addresses_in_log') masked addresses in its log). " +
+                  "The fake proxy and planted credentials are in none of: the container log with the entrypoint's lines, $($jobFiles.Count) stored job files, $($scan.pages) pages. No trace was sent.")
     }
 
     Check "V19" "suites-in-container" {
@@ -695,7 +881,16 @@ print(json.dumps(out))
             if ($code -ne 0) { $p += "$suite ended with code $code (" + (@($out | Where-Object { $_ -like "FAIL *" }) -join ", ") + ")" }
             $told += "$suite [$summary]"
         }
-        $note = "skipped tests: " + $(if ($skipped.Count) { $skipped -join "; " } else { "none" }) + ". Parts of protected suites that need real output files and so do not run in an image: " + ($DataDependent -join "; ")
+        # Skips: in the image exactly one is expected (the compose-file test: the image has no compose file); anything else fails.
+        $expectedSkips = @("test_ui.py skip compose_never_fails_a_command_because_a_setting_is_missing: docker-compose.yml is not in this image; the check is about the source folder")
+        if (-not (Same-List ($skipped | Sort-Object) ($expectedSkips | Sort-Object))) { $p += "the skipped tests in the image are not exactly the one expected: [" + ($skipped -join "; ") + "]" }
+        # Windows side: on the source folder the same suite must skip nothing (the compose-file test runs there).
+        Say "  running test_ui.py on this computer (Windows), where nothing may be skipped ..."
+        $win = @(& python -B (Join-Path $Real "test_ui.py") 2>&1 | ForEach-Object { "$_" })
+        $winCode = $LASTEXITCODE
+        $winSummary = @($win | Where-Object { $_ -cmatch "^\d+/\d+ passed" })[-1]
+        if ($winCode -ne 0 -or $winSummary -notmatch "^(\d+)/\1 passed, 0 skipped$") { $p += "on Windows test_ui.py did not pass with 0 skipped: exit $winCode, '$winSummary'" }
+        $note = "skipped tests in the image: " + $(if ($skipped.Count) { $skipped -join "; " } else { "none" }) + ". On Windows: test_ui.py '$winSummary'. Parts of protected suites that need real output files and so do not run in an image: " + ($DataDependent -join "; ")
         if ($p.Count) { Fail (($p -join "; ") + ". " + $note) } else { Pass ("all nine suites exit 0 as uid 10001 with no network and a read-only system: " + ($told -join "; ") + ". " + $note) }
     }
 

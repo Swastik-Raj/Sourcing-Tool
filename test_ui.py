@@ -1336,7 +1336,8 @@ def container_start_refuses_a_missing_mount_and_the_source_folder(env):
         raises(ep.Refused, ep.check_data, env.root / "no_such_folder", MOUNTED)
         ep.check_data(data, MOUNTED)                                                   # an empty mounted folder is fine
         assert list(data.iterdir()) == [], "the write check leaves nothing behind"
-        with env_vars(TZ="Asia/Kolkata", PROJECT_DIR=None, UI_DATA_DIR=None, UI_SHIPPED_DIR=None, UI_HOST=None, UI_ALLOW_NON_LOOPBACK=None, UI_ENABLE_STUB=None):
+        with env_vars(TZ="Asia/Kolkata", PROJECT_DIR=None, UI_DATA_DIR=None, UI_SHIPPED_DIR=None, UI_HOST=None, UI_ALLOW_NON_LOOPBACK=None, UI_ENABLE_STUB=None,
+                      NO_PROXY=None, no_proxy=None):
             e = raises(SystemExit, ep.main, data, NOT_MOUNTED, zones, lambda: started.append("ui"))
             assert str(e).startswith("NOT STARTED: no data folder is mounted") and list(data.iterdir()) == []
             # the source folder mounted as the data folder: refused, and the working copy in it is not replaced
@@ -1364,7 +1365,8 @@ def container_start_needs_a_time_zone_it_knows(env):
     data.mkdir()
     started, real_app = [], ep.APP
     ep.APP = app
-    rest = dict(PROJECT_DIR=None, UI_DATA_DIR=None, UI_SHIPPED_DIR=None, UI_HOST=None, UI_ALLOW_NON_LOOPBACK=None, UI_ENABLE_STUB=None)
+    rest = dict(PROJECT_DIR=None, UI_DATA_DIR=None, UI_SHIPPED_DIR=None, UI_HOST=None, UI_ALLOW_NON_LOOPBACK=None, UI_ENABLE_STUB=None,
+                NO_PROXY=None, no_proxy=None)            # a start sets both NO_PROXY spellings: put them back afterwards too
     try:
         for empty in (None, "", "   "):                                                # not in .env, empty, or only spaces
             with env_vars(TZ=empty, **rest):
@@ -1389,9 +1391,109 @@ def container_start_needs_a_time_zone_it_knows(env):
 
 
 @test
+def container_start_merges_no_proxy_and_keeps_every_entry_set(env):
+    """NO_PROXY and no_proxy become one list: the person's entries first, in their order, then the three names this
+    container reaches directly, each once. Plain dicts here: Windows' own environment ignores the case of names."""
+    ep = entrypoint_module()
+    ours = "localhost,127.0.0.1,host.docker.internal"
+    cases = [({}, ours, (0, 3)),                                                                   # neither set
+             ({"NO_PROXY": "internal.example,10.0.0.0/8"}, "internal.example,10.0.0.0/8," + ours, (2, 3)),            # only upper case
+             ({"no_proxy": "a.example"}, "a.example," + ours, (1, 3)),                                                 # only lower case
+             ({"NO_PROXY": "a.example,b.example", "no_proxy": "c.example,a.example"}, "a.example,b.example,c.example," + ours, (3, 3)),
+             ({"NO_PROXY": "127.0.0.1,LocalHost", "no_proxy": "host.docker.internal"}, "127.0.0.1,LocalHost,host.docker.internal", (3, 0)),
+             ({"NO_PROXY": " a.example , ,localhost ,"}, "a.example,localhost,127.0.0.1,host.docker.internal", (2, 2)),  # spaces and empty entries
+             ({"NO_PROXY": "", "no_proxy": "   "}, ours, (0, 3))]
+    for given, want, counts in cases:
+        environ = {"HTTP_PROXY": "http://u:p@127.0.0.1:9", **given}
+        assert ep.merge_no_proxy(environ) == counts, (given, counts)
+        assert environ["NO_PROXY"] == environ["no_proxy"] == want, (given, environ)
+        assert environ["HTTP_PROXY"] == "http://u:p@127.0.0.1:9", "the proxy itself is never changed"
+        before = dict(environ)
+        assert ep.merge_no_proxy(environ) == (len(want.split(",")), 0) and environ == before, "a second merge changes nothing"
+    assert ep.PROXY_EXCEPTIONS == ("localhost", "127.0.0.1", "host.docker.internal"), "::1 is left out on purpose (see the stage 3 report)"
+
+
+@test
+def container_start_never_prints_or_shows_proxy_values(env):
+    """A proxy address can hold a user name and password: start-up prints names and counts only, and no page shows it."""
+    import contextlib
+    import io
+    ep = entrypoint_module()
+    app, zones, data = fake_image(env.root), fake_zones(env.root), env.root / "data_folder"
+    data.mkdir()
+    secret_user, secret_pass, own = "proxyuser-FAKE-7781", "proxypass-FAKE-7781", "internal-FAKE-7781.example"
+    proxy = f"http://{secret_user}:{secret_pass}@127.0.0.1:9"
+    rest = dict(PROJECT_DIR=None, UI_DATA_DIR=None, UI_SHIPPED_DIR=None, UI_HOST=None, UI_ALLOW_NON_LOOPBACK=None, UI_ENABLE_STUB=None)
+    seen, real_app, proxy_before = {}, ep.APP, os.environ.get("HTTP_PROXY")
+    ep.APP = app
+    try:        # both NO_PROXY spellings cleared first and put back afterwards (on Linux they are two settings, on Windows one)
+        with env_vars(NO_PROXY=None, no_proxy=None), env_vars(TZ="Asia/Kolkata", HTTP_PROXY=proxy, HTTPS_PROXY=proxy, NO_PROXY=own, **rest), \
+                contextlib.redirect_stdout(io.StringIO()) as said:
+            ep.main(data, MOUNTED, zones, lambda: seen.update(no_proxy=os.environ.get("NO_PROXY"), page=TestClient(create_app(load_settings()),
+                    base_url="http://127.0.0.1:8000").get("/health").text))
+    finally:
+        ep.APP = real_app
+    out = said.getvalue()
+    line = [x for x in out.splitlines() if x.startswith("proxy settings present: ")]
+    assert line == ["proxy settings present: HTTPS_PROXY, HTTP_PROXY; reached directly: 1 name(s) from your settings and 3 added "
+                    "(localhost, 127.0.0.1, host.docker.internal)"], out
+    for value in (secret_user, secret_pass, "127.0.0.1:9", own):
+        assert value not in out, f"start-up printed a setting's value: {value}"
+        assert value not in seen["page"], f"the Health page shows a setting's value: {value}"
+    assert seen["no_proxy"] == own + ",localhost,127.0.0.1,host.docker.internal", "the UI and the agents it starts get the merged list"
+    assert os.environ.get("HTTP_PROXY") == proxy_before, "the test's own environment is restored"
+    # without a test's own start, the UI is started as a new process (os.execv) that carries the environment set above
+    calls, real_exec = [], ep.os.execv
+    ep.APP, ep.os.execv = app, lambda path, args: calls.append((path, args, os.environ.get("NO_PROXY")))
+    try:
+        with env_vars(NO_PROXY=None, no_proxy=None), env_vars(TZ="Asia/Kolkata", NO_PROXY=own, **rest), contextlib.redirect_stdout(io.StringIO()):
+            ep.main(data, MOUNTED, zones)
+    finally:
+        ep.APP, ep.os.execv = real_app, real_exec
+    assert calls == [(sys.executable, [sys.executable, str(app / "run_ui.py")], own + ",localhost,127.0.0.1,host.docker.internal")], calls
+
+
+@test
+def job_logs_mask_credentials_in_addresses_and_proxy_settings(env):
+    """A user name and password inside an address, and a proxy setting that carries them, never reach a stored log or a page."""
+    m = jobs_mod.mask_line
+    for line, keep, gone in (
+            ("connecting through http://alice:FAKE-pw-1@proxy.example:3128 now", "http://[REDACTED]@proxy.example:3128 now", ("alice", "FAKE-pw-1")),   # agent output
+            ("httpx.ProxyError: Unable to connect to proxy 'https://bob:FAKE-pw-2@10.0.0.5:8080/'", "'https://[REDACTED]@10.0.0.5:8080/'", ("bob", "FAKE-pw-2")),  # an error
+            ("git clone https://FAKEtoken123456@github.com/x", "https://[REDACTED]@github.com/x", ("FAKEtoken123456",)),                  # a user name alone
+            ("SOCKS5H://carl:FAKE-pw-7@socks.example:1080", "SOCKS5H://[REDACTED]@socks.example:1080", ("carl", "FAKE-pw-7"))):
+        out = m(line)
+        assert keep in out and not any(g in out for g in gone), (line, out)
+    for plain in ("listing at https://shop.example/item/b2?ref=a@b", "see https://example.com/a@b", "no address here", "proxy http://10.9.9.9:3128"):
+        assert m(plain) == plain, (plain, m(plain))                       # an @ after the host, or no user info: left as it is
+    with env_vars(HTTP_PROXY="http://carol:FAKE-pw-3@10.9.9.9:3128", HTTPS_PROXY="dan:FAKE-pw-4@10.9.9.9:3129"):    # the second has no scheme
+        for line in ("proxy is http://carol:FAKE-pw-3@10.9.9.9:3128", "proxy is dan:FAKE-pw-4@10.9.9.9:3129", "auth carol:FAKE-pw-3 refused", "user dan:FAKE-pw-4"):
+            out = m(line)
+            assert not any(s in out for s in ("FAKE-pw-3", "FAKE-pw-4", "carol", "dan:")), (line, out)
+    # through the real runner: the stored log, the job record and the job's pages
+    with env_vars(HTTPS_PROXY="http://erin:FAKE-pw-8@10.8.8.8:3128"):
+        jid = env.jobs.start("stub.read", {"mode": "url"})["id"]
+        meta = env.jobs.wait(jid)
+        stored = env.jobs.log_path(jid).read_text(encoding="utf-8") + json.dumps(meta)
+        pages = env.client.get(f"/jobs/{jid}").text + env.client.get(f"/jobs/{jid}/log?offset=0").text
+    assert meta["status"] == "succeeded" and "connecting through http://[REDACTED]@proxy.example:3128" in stored, stored
+    assert "proxy setting in use: [REDACTED]" in stored and "https://[REDACTED]@10.0.0.6:8080" in stored, stored
+    for text in (stored, pages):
+        for s in ("stubuser", "FAKE-url-pass-1", "FAKE-url-pass-2", "erin", "FAKE-pw-8"):
+            assert s not in text, s
+
+
+@test
 def compose_never_fails_a_command_because_a_setting_is_missing(env):
-    """`${NAME:?message}` would make stop, down, ps, logs and config fail too. The compose file has none, and passes TZ through."""
-    compose = (Path(__file__).parent / "docker-compose.yml").read_text(encoding="utf-8")
+    """`${NAME:?message}` would make stop, down, ps, logs and config fail too. The compose file has none, and passes TZ through.
+    It checks the source folder's compose file: in the test image there is none, and the test says so as a listed skip.
+    On Windows (the source folder) it always runs: a missing file there is a failure, never a skip."""
+    path = Path(__file__).parent / "docker-compose.yml"
+    if not path.is_file():
+        if os.name == "nt":
+            raise AssertionError("docker-compose.yml is missing from the source folder")
+        raise Skip("docker-compose.yml is not in this image; the check is about the source folder")
+    compose = path.read_text(encoding="utf-8")
     assert ":?" not in compose and "${TZ:-}" in compose, "TZ is passed through as it is; the container refuses, not compose"
     assert [line.strip() for line in compose.splitlines() if line.strip().startswith("TZ:")] == ['TZ: "${TZ:-}"'], "one TZ line, passed through"
 
@@ -1466,12 +1568,14 @@ def container_start_hands_the_data_folder_to_the_ui(env):
     ep.APP = app
     try:        # a settings file that tries to move the project, change the address or switch the test stub on does not get its way
         with env_vars(TZ="Asia/Kolkata", PROJECT_DIR=str(env.root / "somewhere_else"), UI_HOST="10.1.2.3", UI_ENABLE_STUB="1", UI_DATA_DIR=None,
-                      UI_SHIPPED_DIR=None, UI_ALLOW_NON_LOOPBACK=None, SMTP_PASSWORD="FAKE-not-a-password"), contextlib.redirect_stdout(io.StringIO()) as said:
+                      UI_SHIPPED_DIR=None, UI_ALLOW_NON_LOOPBACK=None, SMTP_PASSWORD="FAKE-not-a-password", NO_PROXY=None, no_proxy=None), \
+                contextlib.redirect_stdout(io.StringIO()) as said:
             ep.main(data, MOUNTED, zones, start)
     finally:
         ep.APP = real_app
     lines = said.getvalue().splitlines()
-    assert lines[-1] == "data folder ready, starting the UI" and len(lines) == 12 and all(line.split(": ")[0] in ("program file written", "reference file added") for line in lines[:-1]), lines
+    assert lines[-1] == "data folder ready, starting the UI" and lines[-2].startswith("proxy settings present: ") and len(lines) == 13, lines
+    assert all(line.split(": ")[0] in ("program file written", "reference file added") for line in lines[:-2]), lines
     assert not any(v in said.getvalue() for v in ("FAKE-not-a-password", "Asia/Kolkata", "10.1.2.3")), "start-up never prints the value of a setting"
     s = seen.pop("settings")
     assert seen == {"PROJECT_DIR": str(data), "UI_DATA_DIR": str(data / "ui_data"), "UI_SHIPPED_DIR": str(app), "UI_HOST": "0.0.0.0",

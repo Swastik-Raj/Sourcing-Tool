@@ -45,7 +45,7 @@ COPY docker/entrypoint.py /app/docker/entrypoint.py
 ENV PYTHONDONTWRITEBYTECODE=1
 USER 10001:10001
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD ["python", "-c", "import os, urllib.request as u; u.urlopen('http://127.0.0.1:' + os.environ.get('UI_PORT', '8000') + '/static/app.css', timeout=3)"]
+    CMD ["python", "-c", "import os, urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:' + os.environ.get('UI_PORT', '8000') + '/static/app.css', timeout=3)"]
 ENTRYPOINT ["python", "/app/docker/entrypoint.py"]
 
 # ---------- test: the runtime image plus the suites (never shipped, built only by docker/verify.ps1) ----------

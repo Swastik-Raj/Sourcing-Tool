@@ -14,7 +14,7 @@ class JobRejected(Exception):
 
 
 SKU_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._&-]{0,39}")   # no leading '-', no spaces, no path characters
-STUB_MODES = ("ok", "fail", "slow", "secret", "hostile", "term")
+STUB_MODES = ("ok", "fail", "slow", "secret", "hostile", "term", "url")
 
 # What an exit code means, from the agents' own behaviour (Stage 0): sys.exit("message") and sys.exit(1) both give 1.
 GENERIC_EXITS = {0: "Finished normally.",

@@ -1,7 +1,7 @@
 # Running the sourcing tool in Docker
 
-> **Status:** written before the first container build. None of the commands below has been run against this image
-> yet; `docker\verify.ps1` checks them stage by stage. Remove this note once all four stages have passed.
+> **Status:** `docker\verify.ps1` stages 1 and 2 pass, and stage 3 up to its proxy check (V14–V17). What it settled is
+> written below; the rest has not been run against an image yet. Remove this note once all four stages have passed.
 
 The container holds the web UI, the agents and the Python they need. Your keys and mail settings stay in a `.env` file on
 your computer, and all your work stays in one folder on your computer (the **data folder**). Removing or rebuilding the
@@ -63,8 +63,10 @@ docker compose down           # remove the container (and its network); the data
 
 Each job's log is a file in `data\ui_data\jobs\`, and the **Jobs** page shows it.
 
-After you change `.env`, start again with `docker compose up -d --force-recreate` so the container reads the new values.
-The container does not start by itself when Docker Desktop starts; run `docker compose up -d` when you want it.
+After you change `.env`, run `docker compose up -d`. Compose sees the change and recreates the container with the new
+values; your data folder is not touched. (Tested: an added setting and a changed one both reached the container and the
+pages after a plain `docker compose up -d`.) The container does not start by itself when Docker Desktop starts; run
+`docker compose up -d` when you want it.
 
 ## If the container stops at once
 
@@ -111,7 +113,7 @@ To restore into a new, empty data folder:
 docker compose stop
 Expand-Archive -Path .\lcom-data-20261014-0930.zip -DestinationPath .\data-restored
 # then set LCOM_DATA=./data-restored in .env, and:
-docker compose up -d --force-recreate
+docker compose up -d
 ```
 
 The backup holds your state and outputs; it holds no keys, because `.env` is not in the data folder. Keep backups out of
@@ -196,11 +198,45 @@ Never delete `email_state.json` or `decision_state.json` themselves.
 `.env` or send it to anyone.
 
 - A line starting with `#` is switched off. An empty value is not the same as a switched-off line.
-- Put a value in single quotes if it contains `$` or `#`, or begins or ends with a space.
+- A value with `$` in it **must** be in single quotes: `SMTP_PASSWORD='pa$word'`. Without quotes, compose treats `$word`
+  as a reference to another setting, replaces it with nothing and only prints a warning; the tool would get `pa`.
+- Also put a value in single quotes if it contains `#`, or begins or ends with a space.
+
+What compose reads exactly as the tool's own reader (python-dotenv) does, tested:
+
+| Shape | Example | Use it? |
+|---|---|---|
+| Plain value | `BRAND_NAME=TestBrand` | yes |
+| Double quotes, with `\n` for a line break | `SHIPPING_ADDRESS="Company\n1 Street\nCity, ST 12345"` | yes |
+| Single quotes, with `$`, `#` or spaces inside | `SMTP_PASSWORD='pa$$word with#hash'` | yes |
+| A value over several lines inside double quotes | `NAME="line one` (new line) `line two"` | yes, but the one-line `\n` form is clearer |
+| A reference to a setting earlier in the file | `B=${A}-suffix` | yes, both read it the same |
+| An `export` in front | `export NAME=value` | yes, both ignore the `export` |
+| An unquoted `$` | `NAME=pa$word` | **no**: compose and the tool read different values |
 - Required for the tool to start: `TZ`. Required for the work named in the file: the API keys, the mail settings,
   `SHIPPING_ADDRESS` and `BRAND_NAME`. The Health page shows which are missing.
 - `LCOM_PORT` changes the port (default 8010). The same number is used inside and outside the container.
 - `LCOM_DATA` moves the data folder.
+
+### A company proxy
+
+If your network needs a proxy, set `HTTP_PROXY` and `HTTPS_PROXY` in `.env`, and `NO_PROXY` for any of your own names that
+must be reached directly.
+
+- **Proxy settings are secrets**: a proxy address can hold a user name and password. The container's start-up lines
+  name the proxy settings that are set and count the entries, never their values; the Health page never shows them; job
+  logs replace the user name and password in any address (`http://[REDACTED]@proxy:3128`) and the proxy settings
+  themselves. Every page does the same for any address it shows, also when the address comes from a results file (a
+  seller name, a listing address) and also inside form fields and the pages' data requests. Plain email addresses are
+  shown in full: the page that sends emails lists every recipient on purpose.
+- **Downloads are not masked.** A file you download (a results workbook, a report, an order sheet, a listing, the
+  approved-orders export) is your own file and comes back exactly as it is in the data folder.
+- At start the container adds `localhost`, `127.0.0.1` and `host.docker.internal` to `NO_PROXY` (and its lower-case
+  spelling `no_proxy`), after every entry you set yourself, in your order, without repeats. The tool's own address and a
+  Langfuse on this computer are then reached directly, while everything else still goes through your proxy.
+- `::1` is not added on purpose: the three HTTP libraries the tool uses treat it differently in `NO_PROXY` (tested on
+  Windows and in the image: one of them ignores `::1`, another fails on `[::1]`), so it would not work reliably. The
+  tool does not use `::1`.
 
 ### Tracing (only for the people who maintain the tool)
 

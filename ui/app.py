@@ -35,7 +35,8 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
     jobs = JobManager(s, popen)
     app.state.jobs, app.state.settings = jobs, s
     templates = Jinja2Templates(directory=str(HERE / "templates"))        # autoescape is on for .html
-    templates.env.finalize = wording.display                               # every printed value gets display wording
+    templates.env.finalize = wording.display                               # every printed value gets display wording (attributes too)
+    app.state.templates = templates                                        # tests render through this same environment
     templates.env.globals.update(app_name=s.app_name, badge_kind=badge_kind, job_badge=lambda st: JOB_BADGES.get(st, st))
     app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
     security.install(app, s)
@@ -536,10 +537,10 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
         if meta is None:
             raise HTTPException(404, "No such job.")
         text, new = jobs.read_log(jid, max(offset, 0), whole_lines_only=meta["status"] == "running")
-        body = {"text": wording.display(text), "offset": new, "status": meta["status"]}
+        body = {"text": text, "offset": new, "status": meta["status"]}
         if search_job(jid):
             body["progress"] = progress_for(meta)
-        return JSONResponse(body)
+        return JSONResponse(wording.display_all(body))          # every string in it, as a page prints it
 
     @app.post("/jobs/{jid}/cancel")
     def job_cancel(request: Request, jid: str, csrf_token: str = Form("")):

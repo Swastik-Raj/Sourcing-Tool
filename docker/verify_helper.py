@@ -2,6 +2,9 @@
 
     python docker\\verify_helper.py scan    <image.tar> runtime|test <needle> [<needle> ...]
     python docker\\verify_helper.py envhash <env file> <NAME> [<NAME> ...]
+    python docker\\verify_helper.py envvalues <env file of made-up values> <NAME> [<NAME> ...]
+    python docker\\verify_helper.py pagescan <port> <results stem> <needle> [<needle> ...]
+    python docker\\verify_helper.py plantjob <port> <data folder> <fake user> <fake password> <fake proxy url>
     python docker\\verify_helper.py fixture <data folder>
     python docker\\verify_helper.py hosts   <port> <container name>
     python docker\\verify_helper.py flow    <port> <data folder> <results stem>
@@ -77,6 +80,13 @@ def envhash(path: str, names: list) -> dict:
     from dotenv import dotenv_values
     values = dotenv_values(path)
     return {n: (sha(values[n].encode("utf-8")) if values.get(n) is not None else None) for n in names}
+
+
+def envvalues(path: str, names: list) -> dict:
+    """python-dotenv's reading of a file of made-up test values (never used on a real settings file)."""
+    from dotenv import dotenv_values
+    values = dotenv_values(path)
+    return {n: values.get(n) for n in names}
 
 
 # ---------- fixture: a results workbook in the search agent's own layout ----------
@@ -259,6 +269,49 @@ def flow(port: int, data: str, stem: str) -> dict:
     return {"ok": all(s["ok"] for s in steps), "steps": steps}
 
 
+PLANT_NAME = "sourcing_results_20260101_100200.xlsx"
+
+
+def plantjob(port: int, data: str, user: str, password: str, proxy_url: str) -> dict:
+    """A results file whose seller names and listing addresses carry a user name and password (and the container's own
+    proxy setting), then the email agent's `drafts` through the UI: it prints those names and addresses. The stored log,
+    the job record and the job's pages must show them masked. Nothing here needs the network."""
+    os.environ["OBS_ENABLED"] = "0"
+    sys.path.insert(0, str(ROOT))
+    import test_decision_agent as td
+    planted = f"http://{user}:{password}@seller.example/item"
+    rows = [td.res_row("PLANT1", f"Maker {planted}", url=planted + "/1"), td.res_row("PLANT2", f"Maker via {proxy_url}", url=planted + "/2")]
+    folder = Path(data) / "Excel Output Sheets"
+    td.make_results(str(folder / PLANT_NAME), rows)
+    ui = UI(port)
+    status, headers, body = ui.post("/emails/drafts", wf=PLANT_NAME[:-5])
+    found = re.search(r"job=([0-9a-f-]+)", headers.get("location", ""))
+    if status != 303 or not found:
+        return {"ok": False, "error": f"drafts was not started (HTTP {status})"}
+    state, log = ui.job(headers)
+    jid = found[1]
+    stored = "".join(p.read_text(encoding="utf-8", errors="replace") for p in (Path(data) / "ui_data" / "jobs").glob(f"{jid}.*"))
+    shown = ui.get(f"/jobs/{jid}")[1] + ui.get(f"/jobs/{jid}/log?offset=0")[1] + ui.get(f"/step/emails?wf={PLANT_NAME[:-5]}&job={jid}")[1]
+    secrets_ = [user, password, proxy_url, proxy_url.split("://", 1)[-1].rsplit("@", 1)[0]]
+    return {"ok": state == "succeeded" and stored.count("[REDACTED]@") >= 2 and not any(s in stored or s in shown for s in secrets_),
+            "job": state, "masked_addresses_in_log": stored.count("[REDACTED]@"),
+            "found_in_stored_log": [i for i, s in enumerate(secrets_) if s in stored], "found_on_pages": [i for i, s in enumerate(secrets_) if s in shown]}
+
+
+def pagescan(port: int, stem: str, needles: list) -> dict:
+    """Every page the UI serves for this run (each tab, Health, Jobs, every job's page and log): none may hold a needle."""
+    ui, hits = UI(port), []
+    paths = ["/", f"/?wf={stem}", "/health", "/jobs", "/step/search"] + [f"/step/{s}?wf={stem}" for s in ("emails", "approvals", "order-sheet", "listing-content")]
+    status, html = ui.get("/jobs")
+    for jid in sorted(set(re.findall(r'href="/jobs/(\d{8}-\d{6}-[0-9a-f]{6})"', html))):
+        paths += [f"/jobs/{jid}", f"/jobs/{jid}/log?offset=0"]
+    for path in paths:
+        status, headers, body = ui.request("GET", path)
+        text = body.decode("utf-8", "replace") + json.dumps(headers)
+        hits += [f"{path}: needle {i}" for i, n in enumerate(needles) if n in text]
+    return {"ok": not hits, "pages": len(paths), "hits": hits}
+
+
 def pages(port: int, stem: str) -> dict:
     ui, problems = UI(port), []
     for path, wanted in ((f"/?wf={stem}", [stem]), (f"/step/approvals?wf={stem}", ["A-0001", "VIC00001", "Valid"]),
@@ -323,6 +376,12 @@ def main(argv: list) -> dict:
         return scan(a[0], a[1], a[2:])
     if cmd == "envhash":
         return envhash(a[0], a[1:])
+    if cmd == "envvalues":
+        return envvalues(a[0], a[1:])
+    if cmd == "pagescan":
+        return pagescan(int(a[0]), a[1], a[2:])
+    if cmd == "plantjob":
+        return plantjob(int(a[0]), a[1], a[2], a[3], a[4])
     if cmd == "fixture":
         return fixture(a[0])
     if cmd == "hosts":

@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 p = argparse.ArgumentParser()
-p.add_argument("mode", choices=["ok", "fail", "slow", "secret", "hostile", "term", "search"])
+p.add_argument("mode", choices=["ok", "fail", "slow", "secret", "hostile", "term", "url", "search"])
 p.add_argument("--sku", nargs="+")
 p.add_argument("--results")
 p.add_argument("--input")
@@ -131,6 +131,10 @@ elif a.mode == "secret":
     print("ANTHROPIC_API_KEY=sk-ant-abcdefgh12345678 contact boss@example.com phone +1 214 555 0100", flush=True)
 elif a.mode == "hostile":
     print("<script>alert('x')</script> <img src=x onerror=alert(1)>", flush=True)
+elif a.mode == "url":           # addresses with a user name and password, as a library or an agent might print them
+    print("connecting through http://stubuser:FAKE-url-pass-1@proxy.example:3128 for the search", flush=True)
+    print(f"proxy setting in use: {os.environ.get('HTTPS_PROXY', '')}", flush=True)
+    print("ProxyError('Unable to connect to proxy', OSError('https://stubuser2:FAKE-url-pass-2@10.0.0.6:8080'))", file=sys.stderr, flush=True)
 elif a.mode == "term":
     print("L-Com price 12.00 | LCOM SKU AB-1 | lcom_prices.csv | l com | LCom unit price | workflow lcom-sourcing_results_20260101_100000", flush=True)
 elif a.mode == "slow":

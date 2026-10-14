@@ -15,6 +15,7 @@ from typing import Optional
 
 import observability as obs   # mask_text: keys, emails, phone numbers, shipping address, protected values
 
+from . import wording
 from .commands import Command, JobRejected, build_allowlist
 from .config import Settings
 
@@ -28,9 +29,24 @@ class JobBusy(Exception):
 
 # observability's own rule needs a word boundary before 'api_key', so NAME_API_KEY=value slips past it; this catches it.
 _NAMED_SECRET = re.compile(r"(?i)([A-Za-z0-9_]*(?:api_?key|secret|password|token)\s*[=:]\s*)(?:Bearer\s+)?\S+")
+PROXY_SETTINGS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+
+
+def _proxy_secrets() -> list:
+    """Proxy settings that carry a user name or password: each whole value, and its user:password part on its own."""
+    out = set()
+    for name in PROXY_SETTINGS:
+        value = (os.environ.get(name) or "").strip()
+        if "@" in value:
+            out.add(value)
+            out.add(value.split("://", 1)[-1].rsplit("@", 1)[0])
+    return sorted((v for v in out if len(v) >= 3), key=len, reverse=True)
 
 
 def mask_line(line: str) -> str:
+    for secret in _proxy_secrets():                 # before the address rule and observability's rules, which would split them
+        line = line.replace(secret, "[REDACTED]")
+    line = wording.mask_userinfo(line)              # the same rule the pages use: user info in any address
     return _NAMED_SECRET.sub(lambda m: m[1] + "[REDACTED]", obs.mask_text(line))
 
 

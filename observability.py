@@ -337,6 +337,7 @@ def workflow_id(results_path):
     """'lcom-<results file stem>': the Langfuse session id of every command that touches that results file."""
     if not results_path:
         return None
+    results_path = str(results_path).replace("\\", "/")      # a Windows path gives the same id on every system
     return "lcom-" + os.path.splitext(os.path.basename(str(results_path)))[0]
 
 

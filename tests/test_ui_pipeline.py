@@ -29,12 +29,16 @@ _WATCHED = {"open": 0, "os.listdir": 0, "os.scandir": 0, "os.mkdir": 0, "os.remo
 
 
 _SNAPSHOT = False                       # True only inside snapshot_real(), which reads the real state to prove it did not change
+_CLEANING = None                        # the test's own temp folder, only while remove_temp() deletes it
 
 
 def _tripwire(event, args):
     if _SNAPSHOT or event not in _WATCHED or not args or not isinstance(args[0], (str, bytes, os.PathLike)):
         return
-    path = os.path.normcase(os.path.abspath(os.fsdecode(args[0])))
+    raw = os.fsdecode(args[0])
+    if _CLEANING is not None and not os.path.isabs(raw):
+        return                          # Linux's rmtree opens each entry by its bare name inside an open folder of the temp tree
+    path = os.path.normcase(os.path.abspath(raw))
     if not (path + os.sep).startswith(_REAL) or (path + os.sep).startswith(_CODE_DIRS):
         return
     if event in ("os.listdir", "os.scandir") and path + os.sep == _REAL:     # Python's import system lists the folder to find modules
@@ -134,7 +138,21 @@ def cleanup(env):
     for j in env.jobs.list():
         env.jobs.cancel(j["id"])
     time.sleep(0.2)
-    shutil.rmtree(env.root, ignore_errors=True)
+    remove_temp(env.root)
+
+
+def remove_temp(root: Path) -> None:
+    """Deletes a test's own temp folder. Only while this runs does the tripwire let relative names through, and only for a
+    folder under the system temp folder that is neither the real project nor inside it; absolute paths are checked as always."""
+    global _CLEANING
+    root = Path(root).resolve()
+    temp = Path(tempfile.gettempdir()).resolve()
+    assert root.is_relative_to(temp) and root != temp and not root.is_relative_to(REAL) and not REAL.is_relative_to(root), root
+    _CLEANING = root
+    try:
+        shutil.rmtree(root, ignore_errors=True)
+    finally:
+        _CLEANING = None
 
 
 def token(env):
@@ -678,6 +696,45 @@ def the_real_project_folder_is_never_used(env):
     assert {"Uploads", "Excel Output Sheets", "ui_data"} <= made, made
 
 
+@test
+def tripwire_stays_strong_outside_its_own_cleanup(env):
+    """The one allowance (bare names while a test deletes its own temp folder) changes nothing else: it still stops an
+    absolute path into the real project, even during that cleanup; a bare name of a real file when the working folder is
+    the real project; and rmtree of the real project folder. Deleting is switched off while that last one is tried, so
+    even a broken tripwire could not remove anything."""
+    global _CLEANING
+    e = raises(AssertionError, open, REAL / "README.md")                                    # an absolute path into the real project
+    assert "the real project folder was used" in str(e)
+    _CLEANING = env.root.resolve()                                                          # ...also in the middle of a cleanup
+    try:
+        raises(AssertionError, open, REAL / "README.md")
+        raises(AssertionError, os.listdir, REAL / "Excel Output Sheets")
+    finally:
+        _CLEANING = None
+    here = os.getcwd()
+    os.chdir(REAL)                                                                          # a bare name, outside any cleanup
+    try:
+        raises(AssertionError, open, "README.md")
+        raises(AssertionError, open, os.path.join("no_such_folder_for_this_test", "x.log"), "a")   # (a path that could not be created anyway)
+    finally:
+        os.chdir(here)
+    real_delete = (os.unlink, os.rmdir, os.remove)
+
+    def refuse(*a, **k):
+        raise PermissionError("deleting is switched off in this test")
+    os.unlink = os.rmdir = os.remove = refuse
+    try:
+        e = raises(AssertionError, shutil.rmtree, REAL)                                     # stopped at its first look, before any delete
+        assert "the real project folder was used" in str(e), e
+        assert len(VIOLATIONS) >= 6, VIOLATIONS
+        VIOLATIONS.clear()
+        e = raises(AssertionError, remove_temp, REAL)                                       # the allowance is only for a test's temp folder
+        assert "the real project folder was used" not in str(e) and VIOLATIONS == [], "refused by remove_temp itself, before any look"
+    finally:
+        os.unlink, os.rmdir, os.remove = real_delete
+    assert REAL.is_dir() and (REAL / "tests" / "test_ui_pipeline.py").is_file()
+
+
 # ================= Phase 2: Emails and Approvals =================
 
 RES = "sourcing_results_20260202_100000"
@@ -849,6 +906,50 @@ def test_send_is_marked_and_still_gated(env):
             assert FakePopen.calls == []
             started_job(fake, post(fake, "/emails/send", wf=RES, test_recipient="me@example.invalid", confirm_count="3"))
             assert last_argv(fake) == ["email_agent.py", "send", native("Excel Output Sheets", RES + ".xlsx"), "--confirm-count", "3", "--test-recipient", "me@example.invalid"]
+    finally:
+        cleanup(fake)
+
+
+@test
+def pages_mask_user_info_in_addresses_but_not_email_addresses(env):
+    """A results file's text reaches pages as data (seller names in tables and drop-downs). The user name and password
+    inside an address are masked wherever a page prints a value, attributes and the JSON endpoint included; a plain email
+    address is shown in full; and forms built from such rows still send the right SKU and count."""
+    fake = fake_env()
+    planted = "http://pageuser:FAKE-page-pass@seller.example/item"
+    try:
+        results_file(fake, RES + ".xlsx", [("B2", f"Maker {planted}", "b@maker-b.example", planted + "/b2"),
+                                           ("C3", "Maker C", "c@maker-c.example", "https://maker-c.example/item/c3")])
+        with env_vars(**FAKE):
+            pages = {p: fake.client.get(p).text for p in (f"/step/emails?wf={RES}", f"/step/approvals?wf={RES}", f"/?wf={RES}", "/jobs")}
+            review = post(fake, "/emails/send/review", wf=RES).text
+            emails = pages[f"/step/emails?wf={RES}"]
+            assert '<td data-label="Seller">Maker http://[REDACTED]@seller.example/item</td>' in emails, "the sellers table"
+            assert 'B2 (Maker http://[REDACTED]@seller.example/item)</option>' in emails, "a drop-down's text"
+            for path, html in list(pages.items()) + [("send review", review)]:
+                assert "pageuser" not in html and "FAKE-page-pass" not in html, path
+            # attribute values go through the same filter as text: rendered with the app's own template environment
+            out = fake.app.state.templates.env.from_string('<input value="{{ v }}" title="{{ v }}"><td data-label="{{ v }}">{{ v }}</td>').render(v=f"Maker {planted}")
+            assert out.count("Maker http://[REDACTED]@seller.example/item") == 4 and "pageuser" not in out and "FAKE-page-pass" not in out, out
+            # plain email addresses are shown in full where the page lists recipients
+            assert "b@maker-b.example" in review and "c@maker-c.example" in review and "2 emails would be sent" in review
+            # forms built from such rows send the right SKU and the typed count, unchanged
+            assert 'value="B2"' in emails
+            started_job(fake, post(fake, "/emails/mark", wf=RES, sku="B2", confirm="1"))
+            assert last_argv(fake) == ["email_agent.py", "mark", "B2", "--results", native("Excel Output Sheets", RES + ".xlsx")]
+            meta = started_job(fake, post(fake, "/emails/send", wf=RES, confirm_count="2"))
+            assert last_argv(fake)[-2:] == ["--confirm-count", "2"]
+        # the JSON endpoint and the job page mask too, even a line that reached a stored log without the log masking
+        with open(fake.jobs.log_path(meta["id"]), "a", encoding="utf-8") as log:
+            log.write(f"an older line: {planted}/raw, contact b@maker-b.example\n")
+        body = fake.client.get(f"/jobs/{meta['id']}/log?offset=0").json()
+        page = fake.client.get(f"/jobs/{meta['id']}").text
+        for text in (json.dumps(body), page):
+            assert "pageuser" not in text and "FAKE-page-pass" not in text and "http://[REDACTED]@seller.example/item/raw" in text, text[-400:]
+        assert "b@maker-b.example" in body["text"], "an email address in the log text is left as it is by the page filter"
+        # downloads are the person's own files, given back exactly as they are
+        raw = fake.client.get(f"/files/Excel Output Sheets/{RES}.xlsx")
+        assert raw.status_code == 200 and raw.content == (fake.project / "Excel Output Sheets" / f"{RES}.xlsx").read_bytes()
     finally:
         cleanup(fake)
 

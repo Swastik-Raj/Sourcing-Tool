@@ -20,13 +20,33 @@ _RULES = [
 ]
 
 
+# The user name (and password) inside an address: scheme://user:password@host or scheme://user@host. Masked wherever text is
+# shown or logged; the rest of the address stays readable. A plain email address has no scheme:// and is left alone: the
+# send page lists recipients in full on purpose.
+_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)[^\s/@]+@")
+
+
+def mask_userinfo(text: str) -> str:
+    return _USERINFO.sub(lambda m: m[1] + "[REDACTED]@", text)
+
+
 def display(text):
-    """Display wording for a string; anything else is returned unchanged."""
+    """Display wording for a string, with any address's user info masked; anything else is returned unchanged."""
     if not isinstance(text, str) or not text or hasattr(text, "__html__"):   # not text, or already-rendered markup (its parts were converted)
         return text
+    text = mask_userinfo(text)
     for pattern, repl in _RULES:
         text = pattern.sub(repl, text)
     return text
+
+
+def display_all(value):
+    """display() for every string inside JSON-ready data (dicts and lists), for the JSON endpoints."""
+    if isinstance(value, dict):
+        return {k: display_all(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [display_all(v) for v in value]
+    return display(value)
 
 
 def contains_reference_name(text: str) -> bool:

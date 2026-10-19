@@ -1,0 +1,10 @@
+{# The step after this page's own step: a link when it can start, or why it cannot yet. Never the page you are on. #}
+{% if following %}
+<div class="continue">
+  {% if following.blocked %}
+  <p><strong>Step {{ following.number }}, {{ following.label }}, cannot start yet:</strong> {{ following.blocked }}</p>
+  {% else %}
+  <a class="btn btn-primary" href="/step/{{ following.slug }}?wf={{ wf }}">Continue to step {{ following.number }}: {{ following.label }}</a>
+  {% endif %}
+</div>
+{% endif %}

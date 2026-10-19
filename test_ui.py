@@ -392,7 +392,7 @@ def overview_steps_only_claim_what_files_show(env):
         page = env.client.get(f"/step/{slug}").text
         assert "Not available yet" not in page and f"<h1>{workflows.STEP_LABELS[name]}</h1>" in page and 'aria-label="Progress"' in page, slug
         assert gate in page, slug
-    assert "Which products" in env.client.get("/step/search").text                    # Stage 2a: the Search step is a real screen
+    assert "Upload a spreadsheet of your products" in env.client.get("/step/search").text       # Stage 2a: the Search step is a real screen
     assert env.client.get("/step/bogus").status_code == 404
 
 
@@ -460,6 +460,13 @@ STEM_A, STEM_B = "sourcing_results_20260101_100000", "sourcing_results_20260202_
 
 def has_term(text: str) -> bool:
     return wording.contains_reference_name(text)
+
+
+def outside_details(html: str) -> str:
+    """What a page shows before anything is expanded: a closed <details> keeps only its summary."""
+    def shown(m):
+        return m[0] if re.search(r"\bopen\b", m[1]) else (re.search(r"<summary>.*?</summary>", m[2], re.S) or [""])[0]
+    return re.sub(r"(<details\b[^>]*>)(.*?)</details>", shown, html, flags=re.S)
 
 
 def add_results(env, name, rows, mtime=None):
@@ -824,15 +831,17 @@ def missing_keys_disable_start_and_the_server_refuses_a_forced_post(env):
     fake_agent(env)
     with env_vars(ANTHROPIC_API_KEY=None, NIMBLE_API_KEY=None):
         page = env.client.get("/step/search").text
-        assert "A search cannot start yet." in page and "ANTHROPIC_API_KEY and NIMBLE_API_KEY are not set up" in page
-        assert page.count("Not set") == 2 and re.search(r'<button type="submit" class="btn-primary" disabled>Next: check the cost', page)
+        assert "A search cannot start yet." in outside_details(page) and "the AI service key and the web search key are not set up" in outside_details(page)
+        tech = page.split('<details class="tech"')[1].split("</details>")[0]               # the setting names, under Technical details
+        assert "ANTHROPIC_API_KEY" in tech and "NIMBLE_API_KEY" in tech and "ANTHROPIC_API_KEY" not in outside_details(page)
+        assert page.count("Not set") == 2 and re.search(r'<button type="submit" class="btn-primary" data-needs-choice data-blocked disabled>Next: check the cost', page)
         assert re.search(r'class="btn-primary" disabled>Start search', post(env, "/search/review", choice="preset").text)
         r = post(env, "/search/start", choice="preset", confirm_count="3")
-        assert r.status_code == 400 and "Nothing was started: ANTHROPIC_API_KEY, NIMBLE_API_KEY is not set" in r.text
+        assert r.status_code == 400 and "Nothing was started: the AI service key and the web search key are not set up (ANTHROPIC_API_KEY, NIMBLE_API_KEY)" in r.text
         assert not env.jobs.list()
         with env_vars(ANTHROPIC_API_KEY=FAKE_KEY):                                    # one of the two is still missing
             r = post(env, "/search/start", choice="preset", confirm_count="3")
-            assert r.status_code == 400 and "NIMBLE_API_KEY is not set" in r.text and not env.jobs.list()
+            assert r.status_code == 400 and "the web search key is not set up (NIMBLE_API_KEY)" in r.text and not env.jobs.list()
         # the agents read the project's .env themselves, so a key there counts as set; its value is never shown
         (env.project / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-FILEKEY0000000000\nNIMBLE_API_KEY=nimble-file-secret\n", encoding="utf-8")
         text = env.client.get("/step/search").text + env.client.get("/health").text
@@ -981,7 +990,7 @@ def exit_1_and_a_billing_stop_are_read_in_plain_language(env):
     page = clean(env.client.get(f"/step/search?job={jid}").text, "failed")
     assert meta["status"] == "failed" and meta["exit_code"] == 1
     assert "Exit code 1" in page and "a required setting is missing: ANTHROPIC_API_KEY, NIMBLE_API_KEY" in page
-    assert "Last lines" in page and "No results were saved." in page and "Next: step 2, Email sellers" not in page and "sk-ant-..." not in page
+    assert "Last lines" in page and "No results were saved." in page and "Continue to step 2: Email sellers" not in page and "sk-ant-..." not in page
     with keys("billing"):
         jid = started(post(env, "/search/start", choice="preset", confirm_count="3"))
         meta = env.jobs.wait(jid)
@@ -1010,7 +1019,7 @@ def results_table_is_honest_about_recommended_draftable_and_excluded(env):
     assert "3 products searched: 1 have a seller to contact; 1 have no recommended seller; 1 are on the reviewer&#39;s do-not-use list" in page
     assert "Stub Maker 0" in page and "alibaba.com" in page and "$1.25" in page and "90%" in page
     assert "Reference unit price" in page and "$10.00" in page and "reference list, 2026-01-01" in page          # carried by the file, relabelled
-    assert "Downloaded files keep their original wording" in page and "Next: step 2, Email sellers" in page
+    assert "Downloaded files keep their original wording" in page and "Continue to step 2: Email sellers" in page
     assert f'/step/emails?wf={Path(name).stem}"' in page and f'value="{Path(name).stem}" selected' in page       # the rail follows the run
     assert env.client.get(f"/files/Excel Output Sheets/{name}").status_code == 200
     report = search_mod.parse_progress(env.jobs.read_log(jid)[0])["report"]
@@ -1067,7 +1076,9 @@ def input_file_choice_is_a_listed_file_with_a_bounded_limit(env):
     assert search_mod.input_files(env.settings) == ["products.xlsx"]                      # only .xlsx, only the project folder itself
     assert search_mod.input_products(env.settings, "products.xlsx") == [("IN-1", "L-Com cable"), ("IN-2", "Adapter"), ("IN-3", "Plug kw")]
     page = env.client.get("/step/search").text
-    assert '<option value="products.xlsx">' in page and "sourcing_results_2026" not in page.split("input_file")[1].split("</select>")[0]
+    sheets = page.split('id="sheets"')[1].split("</ul>")[0]                              # the one list of spreadsheets that can be searched
+    assert 'href="/step/search?file=products.xlsx"' in sheets and "sourcing_results_2026" not in sheets
+    page = env.client.get("/step/search?file=products.xlsx").text                        # the sheet's own page: its rows and options
     with keys():
         r = clean(post(env, "/search/review", choice="file", input_file="products.xlsx", limit="2").text)
         assert "About 2 products, roughly $0.16 and 2 minutes." in r and "first 2 rows" in r

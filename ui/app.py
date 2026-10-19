@@ -14,9 +14,10 @@ from fastapi.templating import Jinja2Templates
 
 from . import pipeline, search, security, uploads, wording
 from .commands import JobRejected
-from .config import ENV_VARS, MAX_FACTS_BYTES, MAX_UPLOAD_BYTES, OUTPUT_FOLDERS, Settings, changed_reference_files, is_set, load_settings
+from .config import (CAPABILITIES, ENV_VARS, MAX_FACTS_BYTES, MAX_UPLOAD_BYTES, OUTPUT_FOLDERS, Settings, changed_reference_files, is_optional,
+                     is_set, load_settings, plain_names, tracing_on)
 from .jobs import JobBusy, JobManager, mask_line
-from .workflows import STEP_LABELS, STEP_TEXT, STEPS, Step, list_workflows, next_step, result_rows, search_detail, steps_for
+from .workflows import STEP_LABELS, STEP_TEXT, STEPS, Step, list_workflows, next_step, result_rows, search_detail, steps_for, upload_time
 
 HERE = Path(__file__).resolve().parent
 STEP_SLUGS = {name.lower().replace(" ", "-"): name for name in STEPS}
@@ -37,7 +38,8 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
     templates = Jinja2Templates(directory=str(HERE / "templates"))        # autoescape is on for .html
     templates.env.finalize = wording.display                               # every printed value gets display wording (attributes too)
     app.state.templates = templates                                        # tests render through this same environment
-    templates.env.globals.update(app_name=s.app_name, badge_kind=badge_kind, job_badge=lambda st: JOB_BADGES.get(st, st), step_labels=STEP_LABELS)
+    templates.env.globals.update(app_name=s.app_name, badge_kind=badge_kind, job_badge=lambda st: JOB_BADGES.get(st, st))
+    templates.env.filters.update(upload_time=upload_time, plain_names=plain_names)
     app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
     security.install(app, s)
 
@@ -66,9 +68,11 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
             out = rs["search"]["output"]
             if current["file"] == out or not (s.results_dir / out).exists():
                 steps[0] = Step("Search", "Running", "A search is running. Each product's result is saved as soon as it finishes.")
+        here = STEPS.index(ctx["step_name"]) if ctx.get("step_name") in STEPS else None
         base = dict(request=request, csrf=security.csrf_for(getattr(request.state, "sid", "")), workflows=wfs, wf=wf,
                     current=current, steps=steps, running=jobs.running_state_job(), active=active, page_title=ctx.pop("page_title", ""),
-                    tabs=[(name, slug) for slug, name in STEP_SLUGS.items()], next_step=next_step(steps))
+                    next_step=next_step(steps),                      # Home's Continue: the first step whose output the files do not show
+                    following=steps[here + 1] if here is not None and here + 1 < len(steps) else None)   # a step page's Continue
         return templates.TemplateResponse(request, name, {**base, **ctx}, status_code=status)
 
     def csrf(request: Request, token: str) -> None:
@@ -337,7 +341,8 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
         if not facts or view["facts"] != facts:
             raise JobRejected("Choose a product details sheet you uploaded. Listings are only written from details a person filled in. Nothing was started.")
         if view["missing"]:
-            raise JobRejected(f"Nothing was started: {', '.join(view['missing'])} {'is' if len(view['missing']) == 1 else 'are'} not set.")
+            raise JobRejected(f"Nothing was started: {plain_names(view['missing'])} {'is' if len(view['missing']) == 1 else 'are'} not set up "
+                              f"({', '.join(view['missing'])}).")
         if not view["count"]:
             raise JobRejected("The approved list holds no product. Nothing was started.")
         return file, view
@@ -420,7 +425,8 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
                       preset=search.PRESET_SKUS, preset_missing=[k for k in search.PRESET_SKUS if k not in have],
                       files=search.input_files(s), uploaded=search.upload_files(s), max_limit=search.MAX_LIMIT,
                       max_mb=MAX_UPLOAD_BYTES // (1024 * 1024), review=review, preview=preview, preview_file=asked_file,
-                      preview_label=asked_file[len(search.UPLOAD_PREFIX):] if asked_file.startswith(search.UPLOAD_PREFIX) else asked_file,
+                      preview_label=(f"your spreadsheet uploaded {upload_time(asked_file) or asked_file[len(search.UPLOAD_PREFIX):]}"
+                                     if asked_file.startswith(search.UPLOAD_PREFIX) else asked_file),
                       **common)
 
     def selection(choice: str, sku: list, input_file: str, limit: str, add_builtin: str, rows: str = "") -> dict:
@@ -467,7 +473,8 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
             return search_page(request, 400, error=str(e))
         missing = [n for n, _ in search.REQUIRED_KEYS if not is_set(s, n)]
         if missing:
-            return search_page(request, 400, error=f"Nothing was started: {', '.join(missing)} is not set.")
+            return search_page(request, 400, error=f"Nothing was started: {plain_names(missing)} {'is' if len(missing) == 1 else 'are'} "
+                                                   f"not set up ({', '.join(missing)}).")
         count, typed = len(sel["products"]), confirm_count.strip()
         if not typed.isdigit() or int(typed) != count:
             return search_page(request, 400, review=sel, error="That is not the number of products selected. Nothing was started.")
@@ -487,10 +494,13 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
 
     @app.get("/health", response_class=HTMLResponse)
     def health(request: Request):
-        env = [{"name": n, "set": is_set(s, n), "blocks": why} for n, why in ENV_VARS]
+        env = [{"name": n, "set": is_set(s, n), "blocks": why, "optional": is_optional(n)} for n, why in ENV_VARS]
+        filled = {e["name"]: e["set"] for e in env}
+        capabilities = [(what, all(filled[n] for n in needs)) for what, needs in CAPABILITIES]
         folders = [(n, (s.project / n).is_dir()) for n in OUTPUT_FOLDERS]
-        obs_on = os.environ.get("OBS_ENABLED") == "1"
+        obs_on = os.environ.get("OBS_ENABLED") == "1"          # only for the reachability check below, as before
         return render(request, "health.html", active="health", page_title="Setup", env=env, folders=folders, obs_on=obs_on,
+                      capabilities=capabilities, all_set=all(ok for _, ok in capabilities), tracing=tracing_on(s),
                       python=sys.version.split()[0], langfuse=langfuse_status() if obs_on else None,
                       project_ok=s.project.is_dir(), data_ok=s.data.is_dir(), zone=pipeline.zone_label(),
                       changed=changed_reference_files(s))

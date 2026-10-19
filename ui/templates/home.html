@@ -1,40 +1,38 @@
 {% extends "base.html" %}
-{% from "_macros.html" import badge %}
+{% from "_macros.html" import badge, tech %}
 {% block main %}
 <h1>Overview</h1>
+<section class="intro" aria-label="What this tool does">
+  <p>This tool helps you find cheaper suppliers for your products and prepare the orders, in five steps:</p>
+  <ol class="intro-steps">
+    <li><strong>Find suppliers.</strong> Upload a spreadsheet of your products. The tool searches supplier websites and compares their prices.</li>
+    <li><strong>Email sellers.</strong> Ask the sellers the search found for a sample and a price quote.</li>
+    <li><strong>Get approval.</strong> Send your manager a summary, then record their answer.</li>
+    <li><strong>Order sheet.</strong> Get an Excel sheet of what to buy. You place the orders yourself.</li>
+    <li><strong>Listings.</strong> Draft Walmart listings from product details you have checked.</li>
+  </ol>
+  <p>You confirm every step. Nothing is sent, approved or bought without you.</p>
+</section>
 {% if not workflows %}
-<div class="card empty">
-  <p><strong>No searches yet.</strong></p>
-  <p>Start by uploading a spreadsheet of your products. The tool then finds suppliers for each one.</p>
-  <p><a href="/step/search">Start with step 1: Find suppliers</a></p>
-</div>
+<div class="continue"><a class="btn btn-primary" href="/step/search">Start: upload your products</a></div>
 {% else %}
-<div class="latest">
-  <h2>Search of {{ current.label }}</h2>
-  <span class="muted small">Results spreadsheet: <code>{{ current.file }}</code></span>
-</div>
-<p class="muted">These show what has been done, not whether anyone has checked or approved it.</p>
-<div class="table-wrap">
-  <table class="stack">
-    <caption class="sr">Steps for this search</caption>
-    <thead><tr><th scope="col">Step</th><th scope="col">Status</th><th scope="col">Detail</th></tr></thead>
-    <tbody>
-    {% for st in steps %}
-    <tr>
-      <th scope="row"><a href="/step/{{ st.slug }}?wf={{ wf }}">{{ st.number }}. {{ st.label }}</a></th>
-      <td data-label="Status">{{ badge(st.status) }}</td>
-      <td data-label="Detail">{{ st.detail }}{% if st.blocked %}{% if st.detail %}<br>{% endif %}<strong>Why it cannot start yet:</strong> {{ st.blocked }}{% endif %}</td>
-    </tr>
-    {% endfor %}
-    </tbody>
-  </table>
+<h2>Search of {{ current.label }}</h2>
+{% if steps %}<p>{{ steps[0].detail }}</p>{% endif %}
+<div class="continue" id="continue">
+  {% if not next_step %}
+  <p>Every step has produced its output. <a href="/step/search">Start a new search</a></p>
+  {% elif next_step.blocked %}
+  <p>{{ badge(next_step.status) }} <strong>Step {{ next_step.number }}, {{ next_step.label }}, cannot start yet:</strong> {{ next_step.blocked }}</p>
+  {% else %}
+  <p><a class="btn btn-primary" href="/step/{{ next_step.slug }}?wf={{ wf }}">Continue: step {{ next_step.number }}, {{ next_step.label }}</a>
+    {{ badge(next_step.status) }} <span class="muted small">{{ next_step.detail }}</span></p>
+  {% endif %}
 </div>
 
 <h2>Your searches</h2>
 <ul class="list card">
   {% for w in recent %}
-  <li><a href="/?wf={{ w.stem }}" {% if w.stem == wf %}aria-current="true"{% endif %}>{{ w.label }}</a>
-    <span class="muted small">{{ w.file }}</span></li>
+  <li><a href="/?wf={{ w.stem }}" {% if w.stem == wf %}aria-current="true"{% endif %}>{{ w.label }}</a></li>
   {% endfor %}
 </ul>
 {% if all_count > recent|length %}
@@ -42,10 +40,12 @@
   <summary>Show all ({{ all_count }})</summary>
   <ul class="list">
     {% for w in workflows %}
-    <li><a href="/?wf={{ w.stem }}">{{ w.label }}</a> <span class="muted small">{{ w.file }}</span></li>
+    <li><a href="/?wf={{ w.stem }}">{{ w.label }}</a></li>
     {% endfor %}
   </ul>
 </details>
 {% endif %}
+<p><a href="/step/search">Start a new search</a></p>
+{% call tech() %}<p>The results of the search of {{ current.label }} are in the Excel Output Sheets folder as <code>{{ current.file }}</code>.</p>{% endcall %}
 {% endif %}
 {% endblock %}

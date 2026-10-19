@@ -1,19 +1,29 @@
 {% extends "base.html" %}
-{% from "_macros.html" import badge %}
+{% from "_macros.html" import badge, tech, todo, why %}
 {% block main %}
 <h1>Order sheet</h1>
 <p>{{ step_text }}</p>
-{% include "_strip.html" %}
 {% if error %}<div class="notice danger" role="alert">{{ error }}</div>{% endif %}
-{% if current %}
+{% if not current %}
+{% call todo() %}<p>There is no search yet, so there is nothing to order. <a href="/step/search">Start with step 1: Find suppliers</a></p>{% endcall %}
+{% else %}
+{% call todo() %}
+{% if not view.export.exists %}<p>Save the approved list in <a href="/step/approvals?wf={{ wf }}">step 3, Get approval</a>, first.</p>
+{% elif not view.export.mine %}<p>The saved approved list belongs to a different search. Save it again in <a href="/step/approvals?wf={{ wf }}">step 3, Get approval</a>, for this search.</p>
+{% elif not steps[3].done %}<p>Create the order sheet, download it, then place each order yourself on the seller's website.</p>
+{% else %}<p>Download the newest order sheet below and place each order yourself on the seller's website.</p>{% endif %}
+{% endcall %}
 {% include "_joblog.html" %}
 <div class="notice"><strong>This only creates an Excel file.</strong> Nothing is added to a cart, and nothing is ordered or paid: you place each order yourself on the seller's website.</div>
 {% include "_export.html" %}
+{% set why_build = 'Another task is running.' if running else
+                   ('Save the approved list in step 3 first.' if not view.export.exists else
+                    'The saved approved list belongs to a different search.' if not view.export.mine else '') %}
 <form method="post" action="/order/build" class="gap">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
   <input type="hidden" name="wf" value="{{ wf }}">
-  <button type="submit" class="btn-primary" {{ 'disabled' if running or not view.export.mine }}>Create the order sheet</button>
-  <span class="muted small">It checks each approval again (expiry, seller, price) and says what it left out.</span>
+  <button type="submit" class="btn-primary" {{ 'disabled' if why_build }}>Create the order sheet</button>{{ why(why_build) }}
+  <p class="muted small">It checks each approval again (expiry, seller, price) and says what it left out.</p>
 </form>
 
 <h2>Order sheets</h2>
@@ -25,5 +35,6 @@
 {% else %}
 <div class="card empty"><p><strong>No order sheet has been created yet.</strong></p></div>
 {% endif %}
+{% include "_continue.html" %}
 {% endif %}
 {% endblock %}

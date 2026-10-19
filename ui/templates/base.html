@@ -14,8 +14,6 @@
     <a class="brand" href="/">{{ app_name }}</a>
     <nav class="nav" aria-label="Main">
       <a href="/{{ '?wf=' ~ wf if wf else '' }}" {% if active == 'workflow' and not step_name %}aria-current="page"{% endif %}>Home</a>
-      {% for name, slug in tabs %}<a href="/step/{{ slug }}{{ '?wf=' ~ wf if wf else '' }}" {% if step_name == name %}aria-current="page"{% endif %}>{{ step_labels[name] }}</a>
-      {% endfor %}
       <a href="/jobs" {% if active == 'jobs' %}aria-current="page"{% endif %}>Activity</a>
       <a href="/health" {% if active == 'health' %}aria-current="page"{% endif %}>Setup</a>
     </nav>
@@ -48,11 +46,7 @@
       </select>
       <noscript><button type="submit" class="btn">Show</button></noscript>
     </form>
-    <ol class="stepper" aria-label="Steps">
-      {% for st in steps %}
-      <li><a href="/step/{{ st.slug }}?wf={{ wf }}" {% if step_name == st.name %}aria-current="page"{% endif %}>{{ st.label }} {{ badge(st.status) }}</a></li>
-      {% endfor %}
-    </ol>
+    {% include "_strip.html" %}
     {% else %}
     <p class="muted small">No searches yet. Each search you run appears here, with its five steps.</p>
     <p class="small"><a href="/step/search">Start with step 1: Find suppliers</a></p>

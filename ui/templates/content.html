@@ -1,15 +1,17 @@
 {% extends "base.html" %}
-{% from "_macros.html" import badge %}
+{% from "_macros.html" import badge, tech, todo, why %}
 {% block main %}
 <h1>Listings</h1>
 <p>{{ step_text }}</p>
-{% include "_strip.html" %}
 {% if error %}<div class="notice danger" role="alert">{{ error }}</div>{% endif %}
-{% if current %}
-{% if confirm %}
+{% set why_busy = 'Another task is running.' if running else '' %}
+{% if not current %}
+{% call todo() %}<p>There is no search yet, so there is nothing to list. <a href="/step/search">Start with step 1: Find suppliers</a></p>{% endcall %}
+{% elif confirm %}
+{% call todo() %}<p>Check the products and the number of AI requests. To start, type the number of products and press Write the listings.</p>{% endcall %}
 <h2>Check and confirm</h2>
 <p><strong>{{ view.count }} product{{ 's' if view.count != 1 }}</strong> in the approved list: {{ view.skus|join(', ') }}.</p>
-<p>Product details sheet: <code>{{ view.facts }}</code>{% if view.summary and view.summary.readable %} ({{ view.summary.facts }} detail{{ 's' if view.summary.facts != 1 }} filled in for {{ view.summary.products }} product{{ 's' if view.summary.products != 1 }}){% endif %}.</p>
+<p>Product details: the sheet uploaded {{ view.facts|upload_time or view.facts }}{% if view.summary and view.summary.readable %} ({{ view.summary.facts }} detail{{ 's' if view.summary.facts != 1 }} filled in for {{ view.summary.products }} product{{ 's' if view.summary.products != 1 }}){% endif %}.</p>
 <div class="notice warn"><strong>This calls the AI service and spends money.</strong> It makes up to {{ view.calls_each }} AI requests per product, so up to {{ view.calls_each * view.count }} for this run. The listings are drafts for you to check; nothing is published.</div>
 <form method="post" action="/content/generate" class="confirm">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
@@ -18,22 +20,33 @@
   <label for="confirm_count">Type the number of products to confirm</label>
   <div class="inline-fields">
     <input type="text" id="confirm_count" name="confirm_count" inputmode="numeric" autocomplete="off" size="6" required>
-    <button type="submit" class="btn-primary" {{ 'disabled' if running }}>Write the listings</button>
+    <button type="submit" class="btn-primary" {{ 'disabled' if why_busy }}>Write the listings</button>{{ why(why_busy) }}
     <a href="/step/listing-content?wf={{ wf }}&amp;facts={{ view.facts }}">Back</a>
   </div>
 </form>
+{% call tech() %}<p>Product details file: <code>{{ view.facts }}</code> in the Uploads folder.</p>{% endcall %}
 
 {% else %}
+{% set why_list = 'Save the approved list in step 3 first.' if not view.export.exists else
+                  ('The saved approved list belongs to a different search.' if not view.export.mine else '') %}
+{% call todo() %}
+{% if why_list %}<p>{{ why_list }} <a href="/step/approvals?wf={{ wf }}">Go to step 3, Get approval</a></p>
+{% elif not view.facts_files %}<p>Create the product details sheet, fill it in, and upload it. Listings are written only from details you have checked.</p>
+{% elif view.missing %}<p>Writing listings is not set up yet (see step 4 below). You can still check what was read from your sheet.</p>
+{% elif not steps[4].done %}<p>Check what was read from your sheet, then write the listings.</p>
+{% else %}<p>Download the listings below and check them before you upload anything to Walmart.</p>{% endif %}
+{% endcall %}
 {% include "_joblog.html" %}
 <div class="notice"><strong>This only creates files.</strong> The listings are drafts for you to check, edit and upload yourself. Nothing is published, and this tool sets no price or product code.</div>
 {% include "_export.html" %}
 
 <h2>1. Get the product details sheet</h2>
+{% set why_template = why_busy or why_list %}
 <form method="post" action="/content/template">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
   <input type="hidden" name="wf" value="{{ wf }}">
-  <button type="submit" class="btn" {{ 'disabled' if running or not view.export.mine }}>Create the product details sheet</button>
-  <span class="muted small">A spreadsheet (.csv, opens in Excel) with one row per product detail to fill in, for the products in the approved list.</span>
+  <button type="submit" class="btn" {{ 'disabled' if why_template }}>Create the product details sheet</button>{{ why(why_template) }}
+  <p class="muted small">A spreadsheet (.csv, opens in Excel) with one row per product detail to fill in, for the products in the approved list.</p>
 </form>
 {% if view.templates %}
 <ul class="list card gap">
@@ -61,14 +74,14 @@
   <input type="hidden" name="wf" value="{{ wf }}">
   <label for="facts">Product details sheet to use</label>
   <div class="inline-fields">
-    <select id="facts" name="facts">{% for f in view.facts_files %}<option value="{{ f }}" {{ 'selected' if f == view.facts }}>{{ f }}</option>{% endfor %}</select>
+    <select id="facts" name="facts">{% for f in view.facts_files %}<option value="{{ f }}" {{ 'selected' if f == view.facts }}>Uploaded {{ f|upload_time or f }}</option>{% endfor %}</select>
     <button type="submit" class="btn">Show</button>
   </div>
 </form>
 {% if view.summary and view.summary.readable %}
 <div class="table-wrap gap">
   <table class="stack words">
-    <caption>{{ view.summary.facts }} detail{{ 's' if view.summary.facts != 1 }} filled in for {{ view.summary.products }} product{{ 's' if view.summary.products != 1 }} in {{ view.facts }}</caption>
+    <caption>{{ view.summary.facts }} detail{{ 's' if view.summary.facts != 1 }} filled in for {{ view.summary.products }} product{{ 's' if view.summary.products != 1 }}</caption>
     <thead><tr><th scope="col">Status, as written in the file</th><th scope="col" class="num">Details</th></tr></thead>
     <tbody>{% for status, n in view.summary.by_status %}<tr><th scope="row">{{ status }}</th><td data-label="Details" class="num">{{ n }}</td></tr>{% endfor %}</tbody>
   </table>
@@ -76,28 +89,28 @@
 {% else %}
 <div class="notice warn gap">That product details sheet could not be read.</div>
 {% endif %}
+{% call tech() %}<p>Product details file: <code>{{ view.facts }}</code> in the Uploads folder.</p>{% endcall %}
 
 <h2>4. Write the listings</h2>
-{% if view.missing %}<div class="notice warn">Not possible yet: {{ view.missing|join(' and ') }} {{ 'is' if view.missing|length == 1 else 'are' }} not set.</div>{% endif %}
+{% if view.missing %}<div class="notice warn"><strong>Writing listings is not set up yet:</strong> {{ view.missing|plain_names }} {{ 'is' if view.missing|length == 1 else 'are' }} not set. Ask whoever set up this tool.</div>{% endif %}
+{% set why_write = why_list or ('Writing listings is not set up yet.' if view.missing else ('The approved list holds no product.' if not view.count else '')) %}
 <form method="post" action="/content/review">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
   <input type="hidden" name="wf" value="{{ wf }}">
   <input type="hidden" name="facts" value="{{ view.facts }}">
-  <button type="submit" class="btn-primary" {{ 'disabled' if view.missing or not view.export.mine or not view.count }}>Next: check and confirm</button>
-  <span class="muted small">Nothing starts yet. The next page shows how many products and AI requests, and asks you to type the count.</span>
+  <button type="submit" class="btn-primary" {{ 'disabled' if why_write }}>Next: check and confirm</button>{{ why(why_write) }}
+  <p class="muted small">Nothing starts yet. The next page shows how many products and AI requests, and asks you to type the count.</p>
 </form>
 {% endif %}
 
 <h2>Your listings</h2>
 {% if view.listings %}
 <ul class="list card">
-  {% for f in view.listings %}<li><a href="/files/Walmart Listings/{{ f.name }}">{{ f.name }}</a> <span class="muted small">written {{ f.at }}</span></li>
-  {% endfor %}
+  {% for f in view.listings %}<li><a href="/files/Walmart Listings/{{ f.name }}">{{ f.name }}</a> <span class="muted small">written {{ f.at }}</span></li>{% endfor %}
 </ul>
 <p class="muted small">Each run saves an Excel file (.xlsx) and a text version (.md). Check them before uploading anything. Downloaded files keep their original wording.</p>
 {% else %}
 <div class="card empty"><p><strong>No listings have been written yet.</strong></p></div>
-{% endif %}
 {% endif %}
 {% endif %}
 {% endblock %}

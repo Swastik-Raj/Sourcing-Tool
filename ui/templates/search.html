@@ -1,14 +1,74 @@
 {% extends "base.html" %}
-{% from "_macros.html" import badge %}
+{% from "_macros.html" import badge, tech, todo, why %}
 {% block main %}
 <h1>Find suppliers</h1>
 {% if error %}<div class="notice danger" role="alert">{{ error }}</div>{% endif %}
+{% set why_start = 'A search cannot start yet: see above.' if missing else ('Another task is running.' if busy else '') %}
 
 {% if view == 'form' %}
 <p>{{ step_text }}</p>
+{% call todo() %}<p>Upload a spreadsheet of your products. The next page shows what was read, and nothing starts until you have checked the cost and confirmed.</p>
+<p class="muted small">This starts a new search. The search chosen in the left column is the one steps 2 to 5 work on.</p>{% endcall %}
+{% if missing %}
+<div class="notice warn"><strong>A search cannot start yet.</strong> {{ missing|plain_names }} {{ 'is' if missing|length == 1 else 'are' }} not set up. Ask whoever set up this tool to add {{ 'it' if missing|length == 1 else 'them' }} to the <code>.env</code> file in the project folder, then reload this page.</div>
+{% endif %}
+{% if busy %}
+<div class="notice warn"><strong>A search cannot start while another task is running:</strong> {{ busy.label }} (started {{ busy.started_at|replace('T', ' ') }}). <a href="/jobs/{{ busy.id }}">View that task</a></div>
+{% endif %}
 <div class="notice warn"><strong>A search costs money: it uses paid AI and web search services.</strong> Its results need checking by a person.</div>
 
-<h2>Services a search needs</h2>
+<h2>Upload a spreadsheet of your products</h2>
+<form method="post" action="/search/upload" enctype="multipart/form-data" class="confirm">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <label for="sheet">Excel file (.xlsx), up to {{ max_mb }} MB and {{ max_limit }} products</label>
+  <div class="inline-fields">
+    <input type="file" id="sheet" name="sheet" accept=".xlsx" required>
+    <button type="submit" class="btn-primary">Upload and preview</button>
+  </div>
+  <p class="muted small">The first sheet needs a column headed <code>SKU</code> (your product code) in one of its first 5 rows. A <code>Keyword</code> or <code>Product</code> column with a short description helps the search. Uploading starts nothing: the next page shows what was read.</p>
+</form>
+{% if uploaded or files %}
+<h2>Or use a spreadsheet that is already here</h2>
+<ul class="list card" id="sheets">
+  {% for f in uploaded %}<li><a href="/step/search?file={{ f|urlencode }}">Spreadsheet uploaded {{ f|upload_time or f[8:] }}</a> <span class="muted small">preview and choose products</span></li>{% endfor %}
+  {% for f in files %}<li><a href="/step/search?file={{ f|urlencode }}">{{ f }}</a> <span class="muted small">in the project folder: preview and choose products</span></li>{% endfor %}
+</ul>
+{% endif %}
+
+<details class="more">
+  <summary>More options: search the tool's built-in sample products</summary>
+  <form method="post" action="/search/review" id="search-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <fieldset class="choices">
+      <legend class="sr">Which built-in products to search</legend>
+      <div class="choice">
+        <label><input type="radio" name="choice" value="preset" data-count="{{ preset|length }}" {{ 'disabled' if preset_missing }}> 3-product test <span class="muted">({{ preset|join(', ') }})</span></label>
+        {% if preset_missing %}<p class="muted small">Not available: {{ preset_missing|join(', ') }} {{ 'is' if preset_missing|length == 1 else 'are' }} not in the built-in product list.</p>{% endif %}
+      </div>
+      <div class="choice">
+        <label><input type="radio" name="choice" value="all" data-count="{{ builtin|length }}" {{ 'disabled' if not builtin }}> All built-in products <span class="muted">({{ builtin|length }}: a sample list that comes with the tool)</span></label>
+      </div>
+      <div class="choice">
+        <label><input type="radio" name="choice" value="choose" {{ 'disabled' if not builtin }}> Choose built-in products</label>
+        {% if builtin %}
+        <div class="sub">
+          <label for="sku-filter" class="small">Find a product</label>
+          <input type="search" id="sku-filter" autocomplete="off">
+          <ul class="checklist" id="sku-list">
+            {% for sku, description in builtin %}
+            <li><label><input type="checkbox" name="sku" value="{{ sku }}"> <strong>{{ sku }}</strong> <span class="muted">{{ description }}</span></label></li>
+            {% endfor %}
+          </ul>
+        </div>
+        {% else %}<p class="muted small">The built-in product list could not be read.</p>{% endif %}
+      </div>
+    </fieldset>
+    <p id="sel-count" class="muted" aria-live="polite"></p>
+    <button type="submit" class="btn-primary" data-needs-choice {{ 'data-blocked disabled' if why_start }}>Next: check the cost</button>{{ why(why_start) }}<span class="why" id="choose-first" hidden>Choose which products to search first.</span>
+    <p class="muted small">Nothing starts yet. The next page shows the cost estimate and asks you to confirm.</p>
+  </form>
+</details>
+{% if missing %}{% call tech() %}
 <div class="table-wrap">
   <table class="stack">
     <caption class="sr">Settings a search needs</caption>
@@ -22,80 +82,11 @@
     </tbody>
   </table>
 </div>
-{% if missing %}
-<div class="notice warn gap"><strong>A search cannot start yet.</strong> {{ missing|join(' and ') }} {{ 'is' if missing|length == 1 else 'are' }} not set up. Ask whoever set up this tool to add {{ 'it' if missing|length == 1 else 'them' }} to the <code>.env</code> file in the project folder, then reload this page.</div>
-{% endif %}
-{% if busy %}
-<div class="notice warn gap"><strong>A search cannot start while another task is running:</strong> {{ busy.label }} (started {{ busy.started_at|replace('T', ' ') }}). <a href="/jobs/{{ busy.id }}">View that task</a></div>
-{% endif %}
-
-<h2>Upload a spreadsheet of your products</h2>
-<form method="post" action="/search/upload" enctype="multipart/form-data" class="confirm">
-  <input type="hidden" name="csrf_token" value="{{ csrf }}">
-  <label for="sheet">Excel file (.xlsx), up to {{ max_mb }} MB and {{ max_limit }} products</label>
-  <div class="inline-fields">
-    <input type="file" id="sheet" name="sheet" accept=".xlsx" required>
-    <button type="submit" class="btn">Upload and preview</button>
-  </div>
-  <p class="muted small">The first sheet needs a column headed <code>SKU</code> (your product code) in one of its first 5 rows. A <code>Keyword</code> or <code>Product</code> column with a short description helps the search. Uploading starts nothing: the next page shows what was read.</p>
-</form>
-{% if uploaded or files %}
-<details {{ 'open' if uploaded }}>
-  <summary>Spreadsheets you can search ({{ uploaded|length + files|length }})</summary>
-  <ul class="list">
-    {% for f in uploaded %}<li><a href="/step/search?file={{ f|urlencode }}">{{ f[8:] }}</a> <span class="muted small">uploaded: preview and choose products</span></li>{% endfor %}
-    {% for f in files %}<li><a href="/step/search?file={{ f|urlencode }}">{{ f }}</a> <span class="muted small">in the project folder: preview and choose products</span></li>{% endfor %}
-  </ul>
-</details>
-{% endif %}
-
-<h2>Which products</h2>
-<form method="post" action="/search/review" id="search-form">
-  <input type="hidden" name="csrf_token" value="{{ csrf }}">
-  <fieldset class="choices">
-    <legend class="sr">Which products to search</legend>
-    <div class="choice">
-      <label><input type="radio" name="choice" value="preset" data-count="{{ preset|length }}" {{ 'disabled' if preset_missing else 'checked' }}> 3-product test <span class="muted">({{ preset|join(', ') }})</span></label>
-      {% if preset_missing %}<p class="muted small">Not available: {{ preset_missing|join(', ') }} {{ 'is' if preset_missing|length == 1 else 'are' }} not in the built-in product list.</p>{% endif %}
-    </div>
-    <div class="choice">
-      <label><input type="radio" name="choice" value="all" data-count="{{ builtin|length }}" {{ 'disabled' if not builtin }} {{ 'checked' if preset_missing and builtin }}> All built-in products <span class="muted">({{ builtin|length }}: a sample list that comes with the tool)</span></label>
-    </div>
-    <div class="choice">
-      <label><input type="radio" name="choice" value="choose" {{ 'disabled' if not builtin }}> Choose products</label>
-      {% if builtin %}
-      <div class="sub">
-        <label for="sku-filter" class="small">Find a product</label>
-        <input type="search" id="sku-filter" autocomplete="off">
-        <ul class="checklist" id="sku-list">
-          {% for sku, description in builtin %}
-          <li><label><input type="checkbox" name="sku" value="{{ sku }}"> <strong>{{ sku }}</strong> <span class="muted">{{ description }}</span></label></li>
-          {% endfor %}
-        </ul>
-      </div>
-      {% else %}<p class="muted small">The built-in product list could not be read.</p>{% endif %}
-    </div>
-    {% if files or uploaded %}
-    <div class="choice">
-      <label><input type="radio" name="choice" value="file"> Use a spreadsheet that is already here</label>
-      <div class="sub inline-fields">
-        <span><label for="input_file" class="small">Uploaded spreadsheet, or one in the project folder</label>
-          <select id="input_file" name="input_file">{% for f in uploaded %}<option value="{{ f }}">{{ f[8:] }} (uploaded)</option>{% endfor %}{% for f in files %}<option value="{{ f }}">{{ f }}</option>{% endfor %}</select></span>
-        <span><label for="limit" class="small">Only the first rows (optional, 1 to {{ max_limit }})</label>
-          <input type="number" id="limit" name="limit" min="1" max="{{ max_limit }}" inputmode="numeric"></span>
-      </div>
-      <p><label class="plain"><input type="checkbox" name="add_builtin" value="1" {{ 'disabled' if not builtin }}> Also include the built-in products <span class="muted">({{ builtin|length }}, searched after the file's rows)</span></label></p>
-
-    </div>
-    {% endif %}
-  </fieldset>
-  <p id="sel-count" class="muted" aria-live="polite"></p>
-  <button type="submit" class="btn-primary" {{ 'disabled' if missing or busy }}>Next: check the cost</button>
-  <span class="muted small">Nothing starts yet. The next page shows the cost estimate and asks you to confirm.</span>
-</form>
+{% endcall %}{% endif %}
 
 {% elif view == 'preview' %}
 <p><a href="/step/search">Back</a></p>
+{% call todo() %}<p>Check what was read, choose which of these products to search, then check the cost. Nothing starts yet.</p>{% endcall %}
 <h2>What was read from {{ preview_label }}</h2>
 <dl class="stats card">
   <div><dt>Products (rows with a SKU)</dt><dd>{{ preview.count }}</dd></div>
@@ -114,7 +105,7 @@
   </table>
 </div>
 <h2>Which products</h2>
-{% if missing %}<div class="notice warn"><strong>A search cannot start yet.</strong> {{ missing|join(' and ') }} {{ 'is' if missing|length == 1 else 'are' }} not set up.</div>{% endif %}
+{% if missing %}<div class="notice warn"><strong>A search cannot start yet.</strong> {{ missing|plain_names }} {{ 'is' if missing|length == 1 else 'are' }} not set up. Ask whoever set up this tool.</div>{% endif %}
 <form method="post" action="/search/review" id="search-form">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
   <input type="hidden" name="choice" value="file">
@@ -141,11 +132,12 @@
     </div>
   </fieldset>
   <p><label class="plain"><input type="checkbox" name="add_builtin" value="1" {{ 'disabled' if not builtin }}> Also include the built-in products <span class="muted">({{ builtin|length }}, searched after the sheet's rows; not with chosen products)</span></label></p>
-  <button type="submit" class="btn-primary" {{ 'disabled' if missing or busy }}>Next: check the cost</button>
-  <span class="muted small">Nothing starts yet. The next page shows the cost estimate and asks you to confirm.</span>
+  <button type="submit" class="btn-primary" {{ 'disabled' if why_start }}>Next: check the cost</button>{{ why(why_start) }}
+  <p class="muted small">Nothing starts yet. The next page shows the cost estimate and asks you to confirm.</p>
 </form>
 
 {% elif view == 'review' %}
+{% call todo() %}<p>Check the products and the cost. To start the search, type the number of products and press Start search.</p>{% endcall %}
 <h2>Check the cost and confirm</h2>
 <p><strong>{{ review.label }}:</strong> {{ review.estimate.count }} product{{ 's' if review.estimate.count != 1 }}.</p>
 <details {{ 'open' if review.products|length <= 12 }}>
@@ -156,7 +148,7 @@
 </details>
 <div class="notice"><strong>About {{ review.estimate.count }} product{{ 's' if review.estimate.count != 1 }}, roughly ${{ review.estimate.cost }} and {{ review.estimate.minutes }} minute{{ 's' if review.estimate.minutes != 1 }}.</strong> This is an estimate from one 15-product batch (about ${{ review.estimate.cost_each }} and about {{ review.estimate.seconds_each }} seconds per product), not a measurement of this run.</div>
 <div class="notice warn"><strong>A search costs money: it uses paid AI and web search services.</strong> Its results need checking by a person.</div>
-{% if missing %}<div class="notice warn"><strong>A search cannot start yet.</strong> {{ missing|join(' and ') }} {{ 'is' if missing|length == 1 else 'are' }} not set up.</div>{% endif %}
+{% if missing %}<div class="notice warn"><strong>A search cannot start yet.</strong> {{ missing|plain_names }} {{ 'is' if missing|length == 1 else 'are' }} not set up. Ask whoever set up this tool.</div>{% endif %}
 {% if busy %}<div class="notice warn"><strong>A search cannot start while another task is running:</strong> {{ busy.label }}. <a href="/jobs/{{ busy.id }}">View that task</a></div>{% endif %}
 <form method="post" action="/search/start" class="confirm">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
@@ -168,12 +160,13 @@
   <label for="confirm_count">Type the number of products to confirm</label>
   <div class="inline-fields">
     <input type="text" id="confirm_count" name="confirm_count" inputmode="numeric" autocomplete="off" size="6" required>
-    <button type="submit" class="btn-primary" {{ 'disabled' if missing or busy }}>Start search</button>
+    <button type="submit" class="btn-primary" {{ 'disabled' if why_start }}>Start search</button>{{ why(why_start) }}
     <a href="/step/search">Back</a>
   </div>
 </form>
 
 {% elif view == 'running' %}
+{% call todo() %}<p>The search is running. You can leave this page: the search keeps going, and each product is saved as soon as it finishes.</p>{% endcall %}
 <p>{{ badge('Running') }} {{ info.selection }}. Started {{ job.started_at|replace('T', ' ') }}.</p>
 <div class="card" id="progress" data-total="{{ progress.total or 0 }}">
   <p class="progress-line"><strong>Product <span id="p-started">{{ progress.started }}</span> of <span id="p-total">{{ progress.total or '?' }}</span></strong>
@@ -193,14 +186,17 @@
     <button type="submit" class="btn-danger">Cancel search</button>
   </form>
 </details>
-<h2>Technical log</h2>
+{% call tech() %}
 <p class="muted small">Wording differs from the raw log file.</p>
 <pre id="log" data-job="{{ job.id }}" data-offset="{{ offset }}" data-running="yes">{{ log }}</pre>
+{% endcall %}
 
 {% else %}
+{% call todo() %}{% if table %}<p>Check the results: each recommendation needs checking by a person. Then continue to step 2, Email sellers.</p>
+{% else %}<p>This search saved no results. Read what went wrong below, then start another search.</p>{% endif %}{% endcall %}
 <p>{% if job.status == 'succeeded' %}<strong>The search has finished.</strong>{% else %}{{ badge(job_badge(job.status)) }}{% endif %}
   {{ info.selection }}. Started {{ job.started_at|replace('T', ' ') }}{% if job.duration_s is not none %}, took {{ job.duration_s }} s{% endif %}.
-  {% if job.exit_code is not none %}Exit code {{ job.exit_code }}: {{ job.exit_meaning }}{% endif %}</p>
+  {% if job.exit_code is not none %}{{ job.exit_meaning }}{% endif %}</p>
 {% if job.note %}<div class="notice warn" role="alert">{{ job.note }}</div>{% endif %}
 {% for line in reading %}<div class="notice danger">{{ line }}</div>{% endfor %}
 {% if progress.final_cost is not none or progress.cost %}
@@ -248,18 +244,20 @@
 </div>
 <h2>Files</h2>
 <ul class="list card">
-  <li><a href="/files/Excel Output Sheets/{{ results_file }}">Download the results (Excel)</a> <span class="muted small">{{ results_file }}</span></li>
-  {% if report and report.copied %}<li><a href="/files/Reports/{{ report.name }}">Download the report</a> <span class="muted small">{{ report.name }} (a copy in Reports; the original stays in the project folder)</span></li>
+  <li><a href="/files/Excel Output Sheets/{{ results_file }}">Download the results (Excel)</a></li>
+  {% if report and report.copied %}<li><a href="/files/Reports/{{ report.name }}">Download the report</a></li>
   {% elif report %}<li><span>{{ report.problem }}{% if report.name %} The report file is <code>{{ report.name }}</code> in the project folder.{% endif %}</span></li>{% endif %}
 </ul>
 <p class="muted small">Downloaded files keep their original wording, so some labels differ from these pages.</p>
-<p><a href="/step/emails?wf={{ wf }}"><strong>Next: step 2, Email sellers</strong></a></p>
+{% include "_continue.html" %}
 {% endif %}
-<details>
-  <summary>Technical log</summary>
-  <p class="muted small">Wording differs from the raw log file.</p>
-  <pre>{{ log }}</pre>
-</details>
 <p><a href="/step/search">Start another search</a></p>
+{% call tech() %}
+{% if job.exit_code is not none %}<p>Exit code {{ job.exit_code }}.</p>{% endif %}
+{% if table %}<p>Results file: <code>{{ results_file }}</code> in the Excel Output Sheets folder.</p>{% endif %}
+{% if report and report.copied %}<p>Report: <code>{{ report.name }}</code> (a copy in Reports; the original stays in the project folder).</p>{% endif %}
+<p class="muted small">Wording differs from the raw log file.</p>
+<pre>{{ log }}</pre>
+{% endcall %}
 {% endif %}
 {% endblock %}

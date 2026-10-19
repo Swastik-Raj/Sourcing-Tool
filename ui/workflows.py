@@ -3,6 +3,7 @@ internal id (observability.workflow_id, the agents' own function) is only mapped
 what the files show."""
 import importlib.util
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -111,6 +112,15 @@ def friendly_label(modified: datetime, products) -> str:
     hour = modified.hour % 12 or 12
     when = f"{modified:%b} {modified.day}, {hour}:{modified:%M} {'AM' if modified.hour < 12 else 'PM'}"
     return when + (f", {products} product{'s' if products != 1 else ''}" if products is not None else "")
+
+
+def upload_time(name: str) -> str:
+    """'Oct 19, 10:28 AM' for a file the server named <kind>_<date>_<time>_<random> when it was uploaded; '' for any other."""
+    m = re.search(r"_(\d{8})_(\d{6})_[0-9a-f]{6}\.", name or "")
+    try:
+        return friendly_label(datetime.strptime(m[1] + m[2], "%Y%m%d%H%M%S"), None) if m else ""
+    except ValueError:
+        return ""
 
 
 def list_workflows(s: Settings) -> list:
@@ -313,9 +323,9 @@ def steps_for(s: Settings, results_name: str) -> list:
     built = bool(mine and sheet and sheet.stat().st_mtime >= exported_at)       # a sheet older than the export was built from an earlier one
     if exp_err:
         order = Step("Order sheet", BLOCKED, "", exp_err)
-    elif mine is None:
-        why = "Needs a valid approval, saved as the approved list in step 3, Get approval." if approvals.status != FOUND else ""
-        order = Step("Order sheet", BLOCKED if why else NOT_STARTED, "No approved list saved for this search yet.", why,
+    elif mine is None:                              # an order sheet is built only from this search's saved approved list
+        order = Step("Order sheet", BLOCKED, "No approved list saved for this search yet.",
+                     "Needs a valid approval, saved as the approved list in step 3, Get approval.",
                      [("No order sheet for this search's approved list", False)])
     else:
         extra = f" Newest order sheet: {sheet.name} (a sheet's name does not say which search it came from)." if sheet else " No order sheet yet."

@@ -4,16 +4,22 @@ document.querySelectorAll("[data-autosubmit]").forEach(function (el) {
 });
 
 // Search page: filter the product checklist and show how many products are selected (the server recounts on submit).
+// Nothing is pre-selected, so "Next: check the cost" stays greyed out, with its reason beside it, until a choice is made.
+// Without JavaScript the button works and the server refuses an empty choice with the same reason.
 (function () {
   var form = document.getElementById("search-form");
   if (!form) return;
   var out = document.getElementById("sel-count"), filter = document.getElementById("sku-filter");
+  var next = form.querySelector("button[data-needs-choice]"), first = document.getElementById("choose-first");
   function count() {
     if (!out) return;                      // the sheet preview form has no counter: the next page counts
     var choice = form.querySelector("input[name=choice]:checked");
-    if (!choice) { out.textContent = ""; return; }
-    var n = choice.value === "choose" ? form.querySelectorAll("input[name=sku]:checked").length : choice.dataset.count;
-    out.textContent = n === undefined ? "The products in the file are counted on the next page." : n + " product" + (String(n) === "1" ? "" : "s") + " selected.";
+    var n = !choice ? 0 : choice.value === "choose" ? form.querySelectorAll("input[name=sku]:checked").length : choice.dataset.count;
+    out.textContent = choice ? n + " product" + (String(n) === "1" ? "" : "s") + " selected." : "";
+    if (next && !next.hasAttribute("data-blocked")) {     // a reason the server gave (setup missing, another task) is left alone
+      next.disabled = String(n) === "0";
+      if (first) { first.hidden = !next.disabled; }
+    }
   }
   form.addEventListener("change", function (e) {
     var pick = form.querySelector("input[value=choose], input[value=pick]");

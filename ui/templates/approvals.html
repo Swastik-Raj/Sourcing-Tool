@@ -1,14 +1,22 @@
 {% extends "base.html" %}
-{% from "_macros.html" import badge %}
+{% from "_macros.html" import badge, tech, todo, why %}
 {% block main %}
 <h1>Get approval</h1>
 <p>{{ step_text }}</p>
-{% include "_strip.html" %}
 {% if error %}<div class="notice danger" role="alert">{{ error }}</div>{% endif %}
-{% if current %}
+{% if not current %}
+{% call todo() %}<p>There is no search yet, so there is nothing to approve. <a href="/step/search">Start with step 1: Find suppliers</a></p>{% endcall %}
+{% else %}
+{% call todo() %}
+{% if not view.requests %}<p>Create the request below, then send its text to your manager yourself. Nothing is ordered here.</p>
+{% elif view.open %}<p>Send request {{ view.open|map(attribute='id')|join(', ') }} to your manager yourself. When they answer, record their answer below.</p>
+{% elif view.valid_skus and not view.export.mine %}<p>Save the approved list below, so steps 4 and 5 can use it.</p>
+{% elif view.valid_skus %}<p>The approved list is saved. Continue to step 4, Order sheet. Save the list again after any new approval or withdrawal.</p>
+{% else %}<p>No approval is valid right now. Create a new request if you still want to order.</p>{% endif %}
+{% endcall %}
 {% include "_joblog.html" %}
 {% if view.problem %}<div class="notice danger">{{ view.problem }}</div>{% endif %}
-<div class="notice">Your manager decides, not this tool. You create a request from the search results and the seller replies, send it to your manager yourself, then type in their answer. Nothing is ordered here.</div>
+{% set why_busy = 'Another task is running.' if running else '' %}
 
 <h2>1. Create the request for your manager</h2>
 <form method="post" action="/approvals/request" class="confirm">
@@ -18,10 +26,10 @@
   <div class="notice warn"><strong>No seller has been contacted yet.</strong> The request would say that seller replies are unavailable. Usually you finish step 2, Email sellers, first.
     <p><label class="plain"><input type="checkbox" name="ack" value="1" required> Create the request anyway, without seller replies</label></p></div>
   {% endif %}
-  <label for="budget">Budget to compare the total against (optional, for example 1500)</label>
+  <label for="budget">Budget to compare the total against, in US dollars (optional, for example 1500)</label>
   <div class="inline-fields">
-    <input type="text" id="budget" name="budget" inputmode="decimal" autocomplete="off" size="10">
-    <button type="submit" class="btn-primary" {{ 'disabled' if running }}>Create the request</button>
+    <span class="money"><span aria-hidden="true">$</span><input type="text" id="budget" name="budget" inputmode="decimal" autocomplete="off" size="10"></span>
+    <button type="submit" class="btn-primary" {{ 'disabled' if why_busy }}>Create the request</button>{{ why(why_busy) }}
   </div>
 </form>
 
@@ -63,7 +71,7 @@
       <input type="text" id="approver" name="approver" autocomplete="off" size="20" required></span>
   </div>
   <p class="muted small">These three are typed by you every time. They are never filled in, suggested or remembered by this tool.</p>
-  <button type="submit" class="btn-primary" {{ 'disabled' if running }}>Record the answer</button>
+  <button type="submit" class="btn-primary" {{ 'disabled' if why_busy }}>Record the answer</button>{{ why(why_busy) }}
 </form>
 {% endif %}
 
@@ -92,17 +100,18 @@
   <label for="revoke_sku">Withdraw an approval: type its product code (SKU)</label>
   <div class="inline-fields">
     <input type="text" id="revoke_sku" name="sku" autocomplete="off" size="20" required>
-    <button type="submit" class="btn-danger" {{ 'disabled' if running }}>Withdraw</button>
+    <button type="submit" class="btn-danger" {{ 'disabled' if why_busy }}>Withdraw</button>{{ why(why_busy) }}
   </div>
 </form>
 {% endif %}
 
 <h2>3. Save the approved list</h2>
+{% set why_save = why_busy or ('Create a request first.' if not view.requests else '') %}
 <form method="post" action="/approvals/export">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
   <input type="hidden" name="wf" value="{{ wf }}">
-  <button type="submit" class="btn-primary" {{ 'disabled' if running or not view.requests }}>Save the approved list</button>
-  <span class="muted small">Saves the approvals that are valid right now as the approved list that steps 4 and 5 use. Nothing is ordered.</span>
+  <button type="submit" class="btn-primary" {{ 'disabled' if why_save }}>Save the approved list</button>{{ why(why_save) }}
+  <p class="muted small">Saves the approvals that are valid right now as the approved list that steps 4 and 5 use. Nothing is ordered.</p>
 </form>
 {% if view.export.exists and view.export.mine %}
 <p class="gap">The approved list was saved for this search at {{ view.export.at }} and holds {{ view.export.count }} valid approval{{ 's' if view.export.count != 1 }}.
@@ -110,5 +119,6 @@
 {% elif view.export.exists %}
 <div class="notice warn gap">The saved approved list belongs to a different search (<code>{{ view.export.source }}</code>), not to <code>{{ current.file }}</code>. Save the approved list again here before creating an order sheet or listings.</div>
 {% endif %}
+{% include "_continue.html" %}
 {% endif %}
 {% endblock %}

@@ -10,6 +10,7 @@ from typing import Callable, Optional
 
 from .commands import CANCEL_WARNINGS, GENERIC_EXITS, SKU_RE, Command, JobRejected, Param
 from .config import MAX_PRODUCT_ROWS, UPLOADS_FOLDER, Settings
+from .workflows import upload_time
 
 AGENT = "sourcing_agent.py"
 REQUIRED_KEYS = (("ANTHROPIC_API_KEY", "The AI service key: the AI reads the supplier pages"),
@@ -157,7 +158,8 @@ def resolve_selection(s: Settings, choice: str, skus=(), input_file: str = "", l
     if choice == "file":
         rows = input_products(s, input_file)
         params = {"input": input_file}
-        shown = "Uploaded spreadsheet " + input_file[len(UPLOAD_PREFIX):] if input_file.startswith(UPLOAD_PREFIX) else f"Spreadsheet {input_file}"
+        shown = (f"Spreadsheet uploaded {upload_time(input_file) or input_file[len(UPLOAD_PREFIX):]}" if input_file.startswith(UPLOAD_PREFIX)
+                 else f"Spreadsheet {input_file}")
         if skus:                                      # the agent's own --input FILE --sku A B: only SKUs that are in this file
             if str(limit or "").strip() or add_builtin:
                 raise JobRejected("Chosen products cannot be combined with a row limit or the built-in products option.")

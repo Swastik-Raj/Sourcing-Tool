@@ -1,3 +1,17 @@
 {% macro badge(label, kind=None) -%}
 <span class="badge badge-{{ kind or badge_kind(label) }}">{{ label }}</span>
 {%- endmacro %}
+
+{# Reference information only (setting names, exit codes, file names, logs). Never a refusal, an error, missing setup that
+   blocks the step, or a confirmation line: those stay in view. A native details element: no JavaScript, reachable by keyboard. #}
+{% macro tech(summary="Technical details", open=False) -%}
+<details class="tech" {{ 'open' if open }}><summary>{{ summary }}</summary>{{ caller() }}</details>
+{%- endmacro %}
+
+{# The one "What to do now" box at the top of a page. #}
+{% macro todo() -%}
+<section class="todo" aria-labelledby="todo-h"><h2 id="todo-h">What to do now</h2>{{ caller() }}</section>
+{%- endmacro %}
+
+{# Why a button is greyed out, printed right next to it. A button is disabled exactly when its reason is not empty. #}
+{% macro why(text) -%}{% if text %}<span class="why">{{ text }}</span>{% endif %}{%- endmacro %}

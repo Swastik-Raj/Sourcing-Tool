@@ -26,10 +26,11 @@ folders it uses, the name in the header and how long job logs are kept. A host o
 | 5. Listings | `content_agent.py facts-template`, `generate --facts <uploaded file>` | Fill in the product details sheet (the facts file) yourself and upload it; type the number of products |
 
 The pages call a results file "a search", the export "the approved list", and the facts file "the product details sheet".
-The top bar also has Activity (every task started, with its log) and Setup (which settings are filled in).
-
-Every step after Find suppliers works on one search, chosen in the "Working on the search of" box, and shows a progress box
-for it. The box is read from files on disk and its "Next" link only opens a page.
+The top bar has Home, Activity (every task started, with its log) and Setup (which settings are filled in). The five steps are
+in the left column only: each with its status and one line read from files on disk. Every step after Find suppliers works on
+the search chosen there ("Working on the search of"). Each page starts with one "What to do now" box and ends with "Continue
+to step N" (or why that step cannot start yet). Setting names, exit codes, logs and internal file names are under
+"Technical details"; refusals, errors, missing setup that blocks a step and every confirmation line are never collapsed.
 
 Things the UI will not do:
 

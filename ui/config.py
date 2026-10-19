@@ -114,5 +114,44 @@ def is_set(s: Settings, name: str) -> bool:
         return False
 
 
+PLAIN_NAMES = {"ANTHROPIC_API_KEY": "the AI service key", "NIMBLE_API_KEY": "the web search key", "SMTP_HOST": "the mail server",
+               "SMTP_USER": "the mail login", "SMTP_PASSWORD": "the mail password", "SHIPPING_ADDRESS": "the shipping address",
+               "BRAND_NAME": "the brand name"}      # how a page names a missing setting outside its Technical details
+
+
+def plain_names(names) -> str:
+    """'the mail server, the mail login and the shipping address'."""
+    words = [PLAIN_NAMES.get(n, n) for n in names]
+    return " and ".join([", ".join(words[:-1]), words[-1]] if len(words) > 1 else words)
+
+
+def is_optional(name: str) -> bool:
+    """A setting whose absence stops nothing (its 'what it is for' text says so)."""
+    return dict(ENV_VARS).get(name, "").startswith(("Optional", "Run tracing"))
+
+
+# What a person can do, and the settings each needs filled in. The Setup page says "Set up" only when all are filled in:
+# it cannot tell whether a key works, so it never says "ready" or "working".
+CAPABILITIES = (("Finding suppliers", ("ANTHROPIC_API_KEY", "NIMBLE_API_KEY")),
+                ("Reading seller replies", ("ANTHROPIC_API_KEY",)),
+                ("Sending emails to sellers", ("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD", "SHIPPING_ADDRESS")),
+                ("Writing listings", ("ANTHROPIC_API_KEY", "BRAND_NAME")))
+
+
+def tracing_on(s: Settings) -> bool:
+    """Whether the agents' runs are traced, decided as observability.py decides it: the environment first, then OBS_* and
+    LANGFUSE_* from the .env beside the agents (its _load_env_file, which never overrides the environment), then on only
+    when OBS_ENABLED is "1" and both Langfuse keys are non-empty (its _wanted). Only this yes/no leaves the function."""
+    env = dict(os.environ)
+    try:
+        from dotenv import dotenv_values
+        for k, v in dotenv_values(s.project / ".env").items():
+            if v is not None and (k.startswith("LANGFUSE_") or k.startswith("OBS_")):
+                env.setdefault(k, v)
+    except Exception:  # noqa: BLE001 - as observability.py: an unreadable .env adds nothing
+        pass
+    return env.get("OBS_ENABLED") == "1" and bool(env.get("LANGFUSE_PUBLIC_KEY")) and bool(env.get("LANGFUSE_SECRET_KEY"))
+
+
 def is_loopback(host: str) -> bool:
     return host.strip("[]") in LOOPBACK

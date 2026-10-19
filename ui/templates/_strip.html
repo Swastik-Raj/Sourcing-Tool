@@ -1,20 +1,14 @@
-{# The progress box for the selected search. Everything on it is read from files; the links only open a page. #}
-{% if current %}
+{# The only progress on the pages: one line per step in the left column, read from files. The links only open a page. #}
+{% from "_macros.html" import badge %}
 <section class="strip" aria-label="Progress">
-  <p class="muted small">Progress for the search of {{ current.label }}. It shows what has been done, not whether anyone has checked or approved it.</p>
-  <ol>
+  <ol class="stepper">
     {% for st in steps %}
-    <li {% if st.name == step_name %}aria-current="step"{% endif %}>
-      <a href="/step/{{ st.slug }}?wf={{ wf }}">{{ st.label }}</a>
-      <ul>
-        {% for text, state in st.items %}<li class="{{ 'yes' if state is true else 'no' if state is false else 'fact' }}">{{ text }}</li>{% endfor %}
-      </ul>
+    <li>
+      <a href="/step/{{ st.slug }}?wf={{ wf }}" {% if step_name == st.name %}aria-current="step"{% endif %}>{{ st.label }} {{ badge(st.status) }}</a>
+      <p class="summary">{% if st.blocked %}{{ st.blocked }}{% elif st.items %}{% for text, state in st.items %}<span class="{{ 'yes' if state is true else 'no' if state is false else 'fact' }}">{{ text }}</span>{{ ' · ' if not loop.last }}{% endfor %}{% else %}{{ st.detail }}{% endif %}</p>
     </li>
     {% endfor %}
   </ol>
-  {% if next_step %}<p class="next">Next: <a href="/step/{{ next_step.slug }}?wf={{ wf }}">step {{ next_step.number }}, {{ next_step.label }}</a> <span class="muted small">(opens the page; nothing starts until you confirm there)</span></p>
-  {% else %}<p class="next muted">Every step has produced its output.</p>{% endif %}
+  {% if not next_step %}<p class="muted small all-done">Every step has produced its output.</p>{% endif %}
+  <p class="muted small">This shows what has been done, not whether anyone has checked or approved it.</p>
 </section>
-{% else %}
-<div class="notice">There is no search yet, so there is nothing to work on here. <a href="/step/search">Start with step 1: Find suppliers</a></div>
-{% endif %}

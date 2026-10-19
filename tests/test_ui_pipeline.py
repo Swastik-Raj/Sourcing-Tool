@@ -86,6 +86,21 @@ def raises(exc, fn, *a, **kw):
     raise AssertionError(f"expected {exc.__name__} from {getattr(fn, '__name__', fn)}{a}{kw}")
 
 
+def tripped(fn, *a):
+    """The tripwire's own refusal, and nothing else: any other outcome (the call going through, or failing for another
+    reason such as a missing file) means the tripwire did not stop it, and says so."""
+    what = f"{getattr(fn, '__name__', fn)}{a}"
+    try:
+        fn(*a)
+    except AssertionError as e:
+        if "the real project folder was used" in str(e):
+            return e
+        raise AssertionError(f"the tripwire did not stop {what}: {e}")
+    except Exception as e:  # noqa: BLE001
+        raise AssertionError(f"the tripwire did not stop {what}: {type(e).__name__}: {e}")
+    raise AssertionError(f"the tripwire did not stop {what}: it went through")
+
+
 class Skip(Exception):
     """Raised by a test that cannot run on this system. The runner counts it and prints the reason; it is never silent."""
 
@@ -501,6 +516,18 @@ def strip_of(env, stem, slug="emails") -> str:
     return page.split('<section class="strip"')[1].split("</section>")[0]
 
 
+def continue_of(env, stem) -> str:
+    """Home's Continue: the first step whose output the files do not show yet."""
+    return env.client.get(f"/?wf={stem}").text.split('id="continue"')[1].split("</div>")[0]
+
+
+def outside_details(html: str) -> str:
+    """What a page shows before anything is expanded: a closed <details> keeps only its summary."""
+    def shown(m):
+        return m[0] if re.search(r"\bopen\b", m[1]) else (re.search(r"<summary>.*?</summary>", m[2], re.S) or [""])[0]
+    return re.sub(r"(<details\b[^>]*>)(.*?)</details>", shown, html, flags=re.S)
+
+
 @test
 def status_strip_follows_the_files(env):
     old, new = "sourcing_results_20260101_100000", "sourcing_results_20260202_100000"
@@ -509,9 +536,10 @@ def status_strip_follows_the_files(env):
     results_file(env, new + ".xlsx", [("B2", "Maker B", "b@maker-b.example", url_b), ("C3", "Maker C", "", url_c), ("D4", "", "", "")])
     strip = strip_of(env, new)
     for text in ("Results saved", "3 products", "2 sellers to contact", "0 contacted", "0 replies recorded", "No request yet",
-                 "No order sheet for this search", "No product details yet", "Not written since the approved list was saved"):
+                 "Needs a valid approval, saved as the approved list in step 3, Get approval.",      # a step that cannot start shows why
+                 "Needs the approved list from step 3, Get approval."):
         assert text in strip, (text, strip)
-    assert 'Next: <a href="/step/emails?wf=' + new in strip
+    assert f'href="/step/emails?wf={new}"' in continue_of(env, new)
     assert "<form" not in strip and "<button" not in strip and "<input" not in strip, "the strip only links; it starts nothing"
     assert env.jobs.list() == []
     # email_state.json is one file for every results file: an entry counts for a results file only when its key
@@ -553,7 +581,8 @@ def status_strip_follows_the_files(env):
     assert "Approved list not saved" in strip_of(env, new), "an export made for another results file is not this file's"
     (env.project / "approved_orders.json").write_text(json.dumps({"source_results_file": new + ".xlsx", "valid_approvals": 1, "generated_at": "x", "orders": []}))
     strip = strip_of(env, new)
-    assert ">Approved list saved<" in strip and "Not created since the approved list was saved" in strip and 'Next: <a href="/step/order-sheet?wf=' in strip, strip
+    assert ">Approved list saved<" in strip and "Not created since the approved list was saved" in strip, strip
+    assert f'href="/step/order-sheet?wf={new}"' in continue_of(env, new)
     # order sheet and listings count only when they are newer than the export
     for folder, name in (("Order Sheets", "order_sheet_20260101_000000.xlsx"), ("Walmart Listings", "walmart_listings_20260101_000000.xlsx")):
         (env.project / folder).mkdir()
@@ -573,7 +602,8 @@ def status_strip_follows_the_files(env):
     assert "Newest order sheet: order_sheet_20260303_000000.xlsx" in steps["Order sheet"].detail, steps["Order sheet"].detail
     assert workflows.newest_facts(env.settings).name == "facts_20260303_000000_abcdef.csv"
     assert "Newest listings file: walmart_listings_20260303_000000.xlsx" in steps["Listing content"].detail, steps["Listing content"].detail
-    assert "Next:" not in strip and 'aria-current="step"' in strip
+    cont = continue_of(env, new)
+    assert not re.search(r'href="/step/[a-z-]+\?wf=', cont) and "Every step has produced its output." in cont and 'aria-current="step"' in strip
 
 
 @test
@@ -581,14 +611,19 @@ def results_file_choice_is_validated_server_side(env):
     results_file(env, "sourcing_results_20260101_100000.xlsx", [("A1", "Maker A", "", "https://a.example/1")], mtime=time.time() - 9000)
     results_file(env, "sourcing_results_20260202_100000.xlsx", [("B2", "Maker B", "", "https://b.example/2"), ("C3", "", "", "")])
     (env.project / "elsewhere.xlsx").write_bytes((env.project / "Excel Output Sheets" / "sourcing_results_20260101_100000.xlsx").read_bytes())
-    label = {w["stem"]: w["label"] for w in workflows.list_workflows(env.settings)}         # the progress box names a search by its label
+    label = {w["stem"]: w["label"] for w in workflows.list_workflows(env.settings)}         # the picker names a search by its label
     assert label["sourcing_results_20260101_100000"] != label["sourcing_results_20260202_100000"], label
+
+    def shows(page, stem):                          # the picker selects that search, and every progress link is for it
+        strip = page.split('<section class="strip"')[1].split("</section>")[0]
+        links = re.findall(r'href="/step/[a-z-]+\?wf=([^"]*)"', strip)
+        return f'<option value="{stem}" selected' in page and len(links) == 5 and set(links) == {stem}
     for slug in ("emails", "approvals", "order-sheet", "listing-content"):
         picked = env.client.get(f"/step/{slug}?wf=sourcing_results_20260101_100000").text
-        assert f"Progress for the search of {label['sourcing_results_20260101_100000']}." in picked and "1 product<" in picked
+        assert shows(picked, "sourcing_results_20260101_100000") and "1 product<" in picked
         for bad in ("..\\elsewhere", "../elsewhere", "elsewhere", str(env.project / "elsewhere"), "sourcing_results_20260101_100000.xlsx", "nope", ""):
             page = env.client.get(f"/step/{slug}", params={"wf": bad}).text                 # anything not in the folder: the newest file, never a path
-            assert f"Progress for the search of {label['sourcing_results_20260202_100000']}." in page and "elsewhere" not in page, (slug, bad)
+            assert shows(page, "sourcing_results_20260202_100000") and "elsewhere" not in page, (slug, bad)
         assert 'name="step" value="' in picked and '<label for="wf">Working on the search of</label>' in picked     # the selector is on every tab
     r = env.client.get("/", params={"wf": "sourcing_results_20260101_100000", "step": "Approvals"}, follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/step/approvals?wf=sourcing_results_20260101_100000"
@@ -598,7 +633,7 @@ def results_file_choice_is_validated_server_side(env):
     for bad in ("elsewhere.xlsx", "..\\elsewhere.xlsx", "Excel Output Sheets\\sourcing_results_20260101_100000.xlsx", str(env.project / "elsewhere.xlsx"), ""):
         raises(JobRejected, rule, bad)
     nav = env.client.get("/step/emails").text.split('<nav class="nav"')[1].split("</nav>")[0]
-    assert re.findall(r">([^<>]+)</a>", nav) == ["Home", "Find suppliers", "Email sellers", "Get approval", "Order sheet", "Listings", "Activity", "Setup"], nav
+    assert re.findall(r">([^<>]+)</a>", nav) == ["Home", "Activity", "Setup"], nav               # the steps are in the left column only
 
 
 @test
@@ -708,19 +743,18 @@ def tripwire_stays_strong_outside_its_own_cleanup(env):
     the real project; and rmtree of the real project folder. Deleting is switched off while that last one is tried, so
     even a broken tripwire could not remove anything."""
     global _CLEANING
-    e = raises(AssertionError, open, REAL / "README.md")                                    # an absolute path into the real project
-    assert "the real project folder was used" in str(e)
+    tripped(open, REAL / "README.md")                                                       # an absolute path into the real project
     _CLEANING = env.root.resolve()                                                          # ...also in the middle of a cleanup
     try:
-        raises(AssertionError, open, REAL / "README.md")
-        raises(AssertionError, os.listdir, REAL / "Excel Output Sheets")
+        tripped(open, REAL / "README.md")
+        tripped(os.listdir, REAL / "Excel Output Sheets")
     finally:
         _CLEANING = None
     here = os.getcwd()
     os.chdir(REAL)                                                                          # a bare name, outside any cleanup
     try:
-        raises(AssertionError, open, "README.md")
-        raises(AssertionError, open, os.path.join("no_such_folder_for_this_test", "x.log"), "a")   # (a path that could not be created anyway)
+        tripped(open, "README.md")
+        tripped(open, os.path.join("no_such_folder_for_this_test", "x.log"), "a")           # (a path that could not be created anyway)
     finally:
         os.chdir(here)
     real_delete = (os.unlink, os.rmdir, os.remove)
@@ -729,8 +763,7 @@ def tripwire_stays_strong_outside_its_own_cleanup(env):
         raise PermissionError("deleting is switched off in this test")
     os.unlink = os.rmdir = os.remove = refuse
     try:
-        e = raises(AssertionError, shutil.rmtree, REAL)                                     # stopped at its first look, before any delete
-        assert "the real project folder was used" in str(e), e
+        tripped(shutil.rmtree, REAL)                            # stopped while rmtree lists the folders, before any delete
         assert len(VIOLATIONS) >= 6, VIOLATIONS
         VIOLATIONS.clear()
         e = raises(AssertionError, remove_temp, REAL)                                       # the allowance is only for a test's temp folder
@@ -1426,7 +1459,7 @@ def generate_needs_a_facts_file_and_the_typed_product_count(env):
             export(fake)
         for missing in ("ANTHROPIC_API_KEY", "BRAND_NAME"):
             with env_vars(**{**FAKE, missing: None}):
-                refused(post(fake, "/content/generate", wf=RES, facts=name, confirm_count="2"), f"{missing} is not set")
+                refused(post(fake, "/content/generate", wf=RES, facts=name, confirm_count="2"), f"is not set up ({missing})")
         assert len(FakePopen.calls) == 1
     finally:
         cleanup(fake)
@@ -1714,6 +1747,147 @@ def end_to_end_offline(env):
     finally:
         (out / "hold").unlink(missing_ok=True)
         cleanup(env)
+
+
+# ================= Layout: what is in view, what is collapsed, and where each page leads =================
+
+@test
+def search_starts_with_nothing_chosen_and_the_server_refuses_an_empty_choice(env):
+    """A new user cannot reach a paid search of sample products by accident: on first load nothing is chosen, and a request
+    that chose nothing is refused by the server too (the greyed-out button needs JavaScript; this refusal does not)."""
+    with env_vars(**FAKE):
+        page = env.client.get("/step/search").text
+        assert not re.search(r"<input\b[^>]*\bchecked", page), "no option may be pre-selected"
+        assert re.search(r'<button type="submit" class="btn-primary" data-needs-choice >Next: check the cost</button><span class="why" id="choose-first" hidden>'
+                         r"Choose which products to search first\.</span>", page)
+        assert '<button type="submit" class="btn-primary">Upload and preview</button>' in page          # the upload leads
+        up = uploaded_value(upload(env))
+        preview = env.client.get(f"/step/search?file={up}").text                # after an upload, all of that sheet's rows may be chosen
+        assert re.findall(r"<input\b[^>]*\bchecked[^>]*>", preview) == ['<input type="radio" name="rows" value="all" checked>'], preview
+        for data in ({}, {"choice": ""}, {"choice": "nothing"}, {"choice": "choose"}, {"choice": "file", "input_file": up, "rows": "pick"}):
+            for url in ("/search/review", "/search/start"):
+                r = post(env, url, confirm_count="3", **data)
+                assert r.status_code == 400 and ("Choose which products to search." in r.text or "No products are ticked." in r.text), (url, data, r.status_code)
+                assert outside_details(r.text).count('role="alert"') == 1, "the refusal is in view"
+        assert env.jobs.list() == []
+
+
+@test
+def refusals_errors_and_confirmations_are_never_collapsed(env):
+    """Condition B: only reference information is collapsed. Refusals, errors, setup that blocks the step and every
+    confirmation line are in view without expanding anything; every collapsed section is a native details element with its
+    summary first (no JavaScript, reachable by keyboard); and every greyed-out button says why, right next to it."""
+    fake = fake_env(agents=PHASE3_AGENTS)
+    try:
+        with env_vars(**FAKE):
+            open_request(fake, "A-0001")
+            checks = [
+                (post(fake, "/emails/send", wf=RES, confirm_count="7").text,
+                 ["That is not the number of emails listed. Nothing was sent.", "Type the number of emails to confirm", "This sends real emails to sellers."]),
+                (post(fake, "/search/start", choice="preset", confirm_count="9").text,
+                 ["That is not the number of products selected. Nothing was started.", "Type the number of products to confirm"]),
+                (post(fake, "/approvals/record", wf=RES, request_id="A-0001", reply="approve B2 qty 1 max 1", confirm_request="A-0009", channel="email", approver="X").text,
+                 ["The request number you typed is not the request you picked. Nothing was recorded.", "These three are typed by you every time."]),
+                (post(fake, "/order/build", wf=RES).text, ["There is no approved list yet. Save it in step 3, Get approval, first. Nothing was started."])]
+            export(fake)
+            name = facts_name(upload_facts(fake))
+            checks.append((post(fake, "/content/generate", wf=RES, facts=name, confirm_count="9").text,
+                           ["That is not the number of products listed. Nothing was started.", "Type the number of products to confirm",
+                            "This calls the AI service and spends money."]))
+        with env_vars(**{**FAKE, "SMTP_HOST": None, "BRAND_NAME": None}):
+            emails = fake.client.get(f"/step/emails?wf={RES}").text
+            checks += [(emails, ["Email sending is not set up yet:", "the mail server is not set"]),
+                       (fake.client.get(f"/step/listing-content?wf={RES}").text, ["Writing listings is not set up yet:", "the brand name is not set"])]
+        for html, texts in checks:
+            shown = outside_details(html)
+            for t in texts:
+                assert t in shown, (t, "collapsed or missing")
+            for start in re.findall(r"<details\b[^>]*>\s*(.{0,9})", html, re.S):
+                assert start == "<summary>", start
+            for m in re.finditer(r"<button\b[^>]*\bdisabled\b[^>]*>.*?</button>", html, re.S):
+                assert html[m.end():].startswith('<span class="why">'), m[0]
+        assert "SMTP_HOST" in emails and "SMTP_HOST" not in outside_details(emails), "a setting's name is reference information"
+    finally:
+        cleanup(fake)
+
+
+@test
+def continue_points_to_the_next_step_or_says_why_not(env):
+    """Each step page leads to the step after it, never to itself; when that step cannot start yet, the page says why
+    instead of offering a link."""
+    fake = fake_env(agents=PHASE3_AGENTS)
+    try:
+        def cont(slug):
+            page = fake.client.get(f"/step/{slug}?wf={RES}").text
+            return page.split('class="continue"')[1].split("</div>")[0] if 'class="continue"' in page else ""
+        assert f'href="/step/approvals?wf={RES}"' in cont("emails")
+        c = cont("approvals")
+        assert "Step 4, Order sheet, cannot start yet:</strong> Needs a valid approval" in c and "href=" not in c, c
+        c = cont("order-sheet")
+        assert "Step 5, Listings, cannot start yet:</strong> Needs the approved list" in c and "href=" not in c, c
+        assert cont("listing-content") == "", "the last step has no next step"
+        open_request(fake, "A-0001")                    # a request exists, but no approved list is saved for this search yet
+        c = cont("approvals")
+        assert "Step 4, Order sheet, cannot start yet:</strong> Needs a valid approval" in c and "href=" not in c, c
+        export(fake)
+        assert f'href="/step/order-sheet?wf={RES}"' in cont("approvals") and f'href="/step/listing-content?wf={RES}"' in cont("order-sheet")
+        for slug in ("emails", "approvals", "order-sheet", "listing-content"):
+            assert f'href="/step/{slug}?' not in cont(slug), slug
+    finally:
+        cleanup(fake)
+
+
+@test
+def setup_says_set_up_or_not_and_tracing_as_observability_decides(env):
+    """Condition D: 'Set up' / 'Not set up' from whether the settings are filled in, never 'ready' or 'working'. An optional
+    setting that is not set is neutral. Tracing is On/Off, decided exactly as observability.py decides it."""
+    with env_vars(**{**FAKE, "SMTP_HOST": None, "SMTP_PORT": None, "OBS_ENABLED": None, "LANGFUSE_PUBLIC_KEY": None, "LANGFUSE_SECRET_KEY": None}):
+        page = env.client.get("/health").text
+    rows = dict(re.findall(r'<th scope="row">([^<]+)</th><td data-label="Status"><span class="badge badge-[\w-]+">([^<]+)</span>', page))
+    assert (rows["Finding suppliers"], rows["Reading seller replies"], rows["Sending emails to sellers"], rows["Writing listings"]) == \
+        ("Set up", "Set up", "Not set up", "Set up"), rows
+    assert not re.search(r"(?i)\b(ready|working)\b", page)
+    row = lambda name: page.split(f"<code>{name}</code>")[1].split("</tr>")[0]
+    assert 'badge-not-started">Not set' in row("SMTP_PORT") and 'badge-not-set">Not set' in row("SMTP_HOST"), "optional: neutral; needed: a warning"
+    assert ">Off<" in row("OBS_ENABLED") and ">Set<" not in row("OBS_ENABLED") and ">Not set<" not in row("OBS_ENABLED")
+    # the same decision as observability.py's own _load_env_file and _wanted, run in a separate process on a copy of it
+    shutil.copy(REAL / "observability.py", env.project)
+    full = "OBS_ENABLED=1\nLANGFUSE_PUBLIC_KEY=pk\nLANGFUSE_SECRET_KEY=sk\n"
+    cases = [({}, full), ({"OBS_ENABLED": "0"}, full), ({}, "OBS_ENABLED=1\nLANGFUSE_PUBLIC_KEY=pk\n"),
+             ({"OBS_ENABLED": "1", "LANGFUSE_PUBLIC_KEY": "pk", "LANGFUSE_SECRET_KEY": "sk"}, ""), ({}, full.replace("=1", "=true")),
+             ({"LANGFUSE_SECRET_KEY": ""}, full)]
+    names, base = ("OBS_ENABLED", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"), {k: v for k, v in os.environ.items() if not k.startswith(("OBS_", "LANGFUSE_"))}
+    seen = []
+    for env_part, dotenv in cases:
+        (env.project / ".env").write_text(dotenv, encoding="utf-8")
+        child = subprocess.run([sys.executable, "-c", "import observability as o; o._load_env_file(); print(o._wanted())"],
+                               cwd=env.project, env={**base, **env_part}, capture_output=True, text=True, timeout=60)
+        with env_vars(**{n: env_part.get(n) for n in names}):
+            ours = config.tracing_on(env.settings)
+        assert child.returncode == 0 and ours == (child.stdout.strip() == "True"), (env_part, dotenv, ours, child.stdout, child.stderr[-300:])
+        seen.append(ours)
+    assert seen == [True, False, False, True, False, False], seen
+
+
+@test
+def email_sellers_leads_with_websites_when_no_seller_has_an_address(env):
+    fake = fake_env(agents=("email_agent.py", "decision_agent.py"))
+    try:
+        other = "sourcing_results_20260303_100000"
+        results_file(fake, other + ".xlsx", [("W1", "Maker W", "", "https://w.example/1"), ("W2", "Maker X", "", "https://x.example/2")])
+        with env_vars(**FAKE):
+            page = fake.client.get(f"/step/emails?wf={other}").text
+            usual = fake.client.get(f"/step/emails?wf={RES}").text
+            approvals = fake.client.get(f"/step/approvals?wf={RES}").text
+        todo = page.split('class="todo"')[1].split("</section>")[0]
+        assert "Contact these sellers through their websites, then mark them as contacted." in todo
+        assert page.index(". Preview the emails</h2>") < page.index(". Record what happened</h2>") < page.index(". Send</h2>"), "Send comes last"
+        assert usual.index(". Send</h2>") < usual.index(". Record what happened</h2>")
+        assert "ANTHROPIC_API_KEY" not in page and "ANTHROPIC_API_KEY" not in usual, "sending does not need the AI service key"
+        assert '<span aria-hidden="true">$</span><input type="text" id="budget"' in approvals and "in US dollars" in approvals
+        assert "Your manager decides, not this tool" not in approvals and approvals.count("This tool approves nothing itself.") == 1   # one explanation
+    finally:
+        cleanup(fake)
 
 
 def wait_for(cond, what, timeout=60):

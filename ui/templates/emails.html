@@ -1,12 +1,12 @@
 {% extends "base.html" %}
-{% from "_macros.html" import badge %}
+{% from "_macros.html" import badge, tech, todo, why %}
 {% block main %}
 <h1>Email sellers</h1>
 <p>{{ step_text }}</p>
-{% include "_strip.html" %}
 {% if error %}<div class="notice danger" role="alert">{{ error }}</div>{% endif %}
-{% if current %}
-{% if plan %}
+{% if not current %}
+{% call todo() %}<p>There is no search yet, so there is no seller to contact. <a href="/step/search">Start with step 1: Find suppliers</a></p>{% endcall %}
+{% elif plan %}
 <h2>{{ 'Check the test emails' if plan.test else 'Check who will be emailed' }}</h2>
 {% if plan.test %}
 <div class="notice warn"><strong>This is a TEST.</strong> Every email below goes only to <strong>{{ plan.test_recipient }}</strong>, with [TEST] in its subject. No seller is contacted and nothing is marked as sent.</div>
@@ -25,6 +25,7 @@
     </tbody>
   </table>
 </div>
+{% set why_send = 'Another task is running.' if running else ('There is nothing to send.' if not plan.count else '') %}
 <form method="post" action="/emails/send" class="confirm gap">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
   <input type="hidden" name="wf" value="{{ wf }}">
@@ -32,13 +33,22 @@
   <label for="confirm_count">Type the number of emails to confirm</label>
   <div class="inline-fields">
     <input type="text" id="confirm_count" name="confirm_count" inputmode="numeric" autocomplete="off" size="6" required>
-    <button type="submit" class="{{ 'btn' if plan.test else 'btn-danger' }}" {{ 'disabled' if running or not plan.count }}>{{ 'Send the TEST emails' if plan.test else 'Send to sellers' }}</button>
+    <button type="submit" class="{{ 'btn' if plan.test else 'btn-danger' }}" {{ 'disabled' if why_send }}>{{ 'Send the TEST emails' if plan.test else 'Send to sellers' }}</button>{{ why(why_send) }}
     <a href="/step/emails?wf={{ wf }}">Back without sending</a>
   </div>
   <p class="muted small">The tool counts again just before sending. If its count differs from yours, it sends nothing.</p>
 </form>
 
 {% else %}
+{% set no_email = view.known and view.drafts and not (view.drafts|selectattr('email')|list) %}
+{% call todo() %}
+{% if not view.known %}<p>Close the results spreadsheet if it is open in Excel, then reload this page.</p>
+{% elif not view.drafts %}<p>No product in this search has a seller to contact. <a href="/step/search">Start another search</a></p>
+{% elif no_email %}<p><strong>Contact these sellers through their websites, then mark them as contacted.</strong> None of them has an email address, so nothing can be emailed from here.</p>
+{% elif view.send_missing %}<p>Preview the emails. Sending needs email to be set up first (see Send); in the meantime you can contact sellers through their websites.</p>
+{% elif view.to_send %}<p>Preview the emails, send yourself a test copy, then send them to the {{ view.to_send|length }} seller{{ 's' if view.to_send|length != 1 }} with an email address.</p>
+{% else %}<p>Every seller with an email address has been emailed. When a seller replies, paste the reply under "Record what happened".</p>{% endif %}
+{% endcall %}
 {% include "_joblog.html" %}
 {% if view.problem %}<div class="notice danger">{{ view.problem }}</div>{% endif %}
 {% if not view.known %}
@@ -70,16 +80,42 @@
 </details>
 {% endif %}
 
-<h2>1. Preview the emails</h2>
+{% for part in (['preview', 'record', 'send'] if no_email else ['preview', 'send', 'record']) %}
+{% if part == 'preview' %}
+<h2>{{ loop.index }}. Preview the emails</h2>
+{% set why_preview = 'Another task is running.' if running else ('There is no seller to write to.' if not view.drafts else '') %}
 <form method="post" action="/emails/drafts">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
   <input type="hidden" name="wf" value="{{ wf }}">
   <p><label class="plain"><input type="checkbox" name="near_miss" value="1" {{ 'disabled' if not view.near_miss_file }}> Also preview emails to runner-up suppliers <span class="muted">(preview only: the search did not recommend them, and they are never sent from here)</span></label></p>
-  <button type="submit" class="btn-primary" {{ 'disabled' if running or not view.drafts }}>Preview the emails</button>
-  <span class="muted small">Sends nothing and saves nothing. The emails are shown on this page.</span>
+  <button type="submit" class="btn-primary" {{ 'disabled' if why_preview }}>Preview the emails</button>{{ why(why_preview) }}
+  <p class="muted small">Sends nothing and saves nothing. The emails are shown on this page{{ ", to copy into a seller's contact form" if no_email }}.</p>
 </form>
 
-<h2>2. Send</h2>
+{% elif part == 'send' %}
+<h2>{{ loop.index }}. Send</h2>
+{% if view.send_missing %}<div class="notice warn"><strong>Email sending is not set up yet:</strong> {{ view.send_missing|plain_names }} {{ 'is' if view.send_missing|length == 1 else 'are' }} not set. Ask whoever set up this tool. You can still preview the emails and contact sellers through their websites.</div>{% endif %}
+<p class="muted small">Sending is refused while the shipping address is missing or still the example text.</p>
+{% set why_send = 'None of these sellers has an email address.' if not (view.drafts|selectattr('email')|list) else
+                  ('Every seller with an email address has already been emailed.' if not view.to_send else
+                   ('Email sending is not set up yet.' if view.send_missing else '')) %}
+<form method="post" action="/emails/send/review" class="gap">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <input type="hidden" name="wf" value="{{ wf }}">
+  <button type="submit" class="btn-primary" {{ 'disabled' if why_send }}>Review {{ view.to_send|length }} email{{ 's' if view.to_send|length != 1 }} to sellers</button>{{ why(why_send) }}
+  <p class="muted small">Nothing is sent yet. The next page lists every recipient and asks you to type the count.</p>
+</form>
+{% set why_test = 'Email sending is not set up yet.' if view.send_missing else ('There is no email to test.' if not view.drafts else '') %}
+<form method="post" action="/emails/send/review" class="confirm gap">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <input type="hidden" name="wf" value="{{ wf }}">
+  <label for="test_recipient">Or send yourself a test copy of every email first (to one address of your own)</label>
+  <div class="inline-fields">
+    <input type="text" id="test_recipient" name="test_recipient" inputmode="email" autocomplete="off" size="32" required>
+    <button type="submit" class="btn" {{ 'disabled' if why_test }}>Review the test send</button>{{ why(why_test) }}
+  </div>
+</form>
+{% call tech() %}
 <div class="table-wrap">
   <table class="stack words">
     <caption class="sr">Settings that sending needs</caption>
@@ -87,26 +123,13 @@
     <tbody>{% for name, is_set in view.settings %}<tr><th scope="row"><code>{{ name }}</code></th><td data-label="Status">{{ badge('Set', 'set') if is_set else badge('Not set', 'not-set') }}</td></tr>{% endfor %}</tbody>
   </table>
 </div>
-<p class="muted small">Only whether each setting is filled in is shown, never its value. Sending is refused while the shipping address is missing or still the example text.</p>
-{% if view.send_missing %}<div class="notice warn">Email sending is not set up yet: {{ view.send_missing|join(', ') }} {{ 'is' if view.send_missing|length == 1 else 'are' }} not set.</div>{% endif %}
-<form method="post" action="/emails/send/review" class="gap">
-  <input type="hidden" name="csrf_token" value="{{ csrf }}">
-  <input type="hidden" name="wf" value="{{ wf }}">
-  <button type="submit" class="btn-primary" {{ 'disabled' if view.send_missing or not view.to_send }}>Review {{ view.to_send|length }} email{{ 's' if view.to_send|length != 1 }} to sellers</button>
-  <span class="muted small">Nothing is sent yet. The next page lists every recipient and asks you to type the count.</span>
-</form>
-<form method="post" action="/emails/send/review" class="confirm gap">
-  <input type="hidden" name="csrf_token" value="{{ csrf }}">
-  <input type="hidden" name="wf" value="{{ wf }}">
-  <label for="test_recipient">Or send yourself a test copy of every email first (to one address of your own)</label>
-  <div class="inline-fields">
-    <input type="text" id="test_recipient" name="test_recipient" inputmode="email" autocomplete="off" size="32" required>
-    <button type="submit" class="btn" {{ 'disabled' if view.send_missing or not view.drafts }}>Review the test send</button>
-  </div>
-</form>
+<p class="muted small">Only whether each setting is filled in is shown, never its value.</p>
+{% endcall %}
 
-<h2>3. Record what happened</h2>
+{% else %}
+<h2>{{ loop.index }}. Record what happened</h2>
 {% if view.drafts %}
+{% set why_busy = 'Another task is running.' if running else '' %}
 <form method="post" action="/emails/mark" class="confirm">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
   <input type="hidden" name="wf" value="{{ wf }}">
@@ -114,9 +137,10 @@
   <div class="inline-fields">
     <select id="mark_sku" name="sku" required><option value="">Choose a product</option>{% for d in view.drafts %}<option value="{{ d.sku }}">{{ d.sku }} ({{ d.seller }})</option>{% endfor %}</select>
     <label class="plain"><input type="checkbox" name="confirm" value="1" required> I submitted this form myself</label>
-    <button type="submit" class="btn" {{ 'disabled' if running }}>Mark as contacted</button>
+    <button type="submit" class="btn" {{ 'disabled' if why_busy }}>Mark as contacted</button>{{ why(why_busy) }}
   </div>
 </form>
+{% set why_reply = why_busy or ('Reading a reply needs the AI service key, which is not set up.' if not view.reply_ready else '') %}
 <form method="post" action="/emails/reply" class="confirm gap">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
   <input type="hidden" name="wf" value="{{ wf }}">
@@ -125,12 +149,14 @@
   <label for="reply" class="gap">Paste the seller's reply</label>
   <textarea id="reply" name="reply" rows="8" required autocomplete="off"></textarea>
   <p class="muted small">The tool sends this text to the AI service to pull out prices and quantities, checks every number against your text, and saves the result. This costs a little money.</p>
-  <button type="submit" class="btn" {{ 'disabled' if running }}>Record the reply</button>
+  <button type="submit" class="btn" {{ 'disabled' if why_reply }}>Record the reply</button>{{ why(why_reply) }}
 </form>
 {% else %}
 <p class="muted">There is no seller to record anything for.</p>
 {% endif %}
 {% endif %}
+{% endfor %}
 {% endif %}
+{% include "_continue.html" %}
 {% endif %}
 {% endblock %}

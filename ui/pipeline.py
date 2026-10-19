@@ -44,7 +44,8 @@ def emails(s: Settings, results_name: str) -> dict:
     need = [n for n in SMTP_SETTINGS + ("SHIPPING_ADDRESS",) if not is_set(s, n)]
     return {"known": rows is not None, "drafts": drafts, "skipped": (rows or {}).get("skipped", []), "problem": problem,
             "to_send": [d for d in drafts if d["email"] and not d["sent"]], "send_missing": need,
-            "settings": [(n, is_set(s, n)) for n in SMTP_SETTINGS + ("SHIPPING_ADDRESS", "ANTHROPIC_API_KEY")],
+            "settings": [(n, is_set(s, n)) for n in SMTP_SETTINGS + ("SHIPPING_ADDRESS",)],      # what sending needs, and only that
+            "reply_ready": is_set(s, "ANTHROPIC_API_KEY"),                                          # reading a reply needs the AI service
             "near_miss_file": (s.project / "near_misses.csv").is_file()}
 
 

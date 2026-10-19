@@ -1,13 +1,48 @@
 {% extends "base.html" %}
-{% from "_macros.html" import badge %}
+{% from "_macros.html" import badge, tech %}
 {% block main %}
 <h1>Setup</h1>
-<p class="muted">What is set up on this computer. Only whether each setting is filled in is shown, never its value. (Python {{ python }})</p>
-<p>Times on these pages are shown in <strong>{{ zone }}</strong>, the time zone of the computer or container that runs this tool.</p>
+<p>What is set up on this computer. "Set up" only means the settings it needs are filled in; this page cannot tell whether a key works.</p>
+<div class="table-wrap">
+  <table class="stack">
+    <caption class="sr">What can be done on this computer</caption>
+    <thead><tr><th scope="col">What you can do</th><th scope="col">Status</th></tr></thead>
+    <tbody>
+    {% for what, ok in capabilities %}
+    <tr><th scope="row">{{ what }}</th><td data-label="Status">{{ badge('Set up', 'set') if ok else badge('Not set up', 'not-set') }}</td></tr>
+    {% endfor %}
+    <tr><th scope="row">Run tracing (a record of each run, for the people maintaining the tool)</th><td data-label="Status">{{ badge('On', 'set') if tracing else badge('Off', 'not-started') }}</td></tr>
+    </tbody>
+  </table>
+</div>
+{% if not all_set %}
+<p class="gap">To set something up, ask whoever set up this tool to fill in the missing settings in the <code>.env</code> file in the project folder. Technical details below lists them.</p>
+{% endif %}
+<p class="gap">Times on these pages are shown in <strong>{{ zone }}</strong>, the time zone of the computer or container that runs this tool.</p>
 {% if changed %}
 <div class="notice warn"><strong>Reference files in your data folder that differ from the ones that came with this version:</strong> {{ changed|join(', ') }}. The copies in your data folder are the ones in use. To take this version's copy of a file, stop the tool, move your copy out of the data folder, and start the tool again.</div>
 {% endif %}
 
+{% call tech() %}
+<p class="muted">Only whether each setting is filled in is shown, never its value; tracing is shown as on or off. Python {{ python }}.</p>
+<h2>Settings</h2>
+<p class="muted">Settings are read from the <code>.env</code> file in the project folder, or from this computer's environment. A missing one stops the work listed beside it.</p>
+<div class="table-wrap">
+  <table class="stack">
+    <caption class="sr">Settings</caption>
+    <thead><tr><th scope="col">Setting</th><th scope="col">Status</th><th scope="col">Needed for</th></tr></thead>
+    <tbody>
+    {% for v in env %}
+    <tr>
+      <th scope="row"><code>{{ v.name }}</code></th>
+      <td data-label="Status">{% if v.name == 'OBS_ENABLED' %}{{ badge('On', 'set') if tracing else badge('Off', 'not-started') }}
+        {% elif v.set %}{{ badge('Set', 'set') }}{% elif v.optional %}{{ badge('Not set', 'not-started') }}{% else %}{{ badge('Not set', 'not-set') }}{% endif %}</td>
+      <td data-label="Needed for">{{ v.blocks }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
 <h2>Folders</h2>
 <div class="table-wrap">
   <table class="stack">
@@ -22,26 +57,8 @@
     </tbody>
   </table>
 </div>
-
-<h2>Settings</h2>
-<p class="muted">Settings are read from the <code>.env</code> file in the project folder, or from this computer's environment. A missing one stops the work listed beside it.</p>
-<div class="table-wrap">
-  <table class="stack">
-    <caption class="sr">Settings</caption>
-    <thead><tr><th scope="col">Setting</th><th scope="col">Status</th><th scope="col">Needed for</th></tr></thead>
-    <tbody>
-    {% for v in env %}
-    <tr>
-      <th scope="row"><code>{{ v.name }}</code></th>
-      <td data-label="Status">{{ badge('Set', 'set') if v.set else badge('Not set', 'not-set') }}</td>
-      <td data-label="Needed for">{{ v.blocks }}</td>
-    </tr>
-    {% endfor %}
-    </tbody>
-  </table>
-</div>
-
 <h2>Tracing</h2>
-<p>Run tracing is <strong>{{ 'on' if obs_on else 'off' }}</strong>. It is an optional record of what each run did, kept for the people maintaining the tool.</p>
+<p>Run tracing is <strong>{{ 'on' if tracing else 'off' }}</strong>, decided the way the tools decide it: <code>OBS_ENABLED</code> is 1 and both Langfuse keys are filled in.</p>
 {% if langfuse %}<p>Tracing server: {{ langfuse }}</p>{% endif %}
+{% endcall %}
 {% endblock %}

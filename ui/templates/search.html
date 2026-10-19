@@ -1,49 +1,49 @@
 {% extends "base.html" %}
 {% from "_macros.html" import badge %}
 {% block main %}
-<h1>Search</h1>
+<h1>Find suppliers</h1>
 {% if error %}<div class="notice danger" role="alert">{{ error }}</div>{% endif %}
 
 {% if view == 'form' %}
 <p>{{ step_text }}</p>
-<div class="notice warn"><strong>A search spends money and calls external services.</strong> Its results are unverified until a person checks them.</div>
+<div class="notice warn"><strong>A search costs money: it uses paid AI and web search services.</strong> Its results need checking by a person.</div>
 
-<h2>Before you start</h2>
+<h2>Services a search needs</h2>
 <div class="table-wrap">
   <table class="stack">
     <caption class="sr">Settings a search needs</caption>
-    <thead><tr><th scope="col">Setting</th><th scope="col">Status</th><th scope="col">Without it</th></tr></thead>
+    <thead><tr><th scope="col">Setting</th><th scope="col">Status</th><th scope="col">What it is for</th></tr></thead>
     <tbody>
     {% for k in keys %}
     <tr><th scope="row"><code>{{ k.name }}</code></th>
       <td data-label="Status">{{ badge('Set', 'set') if k.set else badge('Not set', 'not-set') }}</td>
-      <td data-label="Without it">{{ k.blocks }}</td></tr>
+      <td data-label="What it is for">{{ k.blocks }}</td></tr>
     {% endfor %}
     </tbody>
   </table>
 </div>
 {% if missing %}
-<div class="notice warn gap"><strong>A search cannot be started.</strong> {{ missing|join(' and ') }} {{ 'is' if missing|length == 1 else 'are' }} not set. Add {{ 'it' if missing|length == 1 else 'them' }} to the <code>.env</code> file in the project folder, then reload this page.</div>
+<div class="notice warn gap"><strong>A search cannot start yet.</strong> {{ missing|join(' and ') }} {{ 'is' if missing|length == 1 else 'are' }} not set up. Ask whoever set up this tool to add {{ 'it' if missing|length == 1 else 'them' }} to the <code>.env</code> file in the project folder, then reload this page.</div>
 {% endif %}
 {% if busy %}
-<div class="notice warn gap"><strong>A search cannot be started while another job is running:</strong> {{ busy.label }} (started {{ busy.started_at|replace('T', ' ') }}). <a href="/jobs/{{ busy.id }}">View that job</a></div>
+<div class="notice warn gap"><strong>A search cannot start while another task is running:</strong> {{ busy.label }} (started {{ busy.started_at|replace('T', ' ') }}). <a href="/jobs/{{ busy.id }}">View that task</a></div>
 {% endif %}
 
-<h2>Upload a product sheet</h2>
+<h2>Upload a spreadsheet of your products</h2>
 <form method="post" action="/search/upload" enctype="multipart/form-data" class="confirm">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
-  <label for="sheet">Excel workbook (.xlsx, up to {{ max_mb }} MB, up to {{ max_limit }} products)</label>
+  <label for="sheet">Excel file (.xlsx), up to {{ max_mb }} MB and {{ max_limit }} products</label>
   <div class="inline-fields">
     <input type="file" id="sheet" name="sheet" accept=".xlsx" required>
     <button type="submit" class="btn">Upload and preview</button>
   </div>
-  <p class="muted small">The first sheet needs a column headed <code>SKU</code> in its first 5 rows. Uploading starts nothing: the next page shows what was read.</p>
+  <p class="muted small">The first sheet needs a column headed <code>SKU</code> (your product code) in one of its first 5 rows. A <code>Keyword</code> or <code>Product</code> column with a short description helps the search. Uploading starts nothing: the next page shows what was read.</p>
 </form>
 {% if uploaded or files %}
 <details {{ 'open' if uploaded }}>
-  <summary>Sheets you can search ({{ uploaded|length + files|length }})</summary>
+  <summary>Spreadsheets you can search ({{ uploaded|length + files|length }})</summary>
   <ul class="list">
-    {% for f in uploaded %}<li><a href="/step/search?file={{ f|urlencode }}">{{ f[8:] }}</a> <span class="muted small">uploaded sheet: preview and choose products</span></li>{% endfor %}
+    {% for f in uploaded %}<li><a href="/step/search?file={{ f|urlencode }}">{{ f[8:] }}</a> <span class="muted small">uploaded: preview and choose products</span></li>{% endfor %}
     {% for f in files %}<li><a href="/step/search?file={{ f|urlencode }}">{{ f }}</a> <span class="muted small">in the project folder: preview and choose products</span></li>{% endfor %}
   </ul>
 </details>
@@ -59,7 +59,7 @@
       {% if preset_missing %}<p class="muted small">Not available: {{ preset_missing|join(', ') }} {{ 'is' if preset_missing|length == 1 else 'are' }} not in the built-in product list.</p>{% endif %}
     </div>
     <div class="choice">
-      <label><input type="radio" name="choice" value="all" data-count="{{ builtin|length }}" {{ 'disabled' if not builtin }} {{ 'checked' if preset_missing and builtin }}> All built-in products <span class="muted">({{ builtin|length }})</span></label>
+      <label><input type="radio" name="choice" value="all" data-count="{{ builtin|length }}" {{ 'disabled' if not builtin }} {{ 'checked' if preset_missing and builtin }}> All built-in products <span class="muted">({{ builtin|length }}: a sample list that comes with the tool)</span></label>
     </div>
     <div class="choice">
       <label><input type="radio" name="choice" value="choose" {{ 'disabled' if not builtin }}> Choose products</label>
@@ -77,9 +77,9 @@
     </div>
     {% if files or uploaded %}
     <div class="choice">
-      <label><input type="radio" name="choice" value="file"> Use an input file</label>
+      <label><input type="radio" name="choice" value="file"> Use a spreadsheet that is already here</label>
       <div class="sub inline-fields">
-        <span><label for="input_file" class="small">Uploaded sheet or file in the project folder</label>
+        <span><label for="input_file" class="small">Uploaded spreadsheet, or one in the project folder</label>
           <select id="input_file" name="input_file">{% for f in uploaded %}<option value="{{ f }}">{{ f[8:] }} (uploaded)</option>{% endfor %}{% for f in files %}<option value="{{ f }}">{{ f }}</option>{% endfor %}</select></span>
         <span><label for="limit" class="small">Only the first rows (optional, 1 to {{ max_limit }})</label>
           <input type="number" id="limit" name="limit" min="1" max="{{ max_limit }}" inputmode="numeric"></span>
@@ -90,18 +90,18 @@
     {% endif %}
   </fieldset>
   <p id="sel-count" class="muted" aria-live="polite"></p>
-  <button type="submit" class="btn-primary" {{ 'disabled' if missing or busy }}>Continue to the estimate</button>
+  <button type="submit" class="btn-primary" {{ 'disabled' if missing or busy }}>Next: check the cost</button>
   <span class="muted small">Nothing starts yet. The next page shows the cost estimate and asks you to confirm.</span>
 </form>
 
 {% elif view == 'preview' %}
-<p><a href="/step/search">Back to Search</a></p>
+<p><a href="/step/search">Back</a></p>
 <h2>What was read from {{ preview_label }}</h2>
 <dl class="stats card">
   <div><dt>Products (rows with a SKU)</dt><dd>{{ preview.count }}</dd></div>
   <div><dt>Keyword column</dt><dd>{{ 'Found' if preview.columns.keyword else 'Not found' }}</dd></div>
   <div><dt>Product column</dt><dd>{{ 'Found' if preview.columns.product else 'Not found' }}</dd></div>
-  <div><dt>Reference sale price column</dt><dd>{{ 'Found' if preview.columns.price else 'Not found' }}</dd></div>
+  <div><dt>Reference price column (optional)</dt><dd>{{ 'Found' if preview.columns.price else 'Not found' }}</dd></div>
 </dl>
 {% if not preview.columns.keyword and not preview.columns.product %}
 <div class="notice warn gap">This sheet has no Keyword or Product column, so the search would have only the SKU to go on.</div>
@@ -114,7 +114,7 @@
   </table>
 </div>
 <h2>Which products</h2>
-{% if missing %}<div class="notice warn"><strong>A search cannot be started.</strong> {{ missing|join(' and ') }} {{ 'is' if missing|length == 1 else 'are' }} not set.</div>{% endif %}
+{% if missing %}<div class="notice warn"><strong>A search cannot start yet.</strong> {{ missing|join(' and ') }} {{ 'is' if missing|length == 1 else 'are' }} not set up.</div>{% endif %}
 <form method="post" action="/search/review" id="search-form">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
   <input type="hidden" name="choice" value="file">
@@ -141,12 +141,12 @@
     </div>
   </fieldset>
   <p><label class="plain"><input type="checkbox" name="add_builtin" value="1" {{ 'disabled' if not builtin }}> Also include the built-in products <span class="muted">({{ builtin|length }}, searched after the sheet's rows; not with chosen products)</span></label></p>
-  <button type="submit" class="btn-primary" {{ 'disabled' if missing or busy }}>Continue to the estimate</button>
+  <button type="submit" class="btn-primary" {{ 'disabled' if missing or busy }}>Next: check the cost</button>
   <span class="muted small">Nothing starts yet. The next page shows the cost estimate and asks you to confirm.</span>
 </form>
 
 {% elif view == 'review' %}
-<h2>Check and confirm</h2>
+<h2>Check the cost and confirm</h2>
 <p><strong>{{ review.label }}:</strong> {{ review.estimate.count }} product{{ 's' if review.estimate.count != 1 }}.</p>
 <details {{ 'open' if review.products|length <= 12 }}>
   <summary>Products in this search ({{ review.products|length }})</summary>
@@ -155,9 +155,9 @@
   </ul>
 </details>
 <div class="notice"><strong>About {{ review.estimate.count }} product{{ 's' if review.estimate.count != 1 }}, roughly ${{ review.estimate.cost }} and {{ review.estimate.minutes }} minute{{ 's' if review.estimate.minutes != 1 }}.</strong> This is an estimate from one 15-product batch (about ${{ review.estimate.cost_each }} and about {{ review.estimate.seconds_each }} seconds per product), not a measurement of this run.</div>
-<div class="notice warn"><strong>A search spends money and calls external services.</strong> Its results are unverified until a person checks them.</div>
-{% if missing %}<div class="notice warn"><strong>A search cannot be started.</strong> {{ missing|join(' and ') }} {{ 'is' if missing|length == 1 else 'are' }} not set.</div>{% endif %}
-{% if busy %}<div class="notice warn"><strong>A search cannot be started while another job is running:</strong> {{ busy.label }}. <a href="/jobs/{{ busy.id }}">View that job</a></div>{% endif %}
+<div class="notice warn"><strong>A search costs money: it uses paid AI and web search services.</strong> Its results need checking by a person.</div>
+{% if missing %}<div class="notice warn"><strong>A search cannot start yet.</strong> {{ missing|join(' and ') }} {{ 'is' if missing|length == 1 else 'are' }} not set up.</div>{% endif %}
+{% if busy %}<div class="notice warn"><strong>A search cannot start while another task is running:</strong> {{ busy.label }}. <a href="/jobs/{{ busy.id }}">View that task</a></div>{% endif %}
 <form method="post" action="/search/start" class="confirm">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
   <input type="hidden" name="choice" value="{{ review.choice }}">
@@ -182,29 +182,29 @@
   <dl class="stats">
     <div><dt>Working on</dt><dd id="p-current">{{ progress.current|join(', ') or 'starting' }}</dd></div>
     <div><dt>Elapsed</dt><dd id="p-elapsed" data-seconds="{{ progress.elapsed_s }}">{{ progress.elapsed_s // 60 }} min {{ progress.elapsed_s % 60 }} s</dd></div>
-    <div><dt>Cost so far (the agent's own figure)</dt><dd>about $<span id="p-cost">{{ '%.4f'|format(progress.cost) }}</span></dd></div>
+    <div><dt>Cost so far (the search's own figure)</dt><dd>about $<span id="p-cost">{{ '%.4f'|format(progress.cost) }}</span></dd></div>
   </dl>
 </div>
 <details>
   <summary>Cancel this search</summary>
-  <p>Products finished so far are kept in the results file. The product in progress is lost.</p>
+  <p>Products finished so far are kept in the saved results. The product in progress is lost.</p>
   <form method="post" action="/jobs/{{ job.id }}/cancel">
     <input type="hidden" name="csrf_token" value="{{ csrf }}">
     <button type="submit" class="btn-danger">Cancel search</button>
   </form>
 </details>
-<h2>Log</h2>
+<h2>Technical log</h2>
 <p class="muted small">Wording differs from the raw log file.</p>
 <pre id="log" data-job="{{ job.id }}" data-offset="{{ offset }}" data-running="yes">{{ log }}</pre>
 
 {% else %}
-<p>{% if job.status == 'succeeded' %}<strong>The search job has ended.</strong>{% else %}{{ badge(job_badge(job.status)) }}{% endif %}
+<p>{% if job.status == 'succeeded' %}<strong>The search has finished.</strong>{% else %}{{ badge(job_badge(job.status)) }}{% endif %}
   {{ info.selection }}. Started {{ job.started_at|replace('T', ' ') }}{% if job.duration_s is not none %}, took {{ job.duration_s }} s{% endif %}.
   {% if job.exit_code is not none %}Exit code {{ job.exit_code }}: {{ job.exit_meaning }}{% endif %}</p>
 {% if job.note %}<div class="notice warn" role="alert">{{ job.note }}</div>{% endif %}
 {% for line in reading %}<div class="notice danger">{{ line }}</div>{% endfor %}
 {% if progress.final_cost is not none or progress.cost %}
-<p class="muted">Cost by the agent's own figure: about ${{ '%.4f'|format(progress.final_cost if progress.final_cost is not none else progress.cost) }}{{ '' if progress.final_cost is not none else ' for the products that finished' }}.</p>
+<p class="muted">Cost, as the search reported it: about ${{ '%.4f'|format(progress.final_cost if progress.final_cost is not none else progress.cost) }}{{ '' if progress.final_cost is not none else ' for the products that finished' }}.</p>
 {% endif %}
 {% if job.status == 'failed' and job.tail %}
 <h2>Last lines</h2>
@@ -213,34 +213,34 @@
 
 <h2>Results</h2>
 {% if not table %}
-<div class="card empty"><p><strong>No results file was produced.</strong></p><p>Nothing from this run can be used.</p></div>
+<div class="card empty"><p><strong>No results were saved.</strong></p><p>Nothing from this run can be used.</p></div>
 {% else %}
 {% if partial %}
-<div class="notice warn"><strong>Partial results.</strong> This run did not complete: the results file holds {{ in_file }} of the {{ info.expected }} product{{ 's' if info.expected != 1 }} asked for{% if progress.errors %}, {{ progress.errors }} of them recorded as errors{% endif %}. Do not treat it as a full search.</div>
+<div class="notice warn"><strong>Partial results.</strong> This search did not finish: the saved results hold {{ in_file }} of the {{ info.expected }} product{{ 's' if info.expected != 1 }} asked for{% if progress.errors %}, {{ progress.errors }} of them recorded as errors{% endif %}. Do not treat it as a full search.</div>
 {% endif %}
 <p class="muted">{{ counts }}</p>
-{% if not table.exclusions_applied %}<p class="muted">The reviewer's exclusion list could not be applied on this page; the Emails step applies it.</p>{% endif %}
+{% if not table.exclusions_applied %}<p class="muted">The reviewer's do-not-use list could not be applied on this page; step 2, Email sellers, applies it.</p>{% endif %}
 <div class="table-wrap">
   <table class="stack results">
     <caption class="sr">Results of this search, one row per product</caption>
-    <thead><tr><th scope="col">Product</th><th scope="col">Outcome</th><th scope="col">Supplier and platform</th>
-      <th scope="col" class="num">Unit price</th><th scope="col" class="num">Match</th>{% if table.has_ref %}<th scope="col">{{ table.ref_label }}</th>{% endif %}<th scope="col">Caveat</th></tr></thead>
+    <thead><tr><th scope="col">Product</th><th scope="col">Result</th><th scope="col">Supplier (website)</th>
+      <th scope="col" class="num">Their price (each)</th><th scope="col" class="num">Match</th>{% if table.has_ref %}<th scope="col">{{ table.ref_label }}</th>{% endif %}<th scope="col">Note</th></tr></thead>
     <tbody>
     {% for r in table.rows %}
     <tr>
       <th scope="row">{{ r.sku }}{% if r.description %}<br><span class="muted small desc">{{ r.description }}</span>{% endif %}</th>
-      <td data-label="Outcome">
-        {% if r.outcome == 'recommended' %}Recommended {{ badge('Unverified', 'unverified') }}
-        {% elif r.outcome == 'excluded' %}Excluded by reviewer list
-        {% elif r.outcome == 'error' %}Error
+      <td data-label="Result">
+        {% if r.outcome == 'recommended' %}Recommended {{ badge('Needs checking', 'unverified') }}
+        {% elif r.outcome == 'excluded' %}On the reviewer's do-not-use list
+        {% elif r.outcome == 'error' %}Could not be searched
         {% else %}No recommendation{% endif %}
         {% if r.why %}<br><span class="muted small desc">{{ r.why }}</span>{% endif %}
       </td>
-      <td data-label="Supplier and platform">{{ r.supplier }}{% if r.platform %}<br><span class="muted small">{{ r.platform }}</span>{% endif %}</td>
-      <td data-label="Unit price" class="num">{{ r.unit_price }}</td>
+      <td data-label="Supplier (website)">{{ r.supplier }}{% if r.platform %}<br><span class="muted small">{{ r.platform }}</span>{% endif %}</td>
+      <td data-label="Their price (each)" class="num">{{ r.unit_price }}</td>
       <td data-label="Match" class="num">{{ r.match }}</td>
       {% if table.has_ref %}<td data-label="{{ table.ref_label }}">{{ r.ref_price }}{% if r.ref_source or r.ref_date %}<br><span class="muted small">{{ r.ref_source }}{{ ', ' if r.ref_source and r.ref_date }}{{ r.ref_date }}</span>{% endif %}</td>{% endif %}
-      <td data-label="Caveat">{{ r.caveat }}</td>
+      <td data-label="Note">{{ r.caveat }}</td>
     </tr>
     {% endfor %}
     </tbody>
@@ -248,15 +248,15 @@
 </div>
 <h2>Files</h2>
 <ul class="list card">
-  <li><a href="/files/Excel Output Sheets/{{ results_file }}">Download the results workbook</a> <span class="muted small">{{ results_file }}</span></li>
+  <li><a href="/files/Excel Output Sheets/{{ results_file }}">Download the results (Excel)</a> <span class="muted small">{{ results_file }}</span></li>
   {% if report and report.copied %}<li><a href="/files/Reports/{{ report.name }}">Download the report</a> <span class="muted small">{{ report.name }} (a copy in Reports; the original stays in the project folder)</span></li>
   {% elif report %}<li><span>{{ report.problem }}{% if report.name %} The report file is <code>{{ report.name }}</code> in the project folder.{% endif %}</span></li>{% endif %}
 </ul>
-<p class="muted small">Downloaded files keep their original wording, which differs from these pages.</p>
-<p><a href="/step/emails?wf={{ wf }}"><strong>Next: seller emails</strong></a></p>
+<p class="muted small">Downloaded files keep their original wording, so some labels differ from these pages.</p>
+<p><a href="/step/emails?wf={{ wf }}"><strong>Next: step 2, Email sellers</strong></a></p>
 {% endif %}
 <details>
-  <summary>Log</summary>
+  <summary>Technical log</summary>
   <p class="muted small">Wording differs from the raw log file.</p>
   <pre>{{ log }}</pre>
 </details>

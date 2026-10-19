@@ -357,7 +357,7 @@ def upload_gets_a_server_name_and_is_never_edited(env):
     assert not (env.root / "evil.xlsx").exists() and not (env.project / "evil.xlsx").exists()
     page = env.client.get(f"/step/search?file={values[0]}").text
     assert "What was read from" in page and "<script>alert" not in page and "evil" not in page
-    for label in ("Products (rows with a SKU)", "Keyword column", "Product column", "Reference sale price column"):
+    for label in ("Products (rows with a SKU)", "Keyword column", "Product column", "Reference price column (optional)"):
         assert label in page, label
     assert page.count(">Found<") == 3 and ">3<" in page and "Cat6 patch cable" in page and "IN-1" in page
     bare = uploaded_value(upload(env, workbook([["SKU"], ["ONLY-1"]])))
@@ -508,10 +508,10 @@ def status_strip_follows_the_files(env):
     results_file(env, old + ".xlsx", [("a1", "Maker A", "a@maker-a.example", url_a)], mtime=time.time() - 9000)
     results_file(env, new + ".xlsx", [("B2", "Maker B", "b@maker-b.example", url_b), ("C3", "Maker C", "", url_c), ("D4", "", "", "")])
     strip = strip_of(env, new)
-    for text in ("Results file exists", "3 products", "2 can be drafted", "0 marked sent", "0 replies recorded", "No request yet",
-                 "No order sheet for this file", "No facts file yet", "Not generated since the last export"):
+    for text in ("Results saved", "3 products", "2 sellers to contact", "0 contacted", "0 replies recorded", "No request yet",
+                 "No order sheet for this search", "No product details yet", "Not written since the approved list was saved"):
         assert text in strip, (text, strip)
-    assert 'Next step: <a href="/step/emails?wf=' + new in strip
+    assert 'Next: <a href="/step/emails?wf=' + new in strip
     assert "<form" not in strip and "<button" not in strip and "<input" not in strip, "the strip only links; it starts nothing"
     assert env.jobs.list() == []
     # email_state.json is one file for every results file: an entry counts for a results file only when its key
@@ -523,11 +523,11 @@ def status_strip_follows_the_files(env):
         "B2|other-seller.example/item/old": {"sku": "B2", "seller": "A seller no longer recommended", "sent": "2026-01-15 10:00", "reply": "x"},
         "Z9|nowhere.example/z": {"sku": "Z9", "seller": "Unrelated", "sent": "2026-01-15 10:00"}}), encoding="utf-8")
     strip = strip_of(env, new)
-    assert "1 marked sent" in strip and "1 reply recorded" in strip and "2 can be drafted" in strip, strip      # not 3 or 4: only this file's keys
+    assert "1 contacted" in strip and "1 reply recorded" in strip and "2 sellers to contact" in strip, strip      # not 3 or 4: only this file's keys
     strip = strip_of(env, old)
-    assert "1 marked sent" in strip and "0 replies recorded" in strip and "1 can be drafted" in strip, strip
+    assert "1 contacted" in strip and "0 replies recorded" in strip and "1 seller to contact" in strip, strip
     steps = {st.name: st for st in workflows.steps_for(env.settings, new + ".xlsx")}
-    assert "1 seller(s) for this results file" in steps["Emails"].detail and "covers every results file" not in steps["Emails"].detail
+    assert "1 seller(s) on record for this search" in steps["Emails"].detail and "covers every search" not in steps["Emails"].detail
     assert workflows.next_step(list(steps.values())).name == "Approvals"
     # approvals: request, reply, approval with its expiry, export
     soon = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() + 3 * 86400))
@@ -537,7 +537,7 @@ def status_strip_follows_the_files(env):
              "decisions": []}
     (env.project / "decision_state.json").write_text(json.dumps(state), encoding="utf-8")
     strip = strip_of(env, new)
-    assert "1 request written" in strip and "0 replies recorded" in strip and "0 approvals valid" in strip and "Not exported" in strip, strip
+    assert "1 request written" in strip and "0 answers recorded" in strip and "0 approvals valid" in strip and "Approved list not saved" in strip, strip
     state["requests"]["A-0001"]["reply"] = {"approver": "Someone"}
     state["decisions"] = [{"id": "D-1", "request_id": "A-0001", "decision": "approve", "sku": "B2", "expires_at": soon},
                           {"id": "D-2", "request_id": "A-0001", "decision": "approve", "sku": "C3", "expires_at": past},          # expired
@@ -545,32 +545,35 @@ def status_strip_follows_the_files(env):
                           {"id": "D-4", "request_id": "A-0002", "decision": "approve", "sku": "a1", "expires_at": soon}]            # the other file's
     (env.project / "decision_state.json").write_text(json.dumps(state), encoding="utf-8")
     strip = strip_of(env, new)
-    assert "1 reply recorded" in strip and "1 approval valid, first expires " in strip and "Not exported" in strip, strip
+    assert "1 answer recorded" in strip and "1 approval valid, first expires " in strip and "Approved list not saved" in strip, strip
     from datetime import datetime
     local = f"{datetime.fromisoformat(soon).astimezone():%Y-%m-%d %H:%M}"                    # this computer's time, the same as the Approvals table shows
     assert f"first expires {local}" in strip and f'data-label="Expires">{local}</td>' in env.client.get(f"/step/approvals?wf={new}").text, (local, strip)
     (env.project / "approved_orders.json").write_text(json.dumps({"source_results_file": old + ".xlsx", "valid_approvals": 1, "generated_at": "x", "orders": []}))
-    assert "Not exported" in strip_of(env, new), "an export made for another results file is not this file's"
+    assert "Approved list not saved" in strip_of(env, new), "an export made for another results file is not this file's"
     (env.project / "approved_orders.json").write_text(json.dumps({"source_results_file": new + ".xlsx", "valid_approvals": 1, "generated_at": "x", "orders": []}))
     strip = strip_of(env, new)
-    assert ">Exported<" in strip and "Not built since the last export" in strip and 'Next step: <a href="/step/order-sheet?wf=' in strip, strip
+    assert ">Approved list saved<" in strip and "Not created since the approved list was saved" in strip and 'Next: <a href="/step/order-sheet?wf=' in strip, strip
     # order sheet and listings count only when they are newer than the export
     for folder, name in (("Order Sheets", "order_sheet_20260101_000000.xlsx"), ("Walmart Listings", "walmart_listings_20260101_000000.xlsx")):
         (env.project / folder).mkdir()
         (env.project / folder / name).write_bytes(b"x")
         os.utime(env.project / folder / name, (time.time() - 5000, time.time() - 5000))
     strip = strip_of(env, new)
-    assert "Not built since the last export" in strip and "Not generated since the last export" in strip, strip
+    assert "Not created since the approved list was saved" in strip and "Not written since the approved list was saved" in strip, strip
     for folder, name in (("Order Sheets", "order_sheet_20260303_000000.xlsx"), ("Walmart Listings", "walmart_listings_20260303_000000.xlsx")):
         (env.project / folder / name).write_bytes(b"x")
         os.utime(env.project / folder / name, (time.time() + 5, time.time() + 5))
     (env.project / "Uploads").mkdir()
     (env.project / "Uploads" / "facts_20260303_000000_abcdef.csv").write_text("sku,fact_id,field,value,status,source\n")
     strip = strip_of(env, new, "listing-content")
-    for text in ("Built: order_sheet_20260303_000000.xlsx", "Facts file: facts_20260303_000000_abcdef.csv", "Generated: walmart_listings_20260303_000000.xlsx",
-                 "The files show every step has produced its output."):
+    for text in ("Order sheet created", "Product details uploaded", "Listings written", "Every step has produced its output."):
         assert text in strip, (text, strip)
-    assert "Next step:" not in strip and 'aria-current="step"' in strip
+    steps = {st.name: st for st in workflows.steps_for(env.settings, new + ".xlsx")}       # which files those are: the strip no longer names them
+    assert "Newest order sheet: order_sheet_20260303_000000.xlsx" in steps["Order sheet"].detail, steps["Order sheet"].detail
+    assert workflows.newest_facts(env.settings).name == "facts_20260303_000000_abcdef.csv"
+    assert "Newest listings file: walmart_listings_20260303_000000.xlsx" in steps["Listing content"].detail, steps["Listing content"].detail
+    assert "Next:" not in strip and 'aria-current="step"' in strip
 
 
 @test
@@ -578,13 +581,15 @@ def results_file_choice_is_validated_server_side(env):
     results_file(env, "sourcing_results_20260101_100000.xlsx", [("A1", "Maker A", "", "https://a.example/1")], mtime=time.time() - 9000)
     results_file(env, "sourcing_results_20260202_100000.xlsx", [("B2", "Maker B", "", "https://b.example/2"), ("C3", "", "", "")])
     (env.project / "elsewhere.xlsx").write_bytes((env.project / "Excel Output Sheets" / "sourcing_results_20260101_100000.xlsx").read_bytes())
+    label = {w["stem"]: w["label"] for w in workflows.list_workflows(env.settings)}         # the progress box names a search by its label
+    assert label["sourcing_results_20260101_100000"] != label["sourcing_results_20260202_100000"], label
     for slug in ("emails", "approvals", "order-sheet", "listing-content"):
         picked = env.client.get(f"/step/{slug}?wf=sourcing_results_20260101_100000").text
-        assert "Status for <code>sourcing_results_20260101_100000.xlsx</code>" in picked and "1 product<" in picked
+        assert f"Progress for the search of {label['sourcing_results_20260101_100000']}." in picked and "1 product<" in picked
         for bad in ("..\\elsewhere", "../elsewhere", "elsewhere", str(env.project / "elsewhere"), "sourcing_results_20260101_100000.xlsx", "nope", ""):
             page = env.client.get(f"/step/{slug}", params={"wf": bad}).text                 # anything not in the folder: the newest file, never a path
-            assert "Status for <code>sourcing_results_20260202_100000.xlsx</code>" in page and "elsewhere" not in page, (slug, bad)
-        assert 'name="step" value="' in picked and '<label for="wf">Results file</label>' in picked     # the selector is on every tab
+            assert f"Progress for the search of {label['sourcing_results_20260202_100000']}." in page and "elsewhere" not in page, (slug, bad)
+        assert 'name="step" value="' in picked and '<label for="wf">Working on the search of</label>' in picked     # the selector is on every tab
     r = env.client.get("/", params={"wf": "sourcing_results_20260101_100000", "step": "Approvals"}, follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/step/approvals?wf=sourcing_results_20260101_100000"
     assert env.client.get("/", params={"wf": "x", "step": "https://evil.example"}, follow_redirects=False).status_code == 200
@@ -593,7 +598,7 @@ def results_file_choice_is_validated_server_side(env):
     for bad in ("elsewhere.xlsx", "..\\elsewhere.xlsx", "Excel Output Sheets\\sourcing_results_20260101_100000.xlsx", str(env.project / "elsewhere.xlsx"), ""):
         raises(JobRejected, rule, bad)
     nav = env.client.get("/step/emails").text.split('<nav class="nav"')[1].split("</nav>")[0]
-    assert re.findall(r">([^<>]+)</a>", nav) == ["Home", "Search", "Emails", "Approvals", "Order sheet", "Listing content", "Jobs", "Health"], nav
+    assert re.findall(r">([^<>]+)</a>", nav) == ["Home", "Find suppliers", "Email sellers", "Get approval", "Order sheet", "Listings", "Activity", "Setup"], nav
 
 
 @test
@@ -666,7 +671,7 @@ print(json.dumps({"file": mod.__file__, "stdout": out.getvalue(), "stderr": err.
     assert not (env.project / "email_state.json").exists()
     # and in this process: the module the pages use is the project's, not the one beside the UI's code
     results_file(env, "sourcing_results_20260202_100000.xlsx", [("B2", "Maker B", "b@maker-b.example", "https://b.example/2")])
-    assert "1 can be drafted" in env.client.get("/").text
+    assert "1 have a seller to contact" in env.client.get("/").text
     assert Path(workflows.agent_module(env.settings).__file__) == env.project / "email_agent.py"
     assert "email_agent" not in sys.modules, "the UI must not import the email agent from its own folder"
 
@@ -833,7 +838,7 @@ def send_needs_the_typed_count(env):
     try:
         with env_vars(**FAKE):
             page = fake.client.get(f"/step/emails?wf={RES}").text
-            assert "Review 2 emails to sellers" in page and "b@maker-b.example" in page and "No address: use the seller" in page
+            assert "Review 2 emails to sellers" in page and "b@maker-b.example" in page and "No email address: use the contact form" in page
             review = post(fake, "/emails/send/review", wf=RES)
             assert review.status_code == 200 and "2 emails would be sent" in review.text and "This sends real emails to sellers" in review.text
             for who in ("b@maker-b.example", "c@maker-c.example", "Maker B", "Maker C"):                  # the recipients, in full
@@ -858,7 +863,7 @@ def send_needs_the_typed_count(env):
             (fake.project / "email_state.json").unlink()
             # another results file, or none: refused
             for wf in ("nope", "", "..\\x", RES + ".xlsx"):
-                refused(post(fake, "/emails/send", wf=wf, confirm_count="2"), "Choose a results file")
+                refused(post(fake, "/emails/send", wf=wf, confirm_count="2"), "Choose a search from the list")
         # a setting the send needs is missing: refused here, and the agent would refuse too
         for missing in ("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD", "SHIPPING_ADDRESS"):
             with env_vars(**{**FAKE, missing: None}):
@@ -896,7 +901,7 @@ def test_send_is_marked_and_still_gated(env):
         with env_vars(**FAKE):
             review = post(fake, "/emails/send/review", wf=RES, test_recipient="me@example.invalid")
             assert review.status_code == 200 and "This is a TEST" in review.text and "3 emails would be sent" in review.text
-            assert review.text.count("<td data-label=\"Goes to\">me@example.invalid</td>") == 3 and "nobody: no address" in review.text
+            assert review.text.count("<td data-label=\"Goes to\">me@example.invalid</td>") == 3 and "nobody: no email address" in review.text
             assert "Send the TEST emails" in review.text and "Send to sellers" not in review.text
             for typed in ("", "2", "4"):
                 refused(post(fake, "/emails/send", wf=RES, test_recipient="me@example.invalid", confirm_count=typed), "Nothing was sent")
@@ -963,7 +968,7 @@ def drafts_mark_and_reply_run_the_agents_own_commands(env):
         meta = started_job(fake, post(fake, "/emails/drafts", wf=RES))
         assert last_argv(fake) == ["email_agent.py", "drafts", rel] and meta["state_changing"] is True                # drafts takes the lock too
         page = fake.client.get(f"/step/emails?wf={RES}&job={meta['id']}").text
-        assert "fake line one" in page and "Write email drafts" in page and "drafts only" in page
+        assert "fake line one" in page and "Preview the emails" in page and "preview only" in page
         started_job(fake, post(fake, "/emails/drafts", wf=RES, near_miss="1"))
         assert last_argv(fake) == ["email_agent.py", "drafts", rel, "--near-miss"]
         refused(post(fake, "/emails/drafts", wf=RES, near_miss="yes"))
@@ -977,7 +982,7 @@ def drafts_mark_and_reply_run_the_agents_own_commands(env):
         assert last_argv(fake) == ["email_agent.py", "mark", "D4", "--results", rel]
         # reply: the pasted text is saved by the server, passed with --file, and removed when the command has ended
         text = "Hello, 10 pcs at $2.50 each.\nRegards, <script>alert(1)</script> 测试"
-        refused(post(fake, "/emails/reply", wf=RES, sku="B2", reply=text), "ANTHROPIC_API_KEY is not set")
+        refused(post(fake, "/emails/reply", wf=RES, sku="B2", reply=text), "the AI service key (ANTHROPIC_API_KEY), which is not set up")
         with env_vars(**FAKE):
             refused(post(fake, "/emails/reply", wf=RES, sku="B2", reply="  \n "), "Paste the seller")
             refused(post(fake, "/emails/reply", wf=RES, sku="NOPE", reply=text), "Choose a product")
@@ -1009,9 +1014,9 @@ def approvals_needs_a_tick_without_an_email_record(env):
     try:
         rel = native("Excel Output Sheets", RES + ".xlsx")
         page = fake.client.get(f"/step/approvals?wf={RES}").text
-        assert "seller reply status is unavailable" in page and 'name="ack" value="1" required' in page
+        assert "seller replies are unavailable" in page and 'name="ack" value="1" required' in page
         text = refused(post(fake, "/approvals/request", wf=RES), "Nothing was written")
-        assert "seller reply status is unavailable" in text and FakePopen.calls == []
+        assert "seller replies are unavailable" in text and FakePopen.calls == []
         refused(post(fake, "/approvals/request", wf=RES, ack="yes"), "Nothing was written")
         started_job(fake, post(fake, "/approvals/request", wf=RES, ack="1"))
         assert last_argv(fake) == ["decision_agent.py", "request", rel]                    # the tick is the UI's warning; the agent's rules are untouched
@@ -1021,7 +1026,7 @@ def approvals_needs_a_tick_without_an_email_record(env):
             refused(post(fake, "/approvals/request", wf=RES, ack="1", budget=bad))
         (fake.project / "email_state.json").write_text("{}")
         page = fake.client.get(f"/step/approvals?wf={RES}").text
-        assert "seller reply status is unavailable" not in page and 'name="ack"' not in page
+        assert "seller replies are unavailable" not in page and 'name="ack"' not in page
         started_job(fake, post(fake, "/approvals/request", wf=RES))                        # with an email record no tick is asked for
         assert len(FakePopen.calls) == 3
     finally:
@@ -1072,7 +1077,7 @@ def approval_fields_are_never_prefilled(env):
         (fake.project / "decision_state.json").write_text(json.dumps(state), encoding="utf-8")
         page = fake.client.get(f"/step/approvals?wf={RES}").text
         form, inputs = fields(page)
-        assert "Zed Quillfeather" in page.split("Approvals recorded")[1].split("</table>")[0]           # shown where the agent's record is listed
+        assert "Zed Quillfeather" in page.split("Approvals so far")[1].split("</table>")[0]           # shown where the agent's record is listed
         assert "Quillfeather" not in form and "ChannelXyzzy" not in form and "A-0001" not in form       # A-0001 is answered; A-0002 is the open one
         assert all("value=" not in tag for tag in inputs.values()) and "checked" not in form
         for other in ("/step/emails", "/step/search", "/", "/jobs", f"/jobs/{meta['id']}"):
@@ -1093,7 +1098,7 @@ def record_confirmation_must_match_the_picked_request(env):
         for picked, typed in (("A-0001", "A-0002"), ("A-0002", "A-0001"), ("A-0001", "A-1"), ("A-0001", "A-00011"), ("A-0001", "0001"),
                               ("A-0001", "A-0001 A-0002"), ("A-0001", "")):
             text = refused(post(fake, "/approvals/record", wf=RES, request_id=picked, reply=REPLY, **{**TYPED, "confirm_request": typed}))
-            assert "Nothing was recorded" in text or "is not a request id" in text, (picked, typed)
+            assert "Nothing was recorded" in text or "is not a request number" in text, (picked, typed)
         for picked in ("A-0003", "A-0004", "A-9999", "", "A-0001' OR 1=1"):                      # not an open request of THIS results file
             refused(post(fake, "/approvals/record", wf=RES, request_id=picked, reply=REPLY, **{**TYPED, "confirm_request": picked}), "Pick the request")
         assert FakePopen.calls == [] and not list((fake.settings.data / "inputs").glob("*")) if (fake.settings.data / "inputs").exists() else FakePopen.calls == []
@@ -1102,7 +1107,7 @@ def record_confirmation_must_match_the_picked_request(env):
         assert argv[argv.index("--request") + 1] == "A-0002" == argv[argv.index("--confirm-request") + 1]
         page = fake.client.get(f"/step/approvals?wf={RES}").text
         assert "A-0001: written 2026-02-03" in page and "A-0003" not in page and "REQUEST A-0001" in page       # this file's requests, with their text
-        assert "A request does not expire; each approval recorded from its reply does, 7 days after" in page
+        assert "A request does not expire; each approval recorded from its answer lasts 7 days." in page
         assert state
     finally:
         cleanup(fake)
@@ -1122,12 +1127,12 @@ def approvals_show_expiry_and_revoke_and_export_are_gated(env):
                               {**base, "id": "A-0001-3", "sku": "D4", "expires_at": soon, "revoked_at": "2026-02-04T10:00:00+00:00"},
                               {**base, "id": "A-0001-4", "sku": "E5", "decision": "reject", "expires_at": soon}]
         (fake.project / "decision_state.json").write_text(json.dumps(state), encoding="utf-8")
-        table = fake.client.get(f"/step/approvals?wf={RES}").text.split("Approvals recorded")[1].split("</table>")[0]
+        table = fake.client.get(f"/step/approvals?wf={RES}").text.split("Approvals so far")[1].split("</table>")[0]
         rows = dict(re.findall(r'<th scope="row">(\w+)</th><td data-label="Status">(\w+)</td>', table))
-        assert rows == {"B2": "Valid", "C3": "Expired", "D4": "Revoked", "E5": "Rejected"}, rows
+        assert rows == {"B2": "Valid", "C3": "Expired", "D4": "Withdrawn", "E5": "Rejected"}, rows
         assert table.count('data-label="Expires">20') == 4 and "2026-02-10" in table                         # every approval shows its own expiry
         for sku in ("C3", "D4", "E5", "NOPE", "", "b2", "B2 --results x"):                                    # only a currently valid approval, typed exactly
-            refused(post(fake, "/approvals/revoke", wf=RES, sku=sku), "Nothing was revoked")
+            refused(post(fake, "/approvals/revoke", wf=RES, sku=sku), "Nothing was withdrawn")
         assert FakePopen.calls == []
         started_job(fake, post(fake, "/approvals/revoke", wf=RES, sku="B2"))
         assert last_argv(fake) == ["decision_agent.py", "revoke", "B2", "--results", rel]
@@ -1139,7 +1144,7 @@ def approvals_show_expiry_and_revoke_and_export_are_gated(env):
         (fake.project / "approved_orders.json").write_text(json.dumps({"source_results_file": "sourcing_results_20250101_000000.xlsx", "valid_approvals": 1,
                                                                         "generated_at": "2026-02-03T10:00:00+00:00", "orders": []}))
         page = fake.client.get(f"/step/approvals?wf={RES}").text
-        assert "made from a different results file" in page and "sourcing_results_20250101_000000.xlsx" in page and "Download approved_orders.csv" not in page
+        assert "belongs to a different search" in page and "sourcing_results_20250101_000000.xlsx" in page and "Download the approved list" not in page
         (fake.project / "approved_orders.json").write_text(json.dumps({"source_results_file": RES + ".xlsx", "valid_approvals": 1,
                                                                         "generated_at": "2026-02-03T10:00:00+00:00", "orders": []}))
         page = fake.client.get(f"/step/approvals?wf={RES}").text
@@ -1177,7 +1182,7 @@ def one_job_lock_covers_every_state_changing_command(env):
             "/order/build": dict(wf=RES), "/content/template": dict(wf=RES), "/content/generate": dict(wf=RES, facts=facts, confirm_count="2")}
         for path, data in attempts.items():
             r = post(env, path, **data)
-            assert r.status_code == 409 and "Nothing was started" in r.text and "Another job that changes data is running" in r.text, (path, r.status_code, r.text[-500:])
+            assert r.status_code == 409 and "Nothing was started" in r.text and "Another task that changes data is running" in r.text, (path, r.status_code, r.text[-500:])
         assert [j["id"] for j in env.jobs.list()] == [blocker["id"]], "a refused start must not leave a job behind"
         assert not list((env.settings.data / "inputs").glob("*")), "a refused start must not keep pasted text"
         assert (env.project / "email_state.json").read_text() == "{}" and not (env.project / "Order Sheets").exists()
@@ -1306,21 +1311,21 @@ def results_file_match_gate(env):
             name = facts_name(upload_facts(fake))
             attempts = {"/order/build": {}, "/content/template": {}, "/content/review": {"facts": name}, "/content/generate": {"facts": name, "confirm_count": "2"}}
             for path, data in attempts.items():                                             # no export at all
-                refused(post(fake, path, wf=RES, **data), "There is no export yet")
+                refused(post(fake, path, wf=RES, **data), "There is no approved list yet")
             export(fake, source=other + ".xlsx")                                           # an export made from ANOTHER results file
             for path, data in attempts.items():
                 text = refused(post(fake, path, wf=RES, **data), "Nothing was started")
                 assert f"&#39;{other}.xlsx&#39;" in text and f"&#39;{RES}.xlsx&#39;" in text, (path, "the refusal must name both files")
             for slug in ("order-sheet", "listing-content"):
                 page = fake.client.get(f"/step/{slug}?wf={RES}").text
-                assert "belongs to a different results file" in page and f"<code>{other}.xlsx</code>" in page and f"<code>{RES}.xlsx</code>" in page
-                assert "disabled" in page.split("Build the order sheet" if slug == "order-sheet" else "Write a facts template")[0].rsplit("<button", 1)[1]
+                assert "belongs to a different search" in page and f"<code>{other}.xlsx</code>" in page and f"<code>{RES}.xlsx</code>" in page
+                assert "disabled" in page.split("Create the order sheet" if slug == "order-sheet" else "Create the product details sheet")[0].rsplit("<button", 1)[1]
             for bad in ("", None, 5, RES, RES + ".XLSX", " " + RES + ".xlsx", f"Excel Output Sheets\\{RES}.xlsx", str(fake.project / "Excel Output Sheets" / (RES + ".xlsx"))):
                 export(fake, source=bad)                                                    # anything but the exact file name is not a match
                 refused(post(fake, "/order/build", wf=RES), "Nothing was started")
             export(fake)
             (fake.project / "approved_orders.csv").unlink()                                 # the .json alone is not an export to build from
-            refused(post(fake, "/order/build", wf=RES), "There is no export yet")
+            refused(post(fake, "/order/build", wf=RES), "There is no approved list yet")
             assert FakePopen.calls == [] and fake.jobs.list() == []
             export(fake)                                                                    # made from the selected file: allowed
             started_job(fake, post(fake, "/order/build", wf=RES))
@@ -1334,7 +1339,7 @@ def results_file_match_gate(env):
             for slug in ("order-sheet", "listing-content"):
                 page = fake.client.get(f"/step/{slug}?wf={RES}").text
                 rows = dict(re.findall(r'<th scope="row">(\w+)</th>.*?data-label="Now">([\w ]+)</td>', page, re.S))
-                assert rows == {"B2": "Still valid", "C3": "Expired"} and "2099-06-15" in page and "Some approvals have expired since the export" in page, (slug, rows)
+                assert rows == {"B2": "Still valid", "C3": "Expired"} and "2099-06-15" in page and "Some approvals have expired since the list was saved" in page, (slug, rows)
             export(fake, expires="2020-01-01T00:00:00Z")                                    # every approval expired: the agent decides and says so
             started_job(fake, post(fake, "/order/build", wf=RES))
             assert len(FakePopen.calls) == 4
@@ -1370,12 +1375,12 @@ def facts_upload_is_validated_and_saved_byte_for_byte(env):
         assert commands.FACTS_RE.fullmatch(saved) and path.read_bytes() == odd and not list(fake.root.rglob("*evil*"))
         before = hashlib.sha256(path.read_bytes()).hexdigest()
         page = fake.client.get(f"/step/listing-content?wf={RES}&facts={saved}").text
-        counts = dict(re.findall(r'<th scope="row">([^<]+)</th><td data-label="Facts" class="num">(\d+)</td>', page))
+        counts = dict(re.findall(r'<th scope="row">([^<]+)</th><td data-label="Details" class="num">(\d+)</td>', page))
         assert counts == {"sample_inspected": "1", "page_read": "1", "unverified": "1", "listing_title": "1", "SAMPLE_INSPECTED": "1"}, counts
-        assert "5 filled-in facts for 2 products" in page and "this tool never sets or changes it" in page
+        assert "5 details filled in for 2 products" in page and "this tool never sets or changes it" in page
         with env_vars(**FAKE):
             review = post(fake, "/content/review", wf=RES, facts=saved)
-            assert review.status_code == 200 and "up to 3 model calls per product, so up to 6 calls for this run" in review.text
+            assert review.status_code == 200 and "up to 3 AI requests per product, so up to 6 for this run" in review.text
             started_job(fake, post(fake, "/content/generate", wf=RES, facts=saved, confirm_count="2"))
             assert last_argv(fake)[-2:] == ["--facts", native("Uploads", saved)]
             started_job(fake, post(fake, "/content/template", wf=RES))
@@ -1397,15 +1402,15 @@ def generate_needs_a_facts_file_and_the_typed_product_count(env):
         export(fake)
         with env_vars(**FAKE):
             page = fake.client.get(f"/step/listing-content?wf={RES}").text
-            assert "No filled facts file has been uploaded yet." in page and "/content/review" not in page                # no facts file: no way to generate
+            assert "No filled-in product details sheet has been uploaded yet." in page and "/content/review" not in page                # no facts file: no way to generate
             for facts in ("", "product_facts.csv", "facts_20260101_000000_ffffff.csv", "..\\x.csv"):
-                refused(post(fake, "/content/review", wf=RES, facts=facts), "Choose a facts file you uploaded")
-                refused(post(fake, "/content/generate", wf=RES, facts=facts, confirm_count="2"), "Choose a facts file you uploaded")
+                refused(post(fake, "/content/review", wf=RES, facts=facts), "Choose a product details sheet you uploaded")
+                refused(post(fake, "/content/generate", wf=RES, facts=facts, confirm_count="2"), "Choose a product details sheet you uploaded")
             (fake.project / "product_facts.csv").write_bytes(FACTS)                                                         # a file beside the agent is not an upload
-            refused(post(fake, "/content/generate", wf=RES, facts="product_facts.csv", confirm_count="2"), "Choose a facts file you uploaded")
+            refused(post(fake, "/content/generate", wf=RES, facts="product_facts.csv", confirm_count="2"), "Choose a product details sheet you uploaded")
             name = facts_name(upload_facts(fake))
             review = post(fake, "/content/review", wf=RES, facts=name)
-            assert "<strong>2 products</strong> in the export: B2, C3." in review.text and 'name="confirm_count" value' not in review.text
+            assert "<strong>2 products</strong> in the approved list: B2, C3." in review.text and 'name="confirm_count" value' not in review.text
             assert "This calls the AI service and spends money." in review.text
             for typed in ("", " ", "1", "3", "two", "2.0", "-2"):
                 refused(post(fake, "/content/generate", wf=RES, facts=name, confirm_count=typed), "Nothing was started")
@@ -1417,7 +1422,7 @@ def generate_needs_a_facts_file_and_the_typed_product_count(env):
             export(fake, skus=("B2", "C3", "D4"))                                                                           # the export changed: so does the number
             refused(post(fake, "/content/generate", wf=RES, facts=name, confirm_count="2"), "Nothing was started")
             export(fake, skus=())
-            refused(post(fake, "/content/generate", wf=RES, facts=name, confirm_count="0"), "holds no approved product")
+            refused(post(fake, "/content/generate", wf=RES, facts=name, confirm_count="0"), "The approved list holds no product")
             export(fake)
         for missing in ("ANTHROPIC_API_KEY", "BRAND_NAME"):
             with env_vars(**{**FAKE, missing: None}):
@@ -1581,7 +1586,7 @@ def end_to_end_offline(env):
                 wait_for(lambda: (out / "nimble.log").exists(), "the search to reach its first page fetch")
                 assert env.jobs.get(sid)["status"] == "running"
                 second = post(env, "/search/start", choice="file", input_file=up, rows="first", limit="1", confirm_count="1")
-                assert second.status_code == 409 and "Another job that changes data is running" in second.text      # a second job mid-run is refused
+                assert second.status_code == 409 and "Another task that changes data is running" in second.text      # a second job mid-run is refused
                 raises(JobBusy, env.jobs.start, "search", {"input": up, "output": search.new_output_name()})          # by the runner itself too
                 assert len(env.jobs.list()) == 1
             finally:
@@ -1627,10 +1632,10 @@ def end_to_end_offline(env):
             assert state[key]["status"] == "pricing_provided" and "10 pcs" in state[key]["reply"] and len(state) == 2, state
             assert "pricing_provided" in log and not list((env.settings.data / "inputs").glob("*"))
             strip = strip_of(env, wf)
-            assert "2 can be drafted" in strip and "2 marked sent" in strip and "1 reply recorded" in strip, strip
+            assert "2 sellers to contact" in strip and "2 contacted" in strip and "1 reply recorded" in strip, strip
 
             # 3. approvals: request, a refused and an accepted record, export
-            assert "seller reply status is unavailable" not in env.client.get(f"/step/approvals?wf={wf}").text
+            assert "seller replies are unavailable" not in env.client.get(f"/step/approvals?wf={wf}").text
             meta, log = done(post(env, "/approvals/request", wf=wf, budget="100"))
             assert meta["args"] == ["request", rel, "--budget", "100"]
             request_text = (env.project / "Reports" / "approval_request_A-0001.txt").read_text(encoding="utf-8")
@@ -1638,7 +1643,7 @@ def end_to_end_offline(env):
             dstate = json.loads((env.project / "decision_state.json").read_text(encoding="utf-8"))
             assert dstate["requests"]["A-0001"]["results_file"] == results and dstate["requests"]["A-0001"]["reply"] is None
             page = env.client.get(f"/step/approvals?wf={wf}").text
-            assert "A-0001: written " in page and "waiting for a reply" in page and "HOW TO REPLY" in page
+            assert "A-0001: written " in page and "waiting for your manager&#39;s answer" in page and "HOW TO REPLY" in page
             reply = (FIXTURES / "manager_reply.txt").read_text(encoding="utf-8")
             frozen = (env.project / "decision_state.json").read_bytes()
             typed = {"confirm_request": "A-0001", "channel": "test channel", "approver": "Test Approver"}
@@ -1674,8 +1679,8 @@ def end_to_end_offline(env):
             template, = list(env.settings.uploads_dir.glob("facts_template_*.csv"))
             assert meta["args"][-2:] == ["--facts", native("Uploads", template.name)] and template.read_text(encoding="utf-8-sig").startswith("sku,fact_id,field,value,status,source")
             assert "TST-100" in template.read_text(encoding="utf-8-sig") and env.client.get(f"/files/Uploads/{template.name}").status_code == 200
-            refused(post(env, "/content/generate", wf=wf, facts="", confirm_count="1"), "Choose a facts file you uploaded")
-            refused(post(env, "/content/generate", wf=wf, facts=template.name, confirm_count="1"), "Choose a facts file you uploaded")   # the unfilled template is not one
+            refused(post(env, "/content/generate", wf=wf, facts="", confirm_count="1"), "Choose a product details sheet you uploaded")
+            refused(post(env, "/content/generate", wf=wf, facts=template.name, confirm_count="1"), "Choose a product details sheet you uploaded")   # the unfilled template is not one
             assert not (env.project / "Walmart Listings").exists()
             filled = (FIXTURES / "facts_filled.csv").read_bytes()
             facts = facts_name(upload_facts(env, filled, "filled.csv", wf=wf))
@@ -1689,7 +1694,7 @@ def end_to_end_offline(env):
             for name in listings:
                 assert env.client.get(f"/files/Walmart Listings/{name}").status_code == 200
             strip = strip_of(env, wf, "listing-content")
-            assert "The files show every step has produced its output." in strip and "Generated: walmart_listings_" in strip and "Built: order_sheet_" in strip, strip
+            assert "Every step has produced its output." in strip and "Listings written" in strip and "Order sheet created" in strip, strip
 
             # every step's input was the previous step's real output, nothing left this computer, and nothing was started twice
             assert [m["command"] for m in jobs_run] == ["search", "emails.drafts", "emails.send", "emails.send", "emails.mark", "emails.reply", "approvals.request",

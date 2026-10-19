@@ -1,15 +1,15 @@
-{# The export an order sheet or listings are built from: whether it belongs to the selected results file, and each approval's expiry. #}
-<h2>The export this is built from</h2>
+{# The approved list an order sheet or listings are built from: whether it belongs to the selected search, and each approval's expiry. #}
+<h2>The approved list this uses</h2>
 {% if not view.export.exists %}
-<div class="notice warn"><strong>There is no export yet.</strong> Export the valid approvals on the <a href="/step/approvals?wf={{ wf }}">Approvals</a> tab first.</div>
+<div class="notice warn"><strong>There is no approved list yet.</strong> Save it in <a href="/step/approvals?wf={{ wf }}">step 3, Get approval</a>, first.</div>
 {% elif not view.export.mine %}
-<div class="notice danger"><strong>The export on disk belongs to a different results file.</strong> It was made from <code>{{ view.export.source or 'an unnamed file' }}</code>; the results file selected here is <code>{{ current.file }}</code>. Nothing can be built from it here. Export again on the <a href="/step/approvals?wf={{ wf }}">Approvals</a> tab for this results file.</div>
+<div class="notice danger"><strong>The saved approved list belongs to a different search.</strong> It was saved from <code>{{ view.export.source or 'an unnamed file' }}</code>; the search you are working on is <code>{{ current.file }}</code>. Nothing can be created from it here. Save the approved list again in <a href="/step/approvals?wf={{ wf }}">step 3, Get approval</a>.</div>
 {% else %}
-<p>Exported from <code>{{ view.export.source }}</code> at {{ view.export.at }}: {{ view.export.count }} valid approval{{ 's' if view.export.count != 1 }} at that time.</p>
+<p>Saved at {{ view.export.at }}, with {{ view.export.count }} valid approval{{ 's' if view.export.count != 1 }} at that time.</p>
 {% if view.export.orders %}
 <div class="table-wrap">
   <table class="stack words">
-    <caption class="sr">Approvals in the export, with their expiry</caption>
+    <caption class="sr">Approvals in the list, with their expiry</caption>
     <thead><tr><th scope="col">Product</th><th scope="col">Seller</th><th scope="col" class="num">Quantity</th><th scope="col">Approval expires</th><th scope="col">Now</th></tr></thead>
     <tbody>
     {% for o in view.export.orders %}
@@ -20,7 +20,7 @@
   </table>
 </div>
 {% if view.export.orders|selectattr('expired')|list %}
-<div class="notice warn gap">Some approvals have expired since the export. The agent skips them and says so in its output; export again after a new approval to include them.</div>
+<div class="notice warn gap">Some approvals have expired since the list was saved. They are left out, and the result says so. Save the list again after a new approval to include them.</div>
 {% endif %}
 {% endif %}
 {% endif %}

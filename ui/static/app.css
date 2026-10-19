@@ -74,8 +74,8 @@ main { min-width: 0; max-width: 880px; }
 .badge { display: inline-flex; align-items: center; gap: 6px; padding: 1px var(--space-2); border: 1px solid var(--border); border-radius: 999px; font-size: var(--text-xs); font-weight: 600; line-height: 1.6; background: color-mix(in srgb, currentColor 8%, var(--surface)); color: var(--muted); white-space: nowrap; }
 .badge::before { content: ""; font-weight: 700; }
 .badge-not-started { border-style: dashed; } .badge-not-started::before { content: "\25CB"; }
-.badge-files-found { color: var(--info); border-color: var(--info); } .badge-files-found::before { content: "\25C6"; }
-.badge-blocked { color: var(--warning); border-color: var(--warning); } .badge-blocked::before { content: "\25A0"; }
+.badge-output-saved { color: var(--info); border-color: var(--info); } .badge-output-saved::before { content: "\25C6"; }
+.badge-cannot-start-yet { color: var(--warning); border-color: var(--warning); } .badge-cannot-start-yet::before { content: "\25A0"; }
 .badge-running { color: var(--info); border-color: var(--info); border-width: 2px; } .badge-running::before { content: "\25B6"; }
 .badge-done, .badge-set { color: var(--success); border-color: var(--success); } .badge-done::before, .badge-set::before { content: "\2713"; }
 .badge-failed { color: var(--danger); border-color: var(--danger); border-width: 2px; } .badge-failed::before { content: "\2715"; }

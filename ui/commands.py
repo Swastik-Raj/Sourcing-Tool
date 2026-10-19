@@ -18,10 +18,10 @@ STUB_MODES = ("ok", "fail", "slow", "secret", "hostile", "term", "url")
 
 # What an exit code means, from the agents' own behaviour (Stage 0): sys.exit("message") and sys.exit(1) both give 1.
 GENERIC_EXITS = {0: "Finished normally.",
-                 1: "The agent stopped with an error message (see the end of the log). Nothing further was done.",
-                 2: "The command line was rejected by the agent (bad or missing argument)."}
+                 1: "The tool stopped with an error (see the end of the log). Nothing further was done.",
+                 2: "The tool refused the request (a value was missing or wrong)."}
 # email_agent.py and decision_agent.py also exit 3 when their state file is locked by another command (statefile.py).
-STATE_EXITS = {**GENERIC_EXITS, 3: "Another command was using the agent's state file, so nothing was changed. Try again in a moment."}
+STATE_EXITS = {**GENERIC_EXITS, 3: "Another task was saving at the same moment, so nothing was changed. Try again in a moment."}
 
 
 def sku_rule(settings: Settings) -> Callable[[str], str]:
@@ -37,7 +37,7 @@ def results_file_rule(settings: Settings) -> Callable[[str], str]:
     def check(v: str) -> str:
         names = {p.name for p in settings.results_dir.glob("*.xlsx")} if settings.results_dir.is_dir() else set()
         if v not in names:
-            raise JobRejected("That results file is not in 'Excel Output Sheets'. Choose one from the list.")
+            raise JobRejected("That search's results are not in the Excel Output Sheets folder. Choose a search from the list.")
         return str(Path("Excel Output Sheets") / v)
     return check
 
@@ -100,7 +100,7 @@ def facts_file_rule(settings: Settings) -> Callable[[str], str]:
     def check(v: str) -> str:
         path = settings.uploads_dir / v if isinstance(v, str) and FACTS_RE.fullmatch(v) else None
         if path is None or not path.is_file() or path.is_symlink():
-            raise JobRejected("Choose a facts file you uploaded. Nothing was started.")
+            raise JobRejected("Choose a product details sheet you uploaded. Nothing was started.")
         return str(Path(UPLOADS_FOLDER) / v)
     return check
 
@@ -178,53 +178,53 @@ AGENTS = ("sourcing_agent", "email_agent", "decision_agent", "order_sheet", "con
 def _record_check(given: dict) -> None:
     """The decision agent requires --confirm-request to equal --request; the UI refuses a mismatch before starting it."""
     if str(given.get("confirm_request", "")).strip().upper() != str(given.get("request", "")).strip().upper():
-        raise JobRejected("The request id you typed is not the request you picked. Nothing was recorded.")
+        raise JobRejected("The request number you typed is not the request you picked. Nothing was recorded.")
 
 
 def pipeline_commands(settings: Settings) -> dict:
     """Every agent command the tabs after Search can start: (script, subcommand, allowed flags, value rules). A flag that
     is not listed here cannot be passed: --yes, --allow-listing-facts, --dry-run, --out, --duty are deliberately absent."""
     results, sku = results_file_rule(settings), sku_rule(settings)
-    send_exits = {**STATE_EXITS, 0: "The email agent finished. Its last lines say how many emails were sent.",
-                  1: "The email agent refused or stopped. Nothing further was sent (see the end of the log)."}
-    record_exits = {**STATE_EXITS, 0: "The reply was recorded. Nothing has been ordered.",
-                    1: "The decision agent rejected the reply or the confirmation. Nothing was recorded (see the end of the log)."}
+    send_exits = {**STATE_EXITS, 0: "Finished. The last lines below say how many emails were sent.",
+                  1: "Sending was refused or stopped. Nothing further was sent (see the end of the log)."}
+    record_exits = {**STATE_EXITS, 0: "The answer was recorded. Nothing has been ordered.",
+                    1: "The tool did not accept the answer or the confirmation. Nothing was recorded (see the end of the log)."}
     table = [
-        Command("emails.drafts", "Write email drafts", "email_agent.py", ("drafts",),
+        Command("emails.drafts", "Preview the emails", "email_agent.py", ("drafts",),
                 {"results": Param(None, results), "near_miss": Param("--near-miss", switch_rule, False, switch=True)},
-                True, "Drafts are only printed; nothing was sent or stored.", STATE_EXITS),
+                True, "Previews are only shown; nothing was sent or saved.", STATE_EXITS),
         Command("emails.send", "Send emails to sellers", "email_agent.py", ("send",),
                 {"results": Param(None, results), "confirm_count": Param("--confirm-count", pattern_rule(r"\d{1,4}", "a whole number")),
                  "test_recipient": Param("--test-recipient", pattern_rule(EMAIL_ADDRESS, "an email address"), False)},
                 True, CANCEL_WARNINGS["email_agent send"], send_exits),
-        Command("emails.mark", "Record an inquiry-form submission", "email_agent.py", ("mark",),
+        Command("emails.mark", "Mark a seller as contacted", "email_agent.py", ("mark",),
                 {"sku": Param(None, sku), "results": Param("--results", results)}, True,
-                "The mark may or may not have been stored. Check the Emails tab before marking again.", STATE_EXITS),
+                "The seller may or may not have been marked as contacted. Check the Status column on this page before marking again.", STATE_EXITS),
         Command("emails.reply", "Record a seller's reply", "email_agent.py", ("reply",),
                 {"sku": Param(None, sku), "results": Param("--results", results), "file": Param("--file", inputs_file_rule(settings))},
                 True, CANCEL_WARNINGS["email_agent reply"], STATE_EXITS),
-        Command("approvals.request", "Write an approval request", "decision_agent.py", ("request",),
+        Command("approvals.request", "Create an approval request", "decision_agent.py", ("request",),
                 {"results": Param(None, results), "budget": Param("--budget", pattern_rule(r"\d{1,9}(\.\d{1,2})?", "an amount such as 1500 or 1500.50"), False)},
-                True, "The request may or may not have been written. Check the Approvals tab before writing another.", STATE_EXITS),
-        Command("approvals.record", "Record the manager's reply", "decision_agent.py", ("record",),
-                {"results": Param("--results", results), "request": Param("--request", pattern_rule(REQUEST_ID, "a request id such as A-0001")),
+                True, "The request may or may not have been created. Check your requests on this page before creating another.", STATE_EXITS),
+        Command("approvals.record", "Record your manager's answer", "decision_agent.py", ("record",),
+                {"results": Param("--results", results), "request": Param("--request", pattern_rule(REQUEST_ID, "a request number such as A-0001")),
                  "file": Param("--file", inputs_file_rule(settings)),
-                 "confirm_request": Param("--confirm-request", pattern_rule(REQUEST_ID, "a request id such as A-0001"), private=True),
-                 "channel": Param("--channel", typed_line_rule("the channel the reply came through"), private=True),
-                 "approver": Param("--approver", typed_line_rule("the approver's name"), private=True)},
+                 "confirm_request": Param("--confirm-request", pattern_rule(REQUEST_ID, "a request number such as A-0001"), private=True),
+                 "channel": Param("--channel", typed_line_rule("how the answer reached you"), private=True),
+                 "approver": Param("--approver", typed_line_rule("who gave the approval"), private=True)},
                 True, CANCEL_WARNINGS["decision_agent record"], record_exits, _record_check),
-        Command("approvals.revoke", "Revoke an approval", "decision_agent.py", ("revoke",),
+        Command("approvals.revoke", "Withdraw an approval", "decision_agent.py", ("revoke",),
                 {"sku": Param(None, sku), "results": Param("--results", results)}, True,
-                "The approval may or may not have been revoked. Check the Approvals tab.", STATE_EXITS),
-        Command("approvals.export", "Export the valid approvals", "decision_agent.py", ("export",),
+                "The approval may or may not have been withdrawn. Check the approvals on this page.", STATE_EXITS),
+        Command("approvals.export", "Save the approved list", "decision_agent.py", ("export",),
                 {"results": Param("--results", results)}, True, CANCEL_WARNINGS["decision_agent export"], STATE_EXITS),
         # The export is always the decision agent's own approved_orders.csv in the project folder: never a path from a form.
-        Command("order.build", "Build the order sheet", "order_sheet.py", ("build", "--approved", APPROVED_CSV),
+        Command("order.build", "Create the order sheet", "order_sheet.py", ("build", "--approved", APPROVED_CSV),
                 {"results": Param("--results", results)}, True, CANCEL_WARNINGS["order_sheet build"]),
-        Command("content.template", "Write the facts template", "content_agent.py", ("facts-template", "--approved", APPROVED_CSV),
+        Command("content.template", "Create the product details sheet", "content_agent.py", ("facts-template", "--approved", APPROVED_CSV),
                 {"results": Param("--results", results), "facts": Param("--facts", new_template_rule(settings))}, True,
-                "The template may be incomplete. Write a new one."),
-        Command("content.generate", "Write listing drafts", "content_agent.py", ("generate", "--approved", APPROVED_CSV),
+                "The product details sheet may be incomplete. Create a new one."),
+        Command("content.generate", "Write the listings", "content_agent.py", ("generate", "--approved", APPROVED_CSV),
                 {"results": Param("--results", results), "facts": Param("--facts", facts_file_rule(settings))}, True,
                 CANCEL_WARNINGS["content_agent generate"]),
     ]
@@ -251,11 +251,13 @@ def build_allowlist(settings: Settings) -> dict:
 
 # Shown after a cancel, per agent command (from the Stage 0 reading). Stage 2 commands will look these up.
 CANCEL_WARNINGS = {
-    "email_agent send": "Some emails may already have been sent. email_state.json is written after each send, so check it before sending again.",
-    "email_agent reply": "The reply may not have been stored. Check email_state.json before pasting it again.",
-    "decision_agent record": "The approval may or may not have been stored. Run 'status' before recording again.",
-    "decision_agent export": "approved_orders.json and .csv may be half-written. Run 'export' again before building an order sheet.",
-    "order_sheet build": "Only a temporary '.verifying.xlsx' file can be left behind; a finished sheet is only created after checks pass.",
-    "sourcing_agent search": "The results file holds every product finished so far (it is saved after each product); the rest were not searched.",
-    "content_agent generate": "The listing file may be incomplete. Re-run generate.",
+    "email_agent send": "Some emails may already have been sent. Each one is recorded as soon as it is sent, so check the Status column on "
+                        "this page before sending again.",
+    "email_agent reply": "The reply may not have been saved. Check the Status column on this page before pasting it again.",
+    "decision_agent record": "The answer may or may not have been recorded. Check the approvals on this page before recording it again.",
+    "decision_agent export": "The approved list may be half-saved. Save it again before creating an order sheet.",
+    "order_sheet build": "No finished order sheet was created: one is only saved after its checks pass. A temporary file may be left in the "
+                         "Order Sheets folder.",
+    "sourcing_agent search": "The results keep every product finished so far (they are saved after each product); the rest were not searched.",
+    "content_agent generate": "The listings file may be incomplete. Write the listings again.",
 }

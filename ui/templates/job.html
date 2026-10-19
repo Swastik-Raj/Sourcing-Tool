@@ -7,18 +7,18 @@
   {% if job.exit_code is not none %}Exit code {{ job.exit_code }}: {{ job.exit_meaning }}{% endif %}</p>
 {% if job.note %}<div class="notice warn" role="alert">{{ job.note }}</div>{% endif %}
 {% if job.status == 'running' %}
-<progress aria-label="Job running"></progress>
+<progress aria-label="Task running"></progress>
 <form method="post" action="/jobs/{{ job.id }}/cancel">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
-  <button type="submit" class="btn-danger">Cancel job</button>
+  <button type="submit" class="btn-danger">Cancel task</button>
 </form>
 {% endif %}
 {% if job.status == 'failed' and job.tail %}
 <h2>Last lines</h2>
 <pre>{{ job.tail|join('\n') }}</pre>
 {% endif %}
-<h2>Log</h2>
+<h2>Technical log</h2>
 <p class="muted small">Wording differs from the raw log file.</p>
 <pre id="log" data-job="{{ job.id }}" data-offset="{{ offset }}" data-running="{{ 'yes' if job.status == 'running' else 'no' }}">{{ log }}</pre>
-<p>{% if job.command == 'search' %}<a href="/step/search?job={{ job.id }}">Open the search view</a> · {% endif %}<a href="/jobs">Back to jobs</a></p>
+<p>{% if job.command == 'search' %}<a href="/step/search?job={{ job.id }}">Open the search results</a> · {% endif %}<a href="/jobs">Back to Activity</a></p>
 {% endblock %}

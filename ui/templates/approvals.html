@@ -1,85 +1,85 @@
 {% extends "base.html" %}
 {% from "_macros.html" import badge %}
 {% block main %}
-<h1>Approvals</h1>
+<h1>Get approval</h1>
 <p>{{ step_text }}</p>
 {% include "_strip.html" %}
 {% if error %}<div class="notice danger" role="alert">{{ error }}</div>{% endif %}
 {% if current %}
 {% include "_joblog.html" %}
 {% if view.problem %}<div class="notice danger">{{ view.problem }}</div>{% endif %}
-<div class="notice">Nothing on this tab decides anything. The request is written from the search results and the seller replies; the approval is whatever the manager replied, typed in here by a person. Nothing is ordered.</div>
+<div class="notice">Your manager decides, not this tool. You create a request from the search results and the seller replies, send it to your manager yourself, then type in their answer. Nothing is ordered here.</div>
 
-<h2>1. Write the request for the manager</h2>
+<h2>1. Create the request for your manager</h2>
 <form method="post" action="/approvals/request" class="confirm">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
   <input type="hidden" name="wf" value="{{ wf }}">
   {% if view.no_email_record %}
-  <div class="notice warn"><strong>No emails have been recorded yet.</strong> The request would say: "seller reply status is unavailable". The usual order is Emails first, then Approvals.
-    <p><label class="plain"><input type="checkbox" name="ack" value="1" required> Write the request anyway, without seller replies</label></p></div>
+  <div class="notice warn"><strong>No seller has been contacted yet.</strong> The request would say that seller replies are unavailable. Usually you finish step 2, Email sellers, first.
+    <p><label class="plain"><input type="checkbox" name="ack" value="1" required> Create the request anyway, without seller replies</label></p></div>
   {% endif %}
   <label for="budget">Budget to compare the total against (optional, for example 1500)</label>
   <div class="inline-fields">
     <input type="text" id="budget" name="budget" inputmode="decimal" autocomplete="off" size="10">
-    <button type="submit" class="btn-primary" {{ 'disabled' if running }}>Write a request</button>
+    <button type="submit" class="btn-primary" {{ 'disabled' if running }}>Create the request</button>
   </div>
 </form>
 
-<h2>Requests for this results file</h2>
+<h2>Your requests for this search</h2>
 {% if not view.requests %}
-<div class="card empty"><p><strong>No request has been written for this file.</strong></p></div>
+<div class="card empty"><p><strong>No request yet for this search.</strong></p></div>
 {% else %}
 {% for r in view.requests %}
 <details {{ 'open' if loop.last and not r.answered }}>
-  <summary>{{ r.id }}: written {{ r.created }}, {{ r.lines }} line{{ 's' if r.lines != 1 }}, {{ 'reply recorded' if r.answered else 'waiting for a reply' }}</summary>
+  <summary>{{ r.id }}: written {{ r.created }}, {{ r.lines }} line{{ 's' if r.lines != 1 }}, {{ 'answer recorded' if r.answered else "waiting for your manager's answer" }}</summary>
   {% if r.text %}
-  <p class="muted small">This is the text to send to the manager. A request does not expire; each approval recorded from its reply does, 7 days after it is recorded.</p>
+  <p class="muted small">Send this text to your manager yourself; this tool does not send it. A request does not expire; each approval recorded from its answer lasts 7 days.</p>
   <pre>{{ r.text }}</pre>
   <p><a href="/files/Reports/approval_request_{{ r.id }}.txt">Download this request</a></p>
-  {% else %}<p class="muted">The request's text file is not in the Reports folder.</p>{% endif %}
+  {% else %}<p class="muted">This request's text could not be found in the Reports folder.</p>{% endif %}
 </details>
 {% endfor %}
 {% endif %}
 
-<h2>2. Record the manager's reply</h2>
+<h2>2. Record your manager's answer</h2>
 {% if not view.open %}
-<p class="muted">No request is waiting for a reply.</p>
+<p class="muted">No request is waiting for an answer.</p>
 {% else %}
 <form method="post" action="/approvals/record" class="confirm" autocomplete="off">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
   <input type="hidden" name="wf" value="{{ wf }}">
   <fieldset class="choices">
-    <legend>Which request does the reply answer?</legend>
+    <legend>Which request is this answer for?</legend>
     {% for r in view.open %}<div class="choice"><label><input type="radio" name="request_id" value="{{ r.id }}" required> {{ r.id }} <span class="muted">(written {{ r.created }})</span></label></div>{% endfor %}
   </fieldset>
-  <label for="mreply">Paste the manager's reply exactly as it was sent</label>
+  <label for="mreply">Paste your manager's answer exactly as it was sent</label>
   <textarea id="mreply" name="reply" rows="6" required autocomplete="off"></textarea>
   <div class="inline-fields gap">
-    <span><label for="confirm_request">Type the request id again</label>
+    <span><label for="confirm_request">Type the request number again</label>
       <input type="text" id="confirm_request" name="confirm_request" autocomplete="off" size="10" required></span>
-    <span><label for="channel">Channel the reply came through</label>
+    <span><label for="channel">How did the answer reach you?</label>
       <input type="text" id="channel" name="channel" autocomplete="off" size="16" required></span>
-    <span><label for="approver">Who approved</label>
+    <span><label for="approver">Who gave the approval?</label>
       <input type="text" id="approver" name="approver" autocomplete="off" size="20" required></span>
   </div>
   <p class="muted small">These three are typed by you every time. They are never filled in, suggested or remembered by this tool.</p>
-  <button type="submit" class="btn-primary" {{ 'disabled' if running }}>Record the reply</button>
+  <button type="submit" class="btn-primary" {{ 'disabled' if running }}>Record the answer</button>
 </form>
 {% endif %}
 
-<h2>Approvals recorded</h2>
+<h2>Approvals so far</h2>
 {% if not view.decisions %}
 <p class="muted">None yet.</p>
 {% else %}
 <div class="table-wrap">
   <table class="stack words">
-    <caption class="sr">Decisions recorded for this results file's requests</caption>
-    <thead><tr><th scope="col">Product</th><th scope="col">Status</th><th scope="col">Seller</th><th scope="col" class="num">Quantity</th><th scope="col">Recorded</th><th scope="col">Expires</th><th scope="col">Approved by, through</th></tr></thead>
+    <caption class="sr">Decisions recorded for this search's requests</caption>
+    <thead><tr><th scope="col">Product</th><th scope="col">Status</th><th scope="col">Seller</th><th scope="col" class="num">Quantity</th><th scope="col">Recorded</th><th scope="col">Expires</th><th scope="col">Approved by, how</th></tr></thead>
     <tbody>
     {% for d in view.decisions %}
     <tr><th scope="row">{{ d.sku }}</th><td data-label="Status">{{ d.status }}</td><td data-label="Seller">{{ d.seller }}</td>
       <td data-label="Quantity" class="num">{{ d.qty if d.qty is not none }}</td><td data-label="Recorded">{{ d.recorded }}</td>
-      <td data-label="Expires">{{ d.expires }}</td><td data-label="Approved by, through">{{ d.approver }}{{ ', ' ~ d.channel if d.channel }}</td></tr>
+      <td data-label="Expires">{{ d.expires }}</td><td data-label="Approved by, how">{{ d.approver }}{{ ', ' ~ d.channel if d.channel }}</td></tr>
     {% endfor %}
     </tbody>
   </table>
@@ -89,26 +89,26 @@
 <form method="post" action="/approvals/revoke" class="confirm gap">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
   <input type="hidden" name="wf" value="{{ wf }}">
-  <label for="revoke_sku">Revoke an approval: type its SKU</label>
+  <label for="revoke_sku">Withdraw an approval: type its product code (SKU)</label>
   <div class="inline-fields">
     <input type="text" id="revoke_sku" name="sku" autocomplete="off" size="20" required>
-    <button type="submit" class="btn-danger" {{ 'disabled' if running }}>Revoke</button>
+    <button type="submit" class="btn-danger" {{ 'disabled' if running }}>Withdraw</button>
   </div>
 </form>
 {% endif %}
 
-<h2>3. Export the valid approvals</h2>
+<h2>3. Save the approved list</h2>
 <form method="post" action="/approvals/export">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
   <input type="hidden" name="wf" value="{{ wf }}">
-  <button type="submit" class="btn-primary" {{ 'disabled' if running or not view.requests }}>Export</button>
-  <span class="muted small">Writes approved_orders.csv and .json with the approvals that are valid right now. Nothing is ordered.</span>
+  <button type="submit" class="btn-primary" {{ 'disabled' if running or not view.requests }}>Save the approved list</button>
+  <span class="muted small">Saves the approvals that are valid right now as the approved list that steps 4 and 5 use. Nothing is ordered.</span>
 </form>
 {% if view.export.exists and view.export.mine %}
-<p class="gap">The export on disk was made from this results file at {{ view.export.at }} and holds {{ view.export.count }} valid approval{{ 's' if view.export.count != 1 }}.
-  <a href="/files/project/approved_orders.csv">Download approved_orders.csv</a></p>
+<p class="gap">The approved list was saved for this search at {{ view.export.at }} and holds {{ view.export.count }} valid approval{{ 's' if view.export.count != 1 }}.
+  <a href="/files/project/approved_orders.csv">Download the approved list (CSV)</a></p>
 {% elif view.export.exists %}
-<div class="notice warn gap">The export on disk was made from a different results file, <code>{{ view.export.source }}</code>, not from <code>{{ current.file }}</code>. Export again before building an order sheet or listings for this file.</div>
+<div class="notice warn gap">The saved approved list belongs to a different search (<code>{{ view.export.source }}</code>), not to <code>{{ current.file }}</code>. Save the approved list again here before creating an order sheet or listings.</div>
 {% endif %}
 {% endif %}
 {% endblock %}

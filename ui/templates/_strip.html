@@ -1,20 +1,20 @@
-{# The pipeline status strip for the selected results file. Everything on it is read from files; the links only open a tab. #}
+{# The progress box for the selected search. Everything on it is read from files; the links only open a page. #}
 {% if current %}
-<section class="strip" aria-label="Pipeline status">
-  <p class="muted small">Status for <code>{{ current.file }}</code>, read from the files on disk. It shows what exists, not that anything has been checked or approved.</p>
+<section class="strip" aria-label="Progress">
+  <p class="muted small">Progress for the search of {{ current.label }}. It shows what has been done, not whether anyone has checked or approved it.</p>
   <ol>
     {% for st in steps %}
     <li {% if st.name == step_name %}aria-current="step"{% endif %}>
-      <a href="/step/{{ st.slug }}?wf={{ wf }}">{{ st.name }}</a>
+      <a href="/step/{{ st.slug }}?wf={{ wf }}">{{ st.label }}</a>
       <ul>
         {% for text, state in st.items %}<li class="{{ 'yes' if state is true else 'no' if state is false else 'fact' }}">{{ text }}</li>{% endfor %}
       </ul>
     </li>
     {% endfor %}
   </ol>
-  {% if next_step %}<p class="next">Next step: <a href="/step/{{ next_step.slug }}?wf={{ wf }}">{{ next_step.name }}</a> <span class="muted small">(a link only; nothing starts until you confirm on that tab)</span></p>
-  {% else %}<p class="next muted">The files show every step has produced its output.</p>{% endif %}
+  {% if next_step %}<p class="next">Next: <a href="/step/{{ next_step.slug }}?wf={{ wf }}">step {{ next_step.number }}, {{ next_step.label }}</a> <span class="muted small">(opens the page; nothing starts until you confirm there)</span></p>
+  {% else %}<p class="next muted">Every step has produced its output.</p>{% endif %}
 </section>
 {% else %}
-<div class="notice">There is no results file yet, so there is nothing to work on here. <a href="/step/search">Go to Search</a></div>
+<div class="notice">There is no search yet, so there is nothing to work on here. <a href="/step/search">Start with step 1: Find suppliers</a></div>
 {% endif %}

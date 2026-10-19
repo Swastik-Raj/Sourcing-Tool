@@ -148,7 +148,7 @@ class JobManager:
         with self._lock:                                # check and claim the state-changing slot atomically
             if cmd.state_changing:
                 if self._state_job is not None:
-                    raise JobBusy("Another job that changes data is running. Wait for it to finish or cancel it.")
+                    raise JobBusy("Another task that changes data is running. Wait for it to finish or cancel it.")
                 self._state_job = jid
         meta = {"id": jid, "command": cmd.id, "label": cmd.label, "args": cmd.recorded(args), "state_changing": cmd.state_changing,
                 "status": RUNNING, "started_at": datetime.now().isoformat(timespec="seconds"), "finished_at": None,
@@ -193,7 +193,7 @@ class JobManager:
             meta.update(exit_code=code, status=CANCELLED if cancelled else (OK if code == 0 else FAILED))
             meta["exit_meaning"] = "Stopped by you." if cancelled else cmd.exits.get(code, f"Exit code {code} (not one of the agent's documented codes).")
             if cancelled:
-                meta["note"] = cmd.cancel_warning or "This command was stopped part-way. Check its output files before running it again."
+                meta["note"] = cmd.cancel_warning or "This task was stopped part-way. Check what it saved before running it again."
         except Exception as e:   # noqa: BLE001 - never leave a job 'running' because the runner itself failed
             meta.update(status=FAILED, note=mask_line(f"The runner could not run this command: {type(e).__name__}"))
             with open(self.log_path(jid), "a", encoding="utf-8") as log:

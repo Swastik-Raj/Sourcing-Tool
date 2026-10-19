@@ -19,14 +19,17 @@ folders it uses, the name in the header and how long job logs are kept. A host o
 
 | Tab | What it runs | What a person must do before it runs |
 |---|---|---|
-| Search | `sourcing_agent.py --input <sheet> [--limit N] [--sku ...] [--add-builtin] --output <results>` | Upload or pick a sheet, read the cost estimate, type the number of products |
-| Emails | `email_agent.py drafts`, `send --confirm-count N [--test-recipient ADDR]`, `mark`, `reply --file` | Read the list of recipients and type how many emails; tick a box to record a form submission; paste a seller's reply |
-| Approvals | `decision_agent.py request`, `record --confirm-request --channel --approver --file`, `revoke`, `export` | Paste the manager's reply and type the request id, the channel and the approver's name (never filled in for you); type a SKU to revoke |
-| Order sheet | `order_sheet.py build --approved approved_orders.csv --results <results>` | Nothing typed: it only creates a file. Ordering and payment stay manual |
-| Listing content | `content_agent.py facts-template`, `generate --facts <uploaded file>` | Fill in the facts file yourself and upload it; type the number of products |
+| 1. Find suppliers | `sourcing_agent.py --input <sheet> [--limit N] [--sku ...] [--add-builtin] --output <results>` | Upload or pick a sheet, read the cost estimate, type the number of products |
+| 2. Email sellers | `email_agent.py drafts`, `send --confirm-count N [--test-recipient ADDR]`, `mark`, `reply --file` | Read the list of recipients and type how many emails; tick a box to record a form submission; paste a seller's reply |
+| 3. Get approval | `decision_agent.py request`, `record --confirm-request --channel --approver --file`, `revoke`, `export` | Paste the manager's reply and type the request number, how it reached you and who approved (never filled in for you); type a SKU to withdraw an approval |
+| 4. Order sheet | `order_sheet.py build --approved approved_orders.csv --results <results>` | Nothing typed: it only creates a file. Ordering and payment stay manual |
+| 5. Listings | `content_agent.py facts-template`, `generate --facts <uploaded file>` | Fill in the product details sheet (the facts file) yourself and upload it; type the number of products |
 
-Every tab after Search works on one results file, chosen in the "Results file" box, and shows a status strip for it.
-The strip is read from files on disk and its "Next step" link only opens a tab.
+The pages call a results file "a search", the export "the approved list", and the facts file "the product details sheet".
+The top bar also has Activity (every task started, with its log) and Setup (which settings are filled in).
+
+Every step after Find suppliers works on one search, chosen in the "Working on the search of" box, and shows a progress box
+for it. The box is read from files on disk and its "Next" link only opens a page.
 
 Things the UI will not do:
 

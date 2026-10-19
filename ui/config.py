@@ -30,7 +30,7 @@ ENV_VARS = (
     ("SMTP_HOST", "Sending emails to sellers"),
     ("SMTP_USER", "Sending emails to sellers"),
     ("SMTP_PASSWORD", "Sending emails to sellers"),
-    ("SHIPPING_ADDRESS", "Sending emails to sellers (sending is refused while it is unset or still the placeholder)"),
+    ("SHIPPING_ADDRESS", "Sending emails to sellers (sending is refused while it is missing or still the example text)"),
     ("BRAND_NAME", "Writing listing drafts"),
     ("SMTP_PORT", "Optional: mail server port, 587 if unset"),
     ("SMTP_FROM", "Optional: the From address, the mail login if unset"),

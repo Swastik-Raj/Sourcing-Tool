@@ -12,8 +12,8 @@ from .commands import CANCEL_WARNINGS, GENERIC_EXITS, SKU_RE, Command, JobReject
 from .config import MAX_PRODUCT_ROWS, UPLOADS_FOLDER, Settings
 
 AGENT = "sourcing_agent.py"
-REQUIRED_KEYS = (("ANTHROPIC_API_KEY", "The search cannot ask the AI service to read supplier pages"),
-                 ("NIMBLE_API_KEY", "The search cannot look up supplier pages"))
+REQUIRED_KEYS = (("ANTHROPIC_API_KEY", "The AI service key: the AI reads the supplier pages"),
+                 ("NIMBLE_API_KEY", "The web search key: it finds the supplier pages"))
 PRESET_SKUS = ("HDFF", "FOA-020C", "LCSP1050")
 
 # Rough figures from one 15-product batch: about $1.20 and 14 minutes, so about $0.08 and 56 seconds per product.
@@ -89,7 +89,7 @@ def input_path(s: Settings, value: str) -> Path:
         return Path(value)
     if isinstance(value, str) and value in upload_files(s):
         return Path(UPLOADS_FOLDER) / value[len(UPLOAD_PREFIX):]
-    raise JobRejected("That input file is not in the project folder or among the uploaded sheets. Choose one from the list.")
+    raise JobRejected("That spreadsheet is not in the project folder or among your uploads. Choose one from the list.")
 
 
 def products_from_rows(rows) -> tuple:
@@ -157,7 +157,7 @@ def resolve_selection(s: Settings, choice: str, skus=(), input_file: str = "", l
     if choice == "file":
         rows = input_products(s, input_file)
         params = {"input": input_file}
-        shown = "Uploaded sheet " + input_file[len(UPLOAD_PREFIX):] if input_file.startswith(UPLOAD_PREFIX) else f"Input file {input_file}"
+        shown = "Uploaded spreadsheet " + input_file[len(UPLOAD_PREFIX):] if input_file.startswith(UPLOAD_PREFIX) else f"Spreadsheet {input_file}"
         if skus:                                      # the agent's own --input FILE --sku A B: only SKUs that are in this file
             if str(limit or "").strip() or add_builtin:
                 raise JobRejected("Chosen products cannot be combined with a row limit or the built-in products option.")
@@ -175,7 +175,7 @@ def resolve_selection(s: Settings, choice: str, skus=(), input_file: str = "", l
             params["limit"] = limit_rule(str(limit).strip())
             rows = rows[:int(params["limit"])]
         if not rows:
-            raise JobRejected("That input file has no products under its 'SKU' heading.")
+            raise JobRejected("That spreadsheet has no products under its 'SKU' heading.")
         if len(rows) > MAX_PRODUCT_ROWS:
             raise JobRejected(f"That file has {len(rows)} products. One search takes at most {MAX_PRODUCT_ROWS}: "
                               "use the first-rows box or choose products.")
@@ -231,7 +231,7 @@ def output_rule(s: Settings) -> Callable[[str], str]:
         if not isinstance(v, str) or not OUTPUT_RE.fullmatch(v):
             raise JobRejected("The results file name is not one this tool builds.")
         if (s.results_dir / v).exists():
-            raise JobRejected("A results file with that name already exists. Wait a second and start again.")
+            raise JobRejected("A search started at this same second already exists. Wait a second and start again.")
         return str(Path(RESULTS_FOLDER) / v)
     return check
 
@@ -271,7 +271,7 @@ def search_command(s: Settings) -> Command:
               "limit": Param("--limit", limit_rule, False),
               "add_builtin": Param("--add-builtin", switch_rule, False, switch=True),
               "output": Param("--output", output_rule(s))}
-    exits = {**GENERIC_EXITS, 0: "The search agent finished. Its results are unverified until a person checks them."}
+    exits = {**GENERIC_EXITS, 0: "The search finished. Its results need checking by a person."}
     return Command("search", "Search for suppliers", script, fixed, params, True,
                    CANCEL_WARNINGS["sourcing_agent search"], exits, _combination(s))
 
@@ -372,13 +372,13 @@ def reading(status: str, exit_code, progress: dict) -> list:
     """Plain-language sentences for a run that did not simply finish, from what the agent printed."""
     lines = []
     if progress["missing"]:
-        lines.append(f"The search agent stopped before searching because a required setting is missing: {', '.join(progress['missing'])}. "
+        lines.append(f"The search stopped before it began because a required setting is missing: {', '.join(progress['missing'])}. "
                      "Add it to the .env file in the project folder and start again. Nothing was spent.")
     if progress["billing"]:
-        lines.append("The search agent reported a billing, credit or sign-in problem with the AI service and stopped the batch. "
+        lines.append("The search stopped: the AI service reported a billing, credit or sign-in problem. "
                      "Products already finished are saved; the others were not searched and are listed as errors.")
     if status == "failed" and not lines:
-        lines.append("The search agent stopped with an error. The last lines of its log are below.")
+        lines.append("The search stopped with an error. The last lines of its log are below.")
     if status == "interrupted":
-        lines.append("The UI stopped while this search was running, so it is not known how far the search got.")
+        lines.append("This tool was stopped while the search was running, so it is not known how far the search got.")
     return lines

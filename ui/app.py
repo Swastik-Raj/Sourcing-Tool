@@ -16,7 +16,7 @@ from . import pipeline, search, security, uploads, wording
 from .commands import JobRejected
 from .config import ENV_VARS, MAX_FACTS_BYTES, MAX_UPLOAD_BYTES, OUTPUT_FOLDERS, Settings, changed_reference_files, is_set, load_settings
 from .jobs import JobBusy, JobManager, mask_line
-from .workflows import STEP_TEXT, STEPS, Step, list_workflows, next_step, result_rows, search_detail, steps_for
+from .workflows import STEP_LABELS, STEP_TEXT, STEPS, Step, list_workflows, next_step, result_rows, search_detail, steps_for
 
 HERE = Path(__file__).resolve().parent
 STEP_SLUGS = {name.lower().replace(" ", "-"): name for name in STEPS}
@@ -37,7 +37,7 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
     templates = Jinja2Templates(directory=str(HERE / "templates"))        # autoescape is on for .html
     templates.env.finalize = wording.display                               # every printed value gets display wording (attributes too)
     app.state.templates = templates                                        # tests render through this same environment
-    templates.env.globals.update(app_name=s.app_name, badge_kind=badge_kind, job_badge=lambda st: JOB_BADGES.get(st, st))
+    templates.env.globals.update(app_name=s.app_name, badge_kind=badge_kind, job_badge=lambda st: JOB_BADGES.get(st, st), step_labels=STEP_LABELS)
     app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
     security.install(app, s)
 
@@ -65,7 +65,7 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
         if rs and steps:                    # a running search shows on its own workflow, or on any until its file exists
             out = rs["search"]["output"]
             if current["file"] == out or not (s.results_dir / out).exists():
-                steps[0] = Step("Search", "Running", "A search is running. Products are added to its results file as each one finishes.")
+                steps[0] = Step("Search", "Running", "A search is running. Each product's result is saved as soon as it finishes.")
         base = dict(request=request, csrf=security.csrf_for(getattr(request.state, "sid", "")), workflows=wfs, wf=wf,
                     current=current, steps=steps, running=jobs.running_state_job(), active=active, page_title=ctx.pop("page_title", ""),
                     tabs=[(name, slug) for slug, name in STEP_SLUGS.items()], next_step=next_step(steps))
@@ -99,7 +99,7 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
         back = {name: slug for slug, name in STEP_SLUGS.items()}.get(request.query_params.get("step", ""))
         if back and back != "search":       # the results file selector on a tab: stay on that tab (wf is checked again there)
             return RedirectResponse(f"/step/{back}?{urlencode({'wf': request.query_params.get('wf', '')})}", 303)
-        return render(request, "home.html", active="workflow", page_title="Workflow", recent=wfs[:5], all_count=len(wfs))
+        return render(request, "home.html", active="workflow", page_title="Overview", recent=wfs[:5], all_count=len(wfs))
 
     @app.get("/step/{slug}", response_class=HTMLResponse)
     def step(request: Request, slug: str):
@@ -107,7 +107,7 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
         if old:
             return old
         if slug not in STEP_SLUGS:
-            raise HTTPException(404, "No such step.")
+            raise HTTPException(404, "There is no such page.")
         if slug == "search":
             return search_page(request)
         return step_page(request, slug)
@@ -120,7 +120,7 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
         for w in list_workflows(s):
             if w["stem"] == wf:
                 return w["file"]
-        raise JobRejected("Choose a results file from the list. Nothing was started.")
+        raise JobRejected("Choose a search from the list. Nothing was started.")
 
     def step_page(request: Request, slug: str, status: int = 200, error: str = "", wf: str = "", **ctx):
         name = STEP_SLUGS[slug]
@@ -140,7 +140,7 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
         if job and job.get("step") == slug:
             data["job"] = job
             data["job_log"], data["job_offset"] = jobs.read_log(job["id"], 0, whole_lines_only=job["status"] == "running")
-        return render(request, STEP_PAGES[slug], status, active="workflow", page_title=name, step_name=name,
+        return render(request, STEP_PAGES[slug], status, active="workflow", page_title=STEP_LABELS[name], step_name=name,
                       step_text=STEP_TEXT[name], error=error, wf_override=chosen["stem"] if chosen else "", **{**data, **ctx})
 
     def act(request: Request, slug: str, wf: str, cmd: str, params: dict, input_file: str = ""):
@@ -196,7 +196,7 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
             return refused(request, "emails", wf, e)
         typed = confirm_count.strip()
         if not plan["count"]:
-            return refused(request, "emails", wf, "There is nothing to send for this results file. Nothing was sent.")
+            return refused(request, "emails", wf, "There is nothing to send for this search. Nothing was sent.")
         if not typed.isdigit() or int(typed) != plan["count"]:          # the server's own count; the agent checks it again with --confirm-count
             return refused(request, "emails", wf, "That is not the number of emails listed. Nothing was sent.", plan=plan)
         params = {"results": file, "confirm_count": str(plan["count"])}
@@ -206,7 +206,7 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
 
     def known_sku(file: str, sku: str) -> str:
         if sku.strip().upper() not in pipeline.draft_skus(s, file):
-            raise JobRejected("Choose a product from this results file's drafts. Nothing was stored.")
+            raise JobRejected("Choose a product from this search's sellers. Nothing was stored.")
         return sku.strip()
 
     @app.post("/emails/mark")
@@ -216,7 +216,7 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
             file = results_for(wf)
             sku = known_sku(file, sku)
             if confirm != "1":
-                raise JobRejected("Tick the box to say you submitted the seller's inquiry form yourself. Nothing was stored.")
+                raise JobRejected("Tick the box to confirm you contacted the seller through their website yourself. Nothing was stored.")
         except JobRejected as e:
             return refused(request, "emails", wf, e)
         return act(request, "emails", wf, "emails.mark", {"sku": sku, "results": file})
@@ -233,7 +233,7 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
             file = results_for(wf)
             sku = known_sku(file, sku)
             if not is_set(s, "ANTHROPIC_API_KEY"):
-                raise JobRejected("ANTHROPIC_API_KEY is not set, and reading a reply needs it. Nothing was stored.")
+                raise JobRejected("Reading a reply needs the AI service key (ANTHROPIC_API_KEY), which is not set up. Nothing was stored.")
             name = pasted(reply, "the seller's reply")
         except JobRejected as e:
             return refused(request, "emails", wf, e)
@@ -246,8 +246,8 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
         try:
             file = results_for(wf)
             if pipeline.approvals(s, file)["no_email_record"] and ack != "1":
-                raise JobRejected(f"There is no email record yet ({pipeline.NO_EMAIL_RECORD}) Tick the box to write a request without seller replies. "
-                                  "Nothing was written.")
+                raise JobRejected("No seller has been contacted yet, so the request would say that seller replies are unavailable. "
+                                  "Tick the box to create the request anyway. Nothing was written.")
         except JobRejected as e:
             return refused(request, "approvals", wf, e)
         return act(request, "approvals", wf, "approvals.request", {"results": file, **({"budget": budget.strip()} if budget.strip() else {})})
@@ -259,7 +259,7 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
         try:
             file = results_for(wf)
             if request_id not in {r["id"] for r in pipeline.approvals(s, file)["open"]}:
-                raise JobRejected("Pick the request this reply answers, from the requests still waiting for a reply. Nothing was recorded.")
+                raise JobRejected("Pick the request this answer is for, from those still waiting for an answer. Nothing was recorded.")
             given = {"results": file, "request": request_id, "confirm_request": confirm_request.strip().upper(), "channel": channel, "approver": approver}
             cmd = jobs.commands["approvals.record"]                       # every typed field is checked before the pasted text is saved
             try:
@@ -279,7 +279,7 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
         try:
             file = results_for(wf)
             if sku.strip() not in pipeline.approvals(s, file)["valid_skus"]:
-                raise JobRejected("Type the SKU of an approval that is currently valid for this results file. Nothing was revoked.")
+                raise JobRejected("Type the product code (SKU) of an approval that is still valid for this search. Nothing was withdrawn.")
         except JobRejected as e:
             return refused(request, "approvals", wf, e)
         return act(request, "approvals", wf, "approvals.revoke", {"sku": sku.strip(), "results": file})
@@ -324,7 +324,7 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
         try:
             columns = pipeline.facts_columns(s)
             if not columns:
-                raise JobRejected("The content agent's column list could not be read, so a facts file cannot be checked.")
+                raise JobRejected("The listing tool's column list could not be read, so the product details sheet cannot be checked.")
             name = uploads.save_facts(s, facts_file.filename, facts_file.file.read(MAX_FACTS_BYTES + 1), columns)
         except JobRejected as e:
             return refused(request, "listing-content", wf, f"Nothing was uploaded. {e}")
@@ -335,11 +335,11 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
         pipeline.export_gate(s, file)
         view = pipeline.content(s, file, facts)
         if not facts or view["facts"] != facts:
-            raise JobRejected("Choose a facts file you uploaded. Listings are only written from facts a person filled in. Nothing was started.")
+            raise JobRejected("Choose a product details sheet you uploaded. Listings are only written from details a person filled in. Nothing was started.")
         if view["missing"]:
             raise JobRejected(f"Nothing was started: {', '.join(view['missing'])} {'is' if len(view['missing']) == 1 else 'are'} not set.")
         if not view["count"]:
-            raise JobRejected("The export holds no approved product. Nothing was started.")
+            raise JobRejected("The approved list holds no product. Nothing was started.")
         return file, view
 
     @app.post("/content/review", response_class=HTMLResponse)
@@ -384,7 +384,7 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
         return p
 
     def search_page(request: Request, status: int = 200, error: str = "", review: Optional[dict] = None):
-        common = dict(active="workflow", page_title="Search", step_name="Search", step_text=STEP_TEXT["Search"], error=error)
+        common = dict(active="workflow", page_title=STEP_LABELS["Search"], step_name="Search", step_text=STEP_TEXT["Search"], error=error)
         asked = request.query_params.get("job", "")
         job = search_job(asked) if asked else None
         if job is None and review is None and not error and running_search():
@@ -473,7 +473,7 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
             return search_page(request, 400, review=sel, error="That is not the number of products selected. Nothing was started.")
         busy = jobs.running_state_job()                           # say so before anything else; jobs.start still takes the lock itself
         if busy:
-            return search_page(request, 409, error="Nothing was started. Another job that changes data is running. Wait for it to finish or cancel it.")
+            return search_page(request, 409, error="Nothing was started. Another task that changes data is running. Wait for it to finish or cancel it.")
         name = search.new_output_name()
         try:
             s.results_dir.mkdir(parents=True, exist_ok=True)       # the agent does not create the folder it saves into
@@ -490,7 +490,7 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
         env = [{"name": n, "set": is_set(s, n), "blocks": why} for n, why in ENV_VARS]
         folders = [(n, (s.project / n).is_dir()) for n in OUTPUT_FOLDERS]
         obs_on = os.environ.get("OBS_ENABLED") == "1"
-        return render(request, "health.html", active="health", page_title="Health", env=env, folders=folders, obs_on=obs_on,
+        return render(request, "health.html", active="health", page_title="Setup", env=env, folders=folders, obs_on=obs_on,
                       python=sys.version.split()[0], langfuse=langfuse_status() if obs_on else None,
                       project_ok=s.project.is_dir(), data_ok=s.data.is_dir(), zone=pipeline.zone_label(),
                       changed=changed_reference_files(s))
@@ -509,7 +509,7 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
     @app.get("/jobs", response_class=HTMLResponse)
     def job_list(request: Request):
         jobs.prune()
-        return render(request, "jobs.html", active="jobs", page_title="Jobs", jobs=jobs.list(),
+        return render(request, "jobs.html", active="jobs", page_title="Activity", jobs=jobs.list(),
                       commands=[c for c in jobs.commands.values() if not c.state_changing])
 
     @app.post("/jobs/run")
@@ -527,15 +527,15 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
     def job_view(request: Request, jid: str):
         meta = jobs.get(jid)
         if meta is None:
-            raise HTTPException(404, "No such job.")
+            raise HTTPException(404, "No such task.")
         text, offset = jobs.read_log(jid, 0, whole_lines_only=meta["status"] == "running")
-        return render(request, "job.html", active="jobs", page_title="Job", job=meta, log=text, offset=offset)
+        return render(request, "job.html", active="jobs", page_title="Task", job=meta, log=text, offset=offset)
 
     @app.get("/jobs/{jid}/log")
     def job_log(jid: str, offset: int = 0):
         meta = jobs.get(jid)
         if meta is None:
-            raise HTTPException(404, "No such job.")
+            raise HTTPException(404, "No such task.")
         text, new = jobs.read_log(jid, max(offset, 0), whole_lines_only=meta["status"] == "running")
         body = {"text": text, "offset": new, "status": meta["status"]}
         if search_job(jid):
@@ -546,7 +546,7 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
     def job_cancel(request: Request, jid: str, csrf_token: str = Form("")):
         csrf(request, csrf_token)
         if jobs.get(jid) is None:
-            raise HTTPException(404, "No such job.")
+            raise HTTPException(404, "No such task.")
         jobs.cancel(jid)
         meta = jobs.get(jid)
         if meta.get("step") in STEP_SLUGS:

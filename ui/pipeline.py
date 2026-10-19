@@ -14,18 +14,17 @@ from .config import Settings, is_set
 
 SMTP_SETTINGS = ("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD")
 MAX_MODEL_CALLS_PER_PRODUCT = 3      # content_agent.py MAX_CALLS_PER_SKU: first try, one invalid-JSON retry, one repair
-NO_EMAIL_RECORD = "email_state.json not found - seller reply status is unavailable."     # the decision agent's own note
 
 
 def _state(path: Path):
     """(parsed JSON object or None, problem text). A missing file is not a problem."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return (data, "") if isinstance(data, dict) else (None, f"{path.name} is not in the expected format.")
+        return (data, "") if isinstance(data, dict) else (None, f"{workflows.record_name(path)} is not in the expected format.")
     except FileNotFoundError:
         return None, ""
     except (OSError, ValueError):
-        return None, f"{path.name} could not be read."
+        return None, f"{workflows.record_name(path)} could not be read."
 
 
 # ---------- Emails ----------
@@ -54,9 +53,10 @@ def send_plan(s: Settings, results_name: str, test_recipient: str = "") -> dict:
     address, once per draft (the agent's rule), and marks nothing as sent."""
     view = emails(s, results_name)
     if not view["known"]:
-        raise JobRejected("The email agent's rules could not be read for this results file, so nothing can be sent from here.")
+        raise JobRejected("This search's results could not be read, so nothing can be sent from here.")
     if view["send_missing"]:
-        raise JobRejected(f"Nothing was sent: {', '.join(view['send_missing'])} {'is' if len(view['send_missing']) == 1 else 'are'} not set.")
+        raise JobRejected(f"Nothing was sent: email sending is not set up ({', '.join(view['send_missing'])} "
+                          f"{'is' if len(view['send_missing']) == 1 else 'are'} not set).")
     rows = view["drafts"] if test_recipient else view["to_send"]
     return {"test": bool(test_recipient), "test_recipient": test_recipient, "count": len(rows),
             "recipients": [{"sku": d["sku"], "seller": d["seller"], "to": test_recipient or d["email"], "really": d["email"]} for d in rows]}
@@ -89,7 +89,7 @@ def approvals(s: Settings, results_name: str) -> dict:
         if not isinstance(d, dict) or d.get("request_id") not in ids:
             continue
         expires = workflows._when(d.get("expires_at"))
-        status = "Rejected" if d.get("decision") != "approve" else "Revoked" if d.get("revoked_at") else \
+        status = "Rejected" if d.get("decision") != "approve" else "Withdrawn" if d.get("revoked_at") else \
             "Expired" if expires and expires <= now else "Valid"
         decisions.append({"id": d.get("id"), "request": d.get("request_id"), "sku": d.get("sku"), "seller": d.get("seller"), "qty": d.get("qty"),
                           "max": d.get("max_unit_price"), "approver": d.get("approver"), "channel": d.get("channel"),
@@ -124,10 +124,11 @@ def export_gate(s: Settings, results_name: str) -> dict:
     names. Whether each approval is still valid stays the agent's call: expiry is shown, not enforced here."""
     export = export_for(s, results_name)
     if not export["exists"] or not (s.project / "approved_orders.csv").is_file():
-        raise JobRejected("There is no export yet. Export the valid approvals on the Approvals tab first. Nothing was started.")
+        raise JobRejected("There is no approved list yet. Save it in step 3, Get approval, first. Nothing was started.")
     if not export["mine"]:
-        raise JobRejected(f"The export on disk was made from '{export['source'] or 'an unnamed file'}', not from the results file selected here, "
-                          f"'{results_name}'. Export again on the Approvals tab for this results file. Nothing was started.")
+        raise JobRejected(f"The saved approved list belongs to a different search: it was saved from '{export['source'] or 'an unnamed file'}', "
+                          f"not from the one you are working on, '{results_name}'. Save the approved list again in step 3, Get approval. "
+                          "Nothing was started.")
     return export
 
 

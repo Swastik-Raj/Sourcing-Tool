@@ -12,16 +12,19 @@ import observability as obs
 
 from .config import UPLOADS_FOLDER, Settings
 
-STEPS = ("Search", "Emails", "Approvals", "Order sheet", "Listing content")
+STEPS = ("Search", "Emails", "Approvals", "Order sheet", "Listing content")      # internal names: they make the URLs (/step/<slug>)
+STEP_LABELS = {"Search": "Find suppliers", "Emails": "Email sellers", "Approvals": "Get approval", "Order sheet": "Order sheet",
+               "Listing content": "Listings"}                                    # what a person reads
 STEP_TEXT = {
-    "Search": "Finds alternative suppliers for each product and compares their prices with the reference price.",
-    "Emails": "Writes sample-order emails to the suppliers the search recommended, for a person to check and send.",
-    "Approvals": "Turns the recommendations into a request for a manager and records the manager's reply.",
-    "Order sheet": "Builds the Excel sheet a person uses to place the approved orders by hand.",
-    "Listing content": "Drafts the product listing text for a person to review and upload by hand.",
+    "Search": "Upload a spreadsheet of your products. The tool searches supplier websites and compares each price with the "
+              "reference price (the price you compare against).",
+    "Emails": "Ask the recommended sellers for a sample and a price quote. You check every email before it is sent.",
+    "Approvals": "Send your manager a summary of the recommended orders, then type in their answer. This tool approves nothing itself.",
+    "Order sheet": "Get an Excel sheet of what to buy, from which seller and at what price. You place each order yourself.",
+    "Listing content": "Draft Walmart product listings from product details you have checked. You review and upload them yourself.",
 }
-# Badge vocabulary. "Files found" means files exist, nothing more: it does not mean they are correct or approved.
-NOT_STARTED, FOUND, BLOCKED = "Not started", "Files found", "Blocked"
+# Badge vocabulary. "Output saved" means files exist, nothing more: it does not mean they are correct or approved.
+NOT_STARTED, FOUND, BLOCKED = "Not started", "Output saved", "Cannot start yet"
 
 
 @dataclass
@@ -36,6 +39,14 @@ class Step:
     @property
     def slug(self) -> str:
         return self.name.lower().replace(" ", "-")
+
+    @property
+    def label(self) -> str:
+        return STEP_LABELS[self.name]
+
+    @property
+    def number(self) -> int:
+        return STEPS.index(self.name) + 1
 
 
 _agents: dict = {}
@@ -118,13 +129,22 @@ def list_workflows(s: Settings) -> list:
     return out
 
 
+# The agents' record files, by what they hold. A message about one names both, so whoever fixes it can find the file.
+RECORD_NAMES = {"email_state.json": "The record of contacted sellers", "decision_state.json": "The record of approvals",
+                "approved_orders.json": "The saved approved list"}
+
+
+def record_name(path: Path) -> str:
+    return f"{RECORD_NAMES.get(path.name, 'A record file')} ({path.name})"
+
+
 def _json(path: Path):
     try:
         return json.loads(path.read_text(encoding="utf-8")), ""
     except FileNotFoundError:
         return None, ""
     except (OSError, ValueError):
-        return None, f"{path.name} could not be read"
+        return None, f"{record_name(path)} could not be read"
 
 
 def draft_counts(s: Settings, path: Path):
@@ -163,16 +183,16 @@ def search_detail(s: Settings, path: Path) -> tuple:
     d = draft_counts(s, path)
     plural = f"{n} product{'s' if n != 1 else ''}"
     if d is None:
-        return n, (f"{plural} in the results file. {rec} row{'s' if rec != 1 else ''} carry a recommendation; the Emails step shows how "
-                   "many can be drafted. Recommendations are the search's reading of seller pages and are unverified until a person checks them.")
-    parts = [f"{d['draftable']} can be drafted"]
+        return n, (f"{plural} searched. {rec} row{'s' if rec != 1 else ''} carry a recommendation; step 2, Email sellers, shows how "
+                   "many sellers can be contacted. Recommendations are the search's reading of seller pages and need checking by a person.")
+    parts = [f"{d['draftable']} have a seller to contact"]
     if d["no_seller"]:
         parts.append(f"{d['no_seller']} have no recommended seller")
     if d["excluded"]:
-        parts.append(f"{d['excluded']} are excluded by the reviewer's exclusion list")
+        parts.append(f"{d['excluded']} are on the reviewer's do-not-use list")
     if d["errors"]:
         parts.append(f"{d['errors']} could not be searched")
-    return n, (f"{plural} in the results file: " + "; ".join(parts) + ". Recommendations are unverified until a person checks them.")
+    return n, (f"{plural} searched: " + "; ".join(parts) + ". Recommendations need checking by a person.")
 
 
 def _money(v) -> str:
@@ -233,14 +253,14 @@ def steps_for(s: Settings, results_name: str) -> list:
     try:
         n, text = search_detail(s, path)
         d = draft_counts(s, path)
-        search = Step("Search", FOUND, text, items=[("Results file exists", True), (f"{n} product{'s' if n != 1 else ''}", None)], done=True)
+        search = Step("Search", FOUND, text, items=[("Results saved", True), (f"{n} product{'s' if n != 1 else ''}", None)], done=True)
         can_draft = d["draftable"] if d else None
     except Exception:  # noqa: BLE001
         n = 0
         can_draft = None
-        search = Step("Search", BLOCKED, "", "The results file could not be read. It may be open in Excel or damaged.")
+        search = Step("Search", BLOCKED, "", "The results spreadsheet could not be read. It may be open in Excel or damaged.")
     out.append(search)
-    no_results = "There is no readable results file for this workflow." if search.status == BLOCKED else ""
+    no_results = "The results of this search could not be read." if search.status == BLOCKED else ""
 
     # Emails. email_state.json is one file for every results file; an entry belongs to THIS results file when its key
     # (the email agent's listing_key: SKU + the recommended listing's host and path) is the key of one of this file's
@@ -252,17 +272,17 @@ def steps_for(s: Settings, results_name: str) -> list:
     record = {k: v for k, v in (email or {}).items() if not k.startswith("_") and isinstance(v, dict)}
     entries = [record[k] for k in {d["key"] for d in rows["drafts"]} if k in record] if rows else list(record.values())
     sent, replies = sum("sent" in e for e in entries), sum("reply" in e for e in entries)
-    scope = "" if rows else " That record covers every results file, not only this one."
-    strip = [(f"{can_draft} can be drafted" if can_draft is not None else "What can be drafted is unknown", None),
-             (f"{sent} marked sent", sent > 0), (f"{replies} repl{'ies' if replies != 1 else 'y'} recorded", replies > 0)]
+    scope = "" if rows else " That count covers every search, not only this one."
+    strip = [(f"{can_draft} seller{'s' if can_draft != 1 else ''} to contact" if can_draft is not None else "Sellers to contact: unknown", None),
+             (f"{sent} contacted", sent > 0), (f"{replies} repl{'ies' if replies != 1 else 'y'} recorded", replies > 0)]
     if err:
         emails = Step("Emails", BLOCKED, "", err)
     elif not entries:
-        why = no_results or ("Nothing in this file can be drafted." if can_draft == 0 else "")
-        emails = Step("Emails", BLOCKED if why else NOT_STARTED, "No emails recorded yet.", why, strip, done=bool(reqs))
+        why = no_results or ("No product in this search has a seller to contact." if can_draft == 0 else "")
+        emails = Step("Emails", BLOCKED if why else NOT_STARTED, "No seller contacted yet.", why, strip, done=bool(reqs))
     else:
-        emails = Step("Emails", FOUND, f"The email record has {len(entries)} seller(s){' for this results file' if rows else ''}: "
-                      f"{sent} marked sent, {replies} with a reply.{scope}", items=strip, done=True)
+        emails = Step("Emails", FOUND, f"{len(entries)} seller(s) on record{' for this search' if rows else ''}: "
+                      f"{sent} contacted, {replies} replied.{scope}", items=strip, done=True)
     out.append(emails)
 
     exp, exp_err = _json(s.project / "approved_orders.json")
@@ -271,7 +291,7 @@ def steps_for(s: Settings, results_name: str) -> list:
     if dec_err:
         approvals = Step("Approvals", BLOCKED, "", dec_err)
     elif not reqs:
-        approvals = Step("Approvals", BLOCKED if no_results else NOT_STARTED, "No approval request has been written for this file.", no_results,
+        approvals = Step("Approvals", BLOCKED if no_results else NOT_STARTED, "No approval request yet for this search.", no_results,
                          [("No request yet", False)])
     else:
         ids = {r["id"] for r in reqs}
@@ -280,12 +300,12 @@ def steps_for(s: Settings, results_name: str) -> list:
         valid = [d for d in decs if d.get("decision") == "approve" and not d.get("revoked_at") and (_when(d.get("expires_at")) or now) > now]
         live, waiting = len(valid), sum(not r.get("reply") for r in reqs)
         soonest = min((_when(d.get("expires_at")) for d in valid), default=None)
-        approvals = Step("Approvals", FOUND, f"{len(reqs)} request(s); {waiting} still waiting for a recorded reply; "
-                         f"{live} approval(s) currently valid (approvals expire).",
+        approvals = Step("Approvals", FOUND, f"{len(reqs)} request(s); {waiting} still waiting for your manager's answer; "
+                         f"{live} approval(s) still valid (approvals expire).",
                          items=[(f"{len(reqs)} request{'s' if len(reqs) != 1 else ''} written", True),
-                                (f"{len(reqs) - waiting} repl{'ies' if len(reqs) - waiting != 1 else 'y'} recorded", len(reqs) > waiting),
+                                (f"{len(reqs) - waiting} answer{'s' if len(reqs) - waiting != 1 else ''} recorded", len(reqs) > waiting),
                                 (f"{live} approval{'s' if live != 1 else ''} valid" + (f", first expires {soonest.astimezone():%Y-%m-%d %H:%M}" if soonest else ""), live > 0),   # local time, as on the tabs
-                                ("Exported" if mine else "Not exported", bool(mine))])
+                                ("Approved list saved" if mine else "Approved list not saved", bool(mine))])
     approvals.done = bool(mine)
     out.append(approvals)
 
@@ -294,27 +314,27 @@ def steps_for(s: Settings, results_name: str) -> list:
     if exp_err:
         order = Step("Order sheet", BLOCKED, "", exp_err)
     elif mine is None:
-        why = "Needs a valid approval, exported from the Approvals step." if approvals.status != FOUND else ""
-        order = Step("Order sheet", BLOCKED if why else NOT_STARTED, "No approved orders have been exported for this file.", why,
-                     [("No order sheet for this file's export", False)])
+        why = "Needs a valid approval, saved as the approved list in step 3, Get approval." if approvals.status != FOUND else ""
+        order = Step("Order sheet", BLOCKED if why else NOT_STARTED, "No approved list saved for this search yet.", why,
+                     [("No order sheet for this search's approved list", False)])
     else:
-        extra = f" The newest order sheet is {sheet.name} (sheets are not linked to a results file)." if sheet else " No order sheet file yet."
-        order = Step("Order sheet", FOUND, f"{mine.get('valid_approvals', 0)} valid approval(s) exported at {mine.get('generated_at', '?')}.{extra}",
-                     items=[(f"Built: {sheet.name}" if built else "Not built since the last export", built)], done=built)
+        extra = f" Newest order sheet: {sheet.name} (a sheet's name does not say which search it came from)." if sheet else " No order sheet yet."
+        order = Step("Order sheet", FOUND, f"Approved list saved at {mine.get('generated_at', '?')} with {mine.get('valid_approvals', 0)} valid approval(s).{extra}",
+                     items=[("Order sheet created" if built else "Not created since the approved list was saved", built)], done=built)
     out.append(order)
 
     facts = newest_facts(s)
     listing = _newest(s.project / "Walmart Listings", "walmart_listings_*.xlsx")
     generated = bool(mine and listing and listing.stat().st_mtime >= exported_at)
-    strip = [(f"Facts file: {facts.name}" if facts else "No facts file yet", bool(facts)),
-             (f"Generated: {listing.name}" if generated else "Not generated since the last export", generated)]
+    strip = [("Product details uploaded" if facts else "No product details yet", bool(facts)),
+             ("Listings written" if generated else "Not written since the approved list was saved", generated)]
     if listing:
-        content = Step("Listing content", FOUND, f"Newest listing file: {listing.name} (not linked to a results file). Drafts need a person's review before upload.",
-                       items=strip, done=generated)
+        content = Step("Listing content", FOUND, f"Newest listings file: {listing.name} (a file's name does not say which search it came from). "
+                       "Listings need checking by a person before upload.", items=strip, done=generated)
     else:
-        why = "Needs an exported approval first." if mine is None else ""
+        why = "Needs the approved list from step 3, Get approval." if mine is None else ""
         content = Step("Listing content", BLOCKED if why else NOT_STARTED,
-                       "The product facts file exists." if facts else "The product facts file has not been created yet.", why, strip)
+                       "Product details have been uploaded." if facts else "No product details uploaded yet.", why, strip)
     out.append(content)
     return out
 

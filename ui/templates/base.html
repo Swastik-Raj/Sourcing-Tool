@@ -14,17 +14,17 @@
     <a class="brand" href="/">{{ app_name }}</a>
     <nav class="nav" aria-label="Main">
       <a href="/{{ '?wf=' ~ wf if wf else '' }}" {% if active == 'workflow' and not step_name %}aria-current="page"{% endif %}>Home</a>
-      {% for name, slug in tabs %}<a href="/step/{{ slug }}{{ '?wf=' ~ wf if wf else '' }}" {% if step_name == name %}aria-current="page"{% endif %}>{{ name }}</a>
+      {% for name, slug in tabs %}<a href="/step/{{ slug }}{{ '?wf=' ~ wf if wf else '' }}" {% if step_name == name %}aria-current="page"{% endif %}>{{ step_labels[name] }}</a>
       {% endfor %}
-      <a href="/jobs" {% if active == 'jobs' %}aria-current="page"{% endif %}>Jobs</a>
-      <a href="/health" {% if active == 'health' %}aria-current="page"{% endif %}>Health</a>
+      <a href="/jobs" {% if active == 'jobs' %}aria-current="page"{% endif %}>Activity</a>
+      <a href="/health" {% if active == 'health' %}aria-current="page"{% endif %}>Setup</a>
     </nav>
   </div>
 </header>
 {% if running %}
 <div class="banner" role="status">
   <div class="banner-inner">
-    <span>A job is running: <strong>{{ running.label }}</strong> (started {{ running.started_at|replace('T', ' ') }}).</span>
+    <span>A task is running: <strong>{{ running.label }}</strong> (started {{ running.started_at|replace('T', ' ') }}).</span>
     {% if running.command == 'search' %}
     <a href="/step/search?job={{ running.id }}">View progress or cancel</a>
     {% else %}
@@ -38,11 +38,11 @@
 </div>
 {% endif %}
 <div class="layout">
-  <aside class="rail" aria-label="Workflow">
+  <aside class="rail" aria-label="Steps">
     {% if workflows %}
     <form method="get" action="/">
       {% if step_name %}<input type="hidden" name="step" value="{{ step_name }}">{% endif %}
-      <label for="wf">Results file</label>
+      <label for="wf">Working on the search of</label>
       <select id="wf" name="wf" data-autosubmit>
         {% for w in workflows %}<option value="{{ w.stem }}" {{ 'selected' if w.stem == wf }}>{{ w.label }}</option>{% endfor %}
       </select>
@@ -50,12 +50,12 @@
     </form>
     <ol class="stepper" aria-label="Steps">
       {% for st in steps %}
-      <li><a href="/step/{{ st.slug }}?wf={{ wf }}" {% if step_name == st.name %}aria-current="page"{% endif %}>{{ st.name }} {{ badge(st.status) }}</a></li>
+      <li><a href="/step/{{ st.slug }}?wf={{ wf }}" {% if step_name == st.name %}aria-current="page"{% endif %}>{{ st.label }} {{ badge(st.status) }}</a></li>
       {% endfor %}
     </ol>
     {% else %}
-    <p class="muted small">No results files yet. A workflow appears here after a search has produced one.</p>
-    <p class="small"><a href="/step/search">Go to Search</a></p>
+    <p class="muted small">No searches yet. Each search you run appears here, with its five steps.</p>
+    <p class="small"><a href="/step/search">Start with step 1: Find suppliers</a></p>
     {% endif %}
   </aside>
   <main id="main">{% block main %}{% endblock %}</main>

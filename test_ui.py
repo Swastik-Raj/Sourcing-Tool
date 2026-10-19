@@ -373,24 +373,24 @@ def workflow_id_matches_the_agents_and_lists_newest_first(env):
 @test
 def overview_steps_only_claim_what_files_show(env):
     page = env.client.get("/").text
-    assert "lcom-" not in page and "2 products" in page and "1 can be drafted" in page and "1 have no recommended seller" in page
+    assert "lcom-" not in page and "2 products" in page and "1 have a seller to contact" in page and "1 have no recommended seller" in page
     steps = {s.name: s for s in workflows.steps_for(env.settings, "sourcing_results_20260202_100000.xlsx")}
     assert [s for s in steps] == list(workflows.STEPS)
-    assert steps["Search"].status == "Files found" and steps["Emails"].status == "Not started"
+    assert steps["Search"].status == "Output saved" and steps["Emails"].status == "Not started"
     assert steps["Approvals"].blocked == "" and steps["Order sheet"].blocked and steps["Listing content"].blocked
     (env.project / "decision_state.json").write_text(json.dumps({"next_request": 2, "decisions": [], "requests": {
         "A-0001": {"id": "A-0001", "results_file": "sourcing_results_20260202_100000.xlsx", "reply": None, "lines": []},
         "A-0002": {"id": "A-0002", "results_file": "sourcing_results_20260101_100000.xlsx", "reply": None, "lines": []}}}))
     (env.project / "email_state.json").write_text("{not json")
     steps = {s.name: s for s in workflows.steps_for(env.settings, "sourcing_results_20260202_100000.xlsx")}
-    assert steps["Approvals"].status == "Files found" and "1 request(s)" in steps["Approvals"].detail and "still waiting" in steps["Approvals"].detail
-    assert steps["Emails"].status == "Blocked" and steps["Emails"].blocked
+    assert steps["Approvals"].status == "Output saved" and "1 request(s)" in steps["Approvals"].detail and "still waiting" in steps["Approvals"].detail
+    assert steps["Emails"].status == "Cannot start yet" and steps["Emails"].blocked
     gates = {"emails": "Nothing is sent yet. The next page lists every recipient and asks you to type the count.",
-             "approvals": "These three are typed by you every time.", "order-sheet": "No cart link is possible",
+             "approvals": "These three are typed by you every time.", "order-sheet": "nothing is ordered or paid",
              "listing-content": "Nothing is published"}
     for (slug, gate), name in zip(gates.items(), workflows.STEPS[1:]):                 # real screens now: each says what its gate is
         page = env.client.get(f"/step/{slug}").text
-        assert "Not available yet" not in page and f"<h1>{name}</h1>" in page and "Pipeline status" in page, slug
+        assert "Not available yet" not in page and f"<h1>{workflows.STEP_LABELS[name]}</h1>" in page and 'aria-label="Progress"' in page, slug
         assert gate in page, slug
     assert "Which products" in env.client.get("/step/search").text                    # Stage 2a: the Search step is a real screen
     assert env.client.get("/step/bogus").status_code == 404
@@ -400,7 +400,7 @@ def overview_steps_only_claim_what_files_show(env):
 def running_banner_and_job_pages(env):
     m = env.jobs.start("stub.state", {"mode": "slow"})
     page = env.client.get("/").text
-    assert "A job is running" in page and "Cancel" in page
+    assert "A task is running" in page and "Cancel" in page
     assert m["id"] in env.client.get("/jobs").text
     log = env.client.get(f"/jobs/{m['id']}/log?offset=0").json()
     assert log["status"] == "running"
@@ -546,7 +546,7 @@ def friendly_labels_recent_five_and_show_all(env):
     assert len(wfs) == 7 and all("lcom" not in w["label"].lower() and "_" not in w["label"] for w in wfs)
     assert wfs[0]["label"].endswith("5 products") and len({w["label"] for w in wfs}) == 7
     html = env.client.get("/").text
-    recent = html.split("Recent workflows")[1].split("<details>")[0]
+    recent = html.split("Your searches")[1].split("<details>")[0]
     assert recent.count("<li>") == 5 and "Show all (7)" in html
     for f in list((env.project / "Excel Output Sheets").glob("sourcing_results_2026030*.xlsx")):
         f.unlink()
@@ -563,8 +563,8 @@ def home_count_separates_carrying_a_recommendation_from_being_draftable(env):
                 [["A1", "p", "Acme", "http://a/1"], ["B2", "p", "Beta", "http://b/2"], ["C3", "p", "", ""], ["D4", "p", "", ""]])
     (env.project / "reviewer_exclusions.csv").write_text("sku,supplier_or_url,reason\nB2,beta,not acceptable\n", encoding="utf-8")
     text = env.client.get("/").text
-    assert "4 products" in text and "1 can be drafted" in text and "2 have no recommended seller" in text, text
-    assert "1 are excluded by the reviewer" in text and "unverified" in text
+    assert "4 products" in text and "1 have a seller to contact" in text and "2 have no recommended seller" in text, text
+    assert "1 are on the reviewer&#39;s do-not-use list" in text and "need checking by a person" in text
     assert "7 with a recommended seller" not in text and "recommended sellers" not in text
     d = workflows.draft_counts(env.settings, env.project / "Excel Output Sheets" / "sourcing_results_20260404_100000.xlsx")
     assert d == {"draftable": 1, "no_seller": 2, "excluded": 1, "errors": 0}, d
@@ -575,7 +575,7 @@ def home_count_separates_carrying_a_recommendation_from_being_draftable(env):
         text = env.client.get("/").text
     finally:
         workflows.draft_counts = real
-    assert "rows carry a recommendation; the Emails step shows how many can be drafted" in text and "can be drafted;" not in text
+    assert "rows carry a recommendation; step 2, Email sellers, shows how many sellers can be contacted" in text and "have a seller to contact;" not in text
 
 
 @test
@@ -597,11 +597,11 @@ def displayed_log_has_a_note_wording_and_whole_lines_only(env):
 @test
 def app_name_is_configurable_and_neutral_by_default(env):
     html = env.client.get("/").text
-    assert "<title>Workflow - Sourcing Tool</title>" in html and 'class="brand" href="/">Sourcing Tool<' in html
+    assert "<title>Overview - Sourcing Tool</title>" in html and 'class="brand" href="/">Sourcing Tool<' in html
     other = Settings(project=env.project, data=env.project / "d3", app_name="Acme Sourcing")
     c = TestClient(create_app(other), base_url="http://127.0.0.1:8000")
     html = c.get("/health").text
-    assert "<title>Health - Acme Sourcing</title>" in html and "Sourcing Tool" not in html
+    assert "<title>Setup - Acme Sourcing</title>" in html and "Sourcing Tool" not in html
     saved = os.environ.get("UI_APP_NAME")
     os.environ["UI_APP_NAME"] = "From Env"
     try:
@@ -656,7 +656,7 @@ def colour_tokens_meet_wcag_contrast_in_both_themes(env):
 @test
 def every_status_has_a_distinct_badge_with_text(env):
     css = (Path(__file__).parent / "ui" / "static" / "app.css").read_text(encoding="utf-8")
-    kinds = ["not-started", "files-found", "blocked", "running", "done", "failed", "cancelled", "interrupted"]
+    kinds = ["not-started", "output-saved", "cannot-start-yet", "running", "done", "failed", "cancelled", "interrupted"]
     markers = []
     for k in kinds:
         m = re.search(rf"\.badge-{k}::before[^{{]*\{{\s*content:\s*\"([^\"]+)\"", css)
@@ -668,7 +668,7 @@ def every_status_has_a_distinct_badge_with_text(env):
     for j in ("ok", "fail"):
         env.jobs.wait(env.jobs.start("stub.read", {"mode": j})["id"])
     html = env.client.get("/jobs").text
-    assert "badge-done" in html and ">Done<" in html and ">Failed<" in html and "No jobs yet" not in html
+    assert "badge-done" in html and ">Done<" in html and ">Failed<" in html and "No tasks yet" not in html
 
 
 # ================= Stage 2a: the Search screen (stub agent only; no real search is ever run) =================
@@ -803,7 +803,7 @@ def typed_count_is_checked_against_the_server_side_count(env):
         review = post(env, "/search/review", choice="preset")
         assert review.status_code == 200 and "About 3 products, roughly $0.24 and 3 minutes." in review.text
         assert "This is an estimate from one 15-product batch (about $0.08 and about 56 seconds per product), not a measurement of this run." in review.text
-        assert "spends money and calls external services" in review.text and "Type the number of products to confirm" in review.text
+        assert "costs money: it uses paid AI and web search services" in review.text and "Type the number of products to confirm" in review.text
         for typed in ("2", "", "three", "3.0", "-3", "33"):
             r = post(env, "/search/start", choice="preset", confirm_count=typed)
             assert r.status_code == 400 and "not the number of products selected" in r.text, typed
@@ -824,8 +824,8 @@ def missing_keys_disable_start_and_the_server_refuses_a_forced_post(env):
     fake_agent(env)
     with env_vars(ANTHROPIC_API_KEY=None, NIMBLE_API_KEY=None):
         page = env.client.get("/step/search").text
-        assert "A search cannot be started." in page and "ANTHROPIC_API_KEY and NIMBLE_API_KEY are not set" in page
-        assert page.count("Not set") == 2 and re.search(r'<button type="submit" class="btn-primary" disabled>Continue', page)
+        assert "A search cannot start yet." in page and "ANTHROPIC_API_KEY and NIMBLE_API_KEY are not set up" in page
+        assert page.count("Not set") == 2 and re.search(r'<button type="submit" class="btn-primary" disabled>Next: check the cost', page)
         assert re.search(r'class="btn-primary" disabled>Start search', post(env, "/search/review", choice="preset").text)
         r = post(env, "/search/start", choice="preset", confirm_count="3")
         assert r.status_code == 400 and "Nothing was started: ANTHROPIC_API_KEY, NIMBLE_API_KEY is not set" in r.text
@@ -836,8 +836,8 @@ def missing_keys_disable_start_and_the_server_refuses_a_forced_post(env):
         # the agents read the project's .env themselves, so a key there counts as set; its value is never shown
         (env.project / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-FILEKEY0000000000\nNIMBLE_API_KEY=nimble-file-secret\n", encoding="utf-8")
         text = env.client.get("/step/search").text + env.client.get("/health").text
-        assert "A search cannot be started." not in text and "sk-ant-FILEKEY" not in text and "nimble-file-secret" not in text
-        assert not re.search(r'disabled>Continue', text)
+        assert "A search cannot start yet." not in text and "sk-ant-FILEKEY" not in text and "nimble-file-secret" not in text
+        assert not re.search(r'disabled>Next: check the cost', text)
 
 
 @test
@@ -847,7 +847,7 @@ def a_search_takes_the_exclusive_lock(env):
         jid = started(post(env, "/search/start", choice="preset", confirm_count="3"))
         assert env.jobs.get(jid)["state_changing"] and env.jobs.running_state_job()["id"] == jid
         r = post(env, "/search/start", choice="preset", confirm_count="3")
-        assert r.status_code == 409 and "Nothing was started" in r.text and "Another job that changes data is running" in r.text
+        assert r.status_code == 409 and "Nothing was started" in r.text and "Another task that changes data is running" in r.text
         raises(JobBusy, env.jobs.start, "stub.state", {"mode": "ok"})                 # no state-changing job alongside a search
         assert env.jobs.wait(env.jobs.start("stub.read", {"mode": "ok"})["id"])["status"] == "succeeded"   # read-only still runs
         assert len([m for m in env.jobs.list() if m["command"] == "search"]) == 1
@@ -855,8 +855,8 @@ def a_search_takes_the_exclusive_lock(env):
         env.jobs.wait(jid)
         other = env.jobs.start("stub.state", {"mode": "slow"})                        # and the other way round
         page = env.client.get("/step/search").text
-        assert "A search cannot be started while another job is running" in page and "stub (changes state)" in page
-        assert re.search(r'disabled>Continue', page)
+        assert "A search cannot start while another task is running" in page and "stub (changes state)" in page
+        assert re.search(r'disabled>Next: check the cost', page)
         assert post(env, "/search/start", choice="preset", confirm_count="3").status_code == 409
         env.jobs.cancel(other["id"])
         env.jobs.wait(other["id"])
@@ -944,13 +944,13 @@ def cancel_keeps_the_partial_results_file_and_the_run_is_shown_as_partial(env):
         out = env.settings.results_dir / env.jobs.get(jid)["search"]["output"]
         assert out.is_file()
         page = clean(env.client.get(f"/step/search?job={jid}").text, "running")
-        assert "Products finished so far are kept in the results file. The product in progress is lost." in page
-        assert 'id="p-bar" max="3" value="1"' in page and "the agent's own figure" in page and "badge-running" in page
+        assert "Products finished so far are kept in the saved results. The product in progress is lost." in page
+        assert 'id="p-bar" max="3" value="1"' in page and "the search's own figure" in page and "badge-running" in page
         assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page                         # the hostile description, escaped in the log
         prog = env.client.get(f"/jobs/{jid}/log?offset=0").json()["progress"]
         assert (prog["done"], prog["total"], prog["current"]) == (1, 3, ["FOA-020C"]) and prog["cost"] == 0.0165, prog
         home = env.client.get("/").text
-        assert "A job is running" in home and "View progress or cancel" in home and home.count("badge-running") >= 2   # banner, rail and table
+        assert "A task is running" in home and "View progress or cancel" in home and home.count("badge-running") >= 2   # banner, rail and table
         assert f"/jobs/{jid}/cancel" not in home, "a search is only cancelled from the page that shows the warning"
         assert env.client.get("/step/search", follow_redirects=False).headers["location"] == f"/step/search?job={jid}"
         child = int(re.search(r"child pid (\d+)", env.jobs.read_log(jid)[0])[1])
@@ -963,13 +963,13 @@ def cancel_keeps_the_partial_results_file_and_the_run_is_shown_as_partial(env):
     assert process_gone(child)
     assert out.is_file() and workflows.products_in(out) == 1, "the finished product must be kept"
     page = clean(env.client.get(f"/step/search?job={jid}").text, "cancelled")
-    assert "Partial results." in page and "holds 1 of the 3 products asked for" in page and "Cancelled" in page
-    assert "The search job has ended" not in page and ">Done<" not in page
+    assert "Partial results." in page and "hold 1 of the 3 products asked for" in page and "Cancelled" in page
+    assert "The search has finished" not in page and ">Done<" not in page
     named = search_mod.parse_progress(env.jobs.read_log(jid)[0])["report"]             # a stopped agent never prints where the report went
     assert "so no report was copied." in page and f"The report file is <code>{named}</code> in the project folder." in page
     assert "/files/Reports/" not in page and not (env.project / "Reports").exists()
     steps ={st.name: st for st in workflows.steps_for(env.settings, out.name)}
-    assert steps["Search"].status == "Files found" and "badge-running" not in env.client.get("/").text
+    assert steps["Search"].status == "Output saved" and "badge-running" not in env.client.get("/").text
 
 
 @test
@@ -981,14 +981,14 @@ def exit_1_and_a_billing_stop_are_read_in_plain_language(env):
     page = clean(env.client.get(f"/step/search?job={jid}").text, "failed")
     assert meta["status"] == "failed" and meta["exit_code"] == 1
     assert "Exit code 1" in page and "a required setting is missing: ANTHROPIC_API_KEY, NIMBLE_API_KEY" in page
-    assert "Last lines" in page and "No results file was produced." in page and "Next: seller emails" not in page and "sk-ant-..." not in page
+    assert "Last lines" in page and "No results were saved." in page and "Next: step 2, Email sellers" not in page and "sk-ant-..." not in page
     with keys("billing"):
         jid = started(post(env, "/search/start", choice="preset", confirm_count="3"))
         meta = env.jobs.wait(jid)
     page = clean(env.client.get(f"/step/search?job={jid}").text, "billing")
     assert meta["exit_code"] == 0, "the real agent ends normally after a billing stop, so the page must read the log"
     assert "billing, credit or sign-in problem" in page and "Partial results." in page and "2 of them recorded as errors" in page
-    assert page.count(">Error") >= 2 and "1 can be drafted" in page and "2 could not be searched" in page and ">Done<" not in page
+    assert page.count(">Error") >= 2 and "1 have a seller to contact" in page and "2 could not be searched" in page and ">Done<" not in page
 
 
 @test
@@ -1004,13 +1004,13 @@ def results_table_is_honest_about_recommended_draftable_and_excluded(env):
         meta = env.jobs.wait(jid)
     name = meta["search"]["output"]
     page = clean(env.client.get(f"/step/search?job={jid}").text, "finished")
-    assert "The search job has ended." in page and ">Done<" not in page and "Partial results" not in page
+    assert "The search has finished." in page and ">Done<" not in page and "Partial results" not in page
     assert page.count("badge-unverified") == 1, "only the draftable recommendation is marked; an excluded one is not a recommendation"
-    assert "Excluded by reviewer list" in page and "No recommendation" in page and "Check the pack size" in page
-    assert "3 products in the results file: 1 can be drafted; 1 have no recommended seller; 1 are excluded by the reviewer" in page
+    assert "On the reviewer's do-not-use list" in page and "No recommendation" in page and "Check the pack size" in page
+    assert "3 products searched: 1 have a seller to contact; 1 have no recommended seller; 1 are on the reviewer&#39;s do-not-use list" in page
     assert "Stub Maker 0" in page and "alibaba.com" in page and "$1.25" in page and "90%" in page
     assert "Reference unit price" in page and "$10.00" in page and "reference list, 2026-01-01" in page          # carried by the file, relabelled
-    assert "Downloaded files keep their original wording" in page and "Next: seller emails" in page
+    assert "Downloaded files keep their original wording" in page and "Next: step 2, Email sellers" in page
     assert f'/step/emails?wf={Path(name).stem}"' in page and f'value="{Path(name).stem}" selected' in page       # the rail follows the run
     assert env.client.get(f"/files/Excel Output Sheets/{name}").status_code == 200
     report = search_mod.parse_progress(env.jobs.read_log(jid)[0])["report"]
@@ -1021,9 +1021,9 @@ def results_table_is_honest_about_recommended_draftable_and_excluded(env):
     for u in urls_in(page):
         assert not has_term(u), u
     assert not has_term(re.search(r"<title>(.*?)</title>", page, re.S)[1])
-    assert "Open the search view" in env.client.get(f"/jobs/{jid}").text
+    assert "Open the search results" in env.client.get(f"/jobs/{jid}").text
     home = env.client.get("/").text
-    assert "Files found" in home and ">Done<" not in home
+    assert "Output saved" in home and ">Done<" not in home
     # without the email agent's rules the page says the exclusion list was not applied, and never invents a count
     real, workflows._cache = (workflows.draft_counts, workflows.draft_rows), {}
     workflows.draft_counts = workflows.draft_rows = lambda s, p: None        # the project's email agent cannot be loaded
@@ -1032,7 +1032,7 @@ def results_table_is_honest_about_recommended_draftable_and_excluded(env):
     finally:
         workflows.draft_counts, workflows.draft_rows = real
         workflows._cache = {}
-    assert "exclusion list could not be applied on this page" in page and "can be drafted;" not in page and page.count("badge-unverified") == 2
+    assert "do-not-use list could not be applied on this page" in page and "have a seller to contact;" not in page and page.count("badge-unverified") == 2
 
 
 @test

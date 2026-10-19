@@ -1,7 +1,7 @@
 {# The command this tab last started (when the address names one): its status, its masked log, and Cancel while it runs. #}
 {% from "_macros.html" import badge %}
 {% if job %}
-<section class="card gap" aria-label="The command you started">
+<section class="card gap" aria-label="The task you started">
   <p>{{ badge(job_badge(job.status)) }} <strong>{{ job.label }}</strong>. Started {{ job.started_at|replace('T', ' ') }}{% if job.duration_s is not none %}, took {{ job.duration_s }} s{% endif %}.
     {% if job.exit_code is not none %}Exit code {{ job.exit_code }}: {{ job.exit_meaning }}{% endif %}</p>
   {% if job.note %}<div class="notice warn" role="alert">{{ job.note }}</div>{% endif %}
@@ -11,7 +11,7 @@
     <button type="submit" class="btn-danger">Cancel</button>
   </form>
   {% endif %}
-  <p class="muted small">This is the agent's own output. Email addresses, keys and the shipping address are masked in logs, and wording differs from the raw log file.</p>
+  <p class="muted small">This is the tool's own output. Email addresses, keys and the shipping address are hidden here, and some wording differs from the saved log.</p>
   <pre id="log" data-job="{{ job.id }}" data-offset="{{ job_offset }}" {% if job.status == 'running' %}data-running="yes"{% endif %}>{{ job_log }}</pre>
 </section>
 {% endif %}

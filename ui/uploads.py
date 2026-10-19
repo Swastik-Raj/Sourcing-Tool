@@ -84,18 +84,19 @@ def save_facts(s: Settings, filename: str, data: bytes, columns: list, now: Opti
     byte for byte as Uploads\\facts_<date>_<time>_<random>.csv and never opened for writing again: what a fact's status
     says is only ever what the person who filled the file wrote. Returns the saved name."""
     if not isinstance(filename, str) or not filename.lower().endswith(".csv"):
-        raise JobRejected("Only a .csv facts file can be uploaded.")
+        raise JobRejected("Only a .csv product details sheet can be uploaded.")
     if len(data) > MAX_FACTS_BYTES:
-        raise JobRejected(f"That facts file is larger than {_mb(MAX_FACTS_BYTES)}.")
+        raise JobRejected(f"That product details sheet is larger than {_mb(MAX_FACTS_BYTES)}.")
     if b"\x00" in data or data.startswith(b"PK"):
         raise JobRejected("That file is not a .csv text file, whatever its name says.")
     try:
         text = data.decode("utf-8-sig")
     except UnicodeDecodeError:
-        raise JobRejected("That facts file is not saved as UTF-8 text. Save it as 'CSV UTF-8' and upload it again.")
+        raise JobRejected("That product details sheet is not saved as UTF-8 text. In Excel, save it as 'CSV UTF-8' and upload it again.")
     header = next(csv.reader(io.StringIO(text)), [])
     if [h.strip() for h in header] != list(columns):
-        raise JobRejected(f"That file's first row is not the template's columns ({', '.join(columns)}). Fill in the template and upload that.")
+        raise JobRejected(f"That file's first row is not the product details sheet's columns ({', '.join(columns)}). "
+                          "Fill in the sheet from step 1 on this page and upload that.")
     name = f"facts_{now or datetime.now():%Y%m%d_%H%M%S}_{secrets.token_hex(3)}.csv"
     _write_new(_real_folder(s.uploads_dir) / name, data)
     return name

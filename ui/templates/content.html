@@ -89,6 +89,19 @@
 {% else %}
 <div class="notice warn gap">That product details sheet could not be read.</div>
 {% endif %}
+{% set use = view.use %}
+{% if use and use.error %}
+<div class="notice danger gap" id="facts-use"><strong>The listing tool would refuse to write listings from this:</strong> {{ use.error }}</div>
+{% elif use %}
+<div class="notice gap" id="facts-use"><p><strong>{{ use.used }} detail{{ 's' if use.used != 1 }} will be used, {{ use.ignored }} ignored.</strong>
+  Ignored details have a status the listing tool does not use, or are a price or UPC, which is never shown to the AI.</p>
+  <p>{{ use.empty }} row{{ 's' if use.empty != 1 }} {{ 'is' if use.empty == 1 else 'are' }} still empty.{% if use.other %} {{ use.other }} more detail{{ 's are' if use.other != 1 else ' is' }} for products whose listing will not be written now (not in the approved list, or the approval has expired).{% endif %}
+  {% if not use.products %} No approved product is still valid, so no listing would be written.{% endif %}</p>
+  <p class="muted small">Counted by the listing tool itself, the way it picks the details when it writes the listings.</p></div>
+{% elif view.export.mine %}
+<p class="gap"><a class="btn" href="/step/listing-content?wf={{ wf }}&amp;facts={{ view.facts }}&amp;count=1">Count the details the listing tool will use</a>
+  <span class="muted small">It reads the sheet the way the listing tool does; this takes a few seconds. If no count appears, it could not be worked out.</span></p>
+{% endif %}
 {% call tech() %}<p>Product details file: <code>{{ view.facts }}</code> in the Uploads folder.</p>{% endcall %}
 
 <h2>4. Write the listings</h2>

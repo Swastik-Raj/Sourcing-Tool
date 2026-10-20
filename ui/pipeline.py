@@ -4,9 +4,14 @@ action is a command from the allowlist that the agent checks again itself."""
 import ast
 import csv
 import json
+import os
 import re
+import subprocess
+import sys
+import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from . import workflows
 from .commands import FACTS_RE, REQUEST_ID, JobRejected
@@ -29,6 +34,21 @@ def _state(path: Path):
 
 # ---------- Emails ----------
 
+def web_link(url) -> str:
+    """A seller's page as a link target: an http or https address with a host, rebuilt without any user name or password.
+    '' for anything else, which a page then shows as plain text: these addresses come from web pages, so a javascript:,
+    data: or other address must never become a link."""
+    try:
+        p = urlsplit(str(url or "").strip())
+        port = p.port
+    except ValueError:
+        return ""
+    if p.scheme.lower() not in ("http", "https") or not p.hostname:
+        return ""
+    host = f"[{p.hostname}]" if ":" in p.hostname else p.hostname
+    return urlunsplit((p.scheme.lower(), host + (f":{port}" if port else ""), p.path, p.query, p.fragment))
+
+
 def emails(s: Settings, results_name: str) -> dict:
     """What the Emails tab shows for one results file. 'drafts' are the rows the email agent would draft, each with what
     email_state.json records under its key; 'to_send' is what a real send would send (the agent's rule: has an address,
@@ -39,7 +59,9 @@ def emails(s: Settings, results_name: str) -> dict:
     for d in (rows or {}).get("drafts", []):
         entry = (state or {}).get(d["key"])
         entry = entry if isinstance(entry, dict) else {}
+        link = web_link(d["url"])
         drafts.append({"sku": str(d["sku"]), "seller": str(d["manufacturer"] or ""), "email": str(d["email"] or "").strip(), "url": str(d["url"] or ""),
+                       "link": link, "site": urlsplit(link).hostname if link else "",
                        "sent": entry.get("sent"), "status": entry.get("status"), "summary": entry.get("summary"), "replied": "reply" in entry})
     need = [n for n in SMTP_SETTINGS + ("SHIPPING_ADDRESS",) if not is_set(s, n)]
     return {"known": rows is not None, "drafts": drafts, "skipped": (rows or {}).get("skipped", []), "problem": problem,
@@ -143,7 +165,12 @@ def outputs(s: Settings, folder: str, pattern: str, limit: int = 5) -> list:
 
 
 def order(s: Settings, results_name: str) -> dict:
-    return {"export": export_for(s, results_name), "sheets": outputs(s, "Order Sheets", "order_sheet_*.xlsx")}
+    """'newest' is the newest sheet when it was written at or after this search's approved list was saved: the same rule
+    the step list uses to say an order sheet was created. Nothing else about a sheet can be checked from its file."""
+    export, sheets = export_for(s, results_name), outputs(s, "Order Sheets", "order_sheet_*.xlsx")
+    saved = workflows._mtime(s.project / "approved_orders.json") if export["mine"] else None
+    newest = sheets[0] if sheets and saved is not None and sheets[0]["mtime"] >= saved else None
+    return {"export": export, "sheets": sheets, "newest": newest, "older": sheets[1:] if newest else sheets}
 
 
 # ---------- Listing content ----------
@@ -189,13 +216,69 @@ def facts_summary(s: Settings, name: str) -> dict:
     return {"name": name, "readable": True, "by_status": sorted(by_status.items()), "facts": sum(by_status.values()), "products": len(skus - {""})}
 
 
-def content(s: Settings, results_name: str, facts: str = "") -> dict:
+# Run with the project folder as its working folder, so the listing tool's own modules (and their own imports) are the ones
+# loaded: the UI does not import content_agent itself, because it imports the email agent, the order sheet tool and the
+# decision agent by name. It follows `generate` step by step and only reads files.
+_USE_PROBE = r'''
+import csv, json, sys
+from datetime import datetime, timezone
+import content_agent as c
+ask = json.loads(sys.stdin.read())
+try:
+    approved, _ = c.read_approved(ask["approved"])
+    lines, _ = c.select_lines(approved, c.read_results(ask["results"]), c.load_exclusions(c.REVIEWER_EXCLUSIONS_CSV),
+                              datetime.now(timezone.utc), None)
+    rows = c.read_facts(ask["facts"])
+except Exception as e:
+    print(json.dumps({"error": str(e) or type(e).__name__}))
+    raise SystemExit
+with open(ask["facts"], encoding="utf-8-sig", newline="") as f:
+    in_file = sum(1 for _ in csv.DictReader(f))
+skus = [line[0] for line in lines]
+used = sum(len(c.usable_facts(c.facts_for(rows, sku), False)) for sku in skus)
+mine = sum(len(c.facts_for(rows, sku)) for sku in skus)
+print(json.dumps({"error": "", "products": len(skus), "used": used, "ignored": mine - used, "other": len(rows) - mine,
+                  "empty": in_file - len(rows)}))
+'''
+_use: dict = {}
+USE_KEPT_S = 600       # a count is shown again for up to 10 minutes while none of its files change (approvals expire)
+
+
+def facts_use(s: Settings, results_name: str, facts: str, count: bool = False):
+    """How the listing tool will use an uploaded product details sheet, from its own functions (read_approved,
+    select_lines, read_facts, facts_for, usable_facts; listing-title facts off, as the UI never passes that flag):
+    {'products', 'used', 'ignored', 'other', 'empty'} or {'error': the tool's own refusal}; None if it is not known.
+    Loading the tool takes several seconds, so it is only run when `count` is asked for (after an upload, or the
+    page's Count link); otherwise only a recent count of the same files is returned. Nothing is written."""
+    files = (s.project / "content_agent.py", s.project / "approved_orders.csv", s.results_dir / results_name, s.uploads_dir / facts,
+             s.project / "reviewer_exclusions.csv")
+    key = tuple(workflows._mtime(p) for p in files) + (results_name, facts)
+    kept = _use.get(key)
+    if kept and time.time() - kept[0] < USE_KEPT_S:
+        return kept[1]
+    if not count:
+        return None
+    try:
+        how = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+        p = subprocess.run([sys.executable, "-X", "utf8", "-c", _USE_PROBE], cwd=s.project, capture_output=True, text=True, timeout=120,
+                           input=json.dumps({"approved": str(files[1]), "results": str(files[2]), "facts": str(files[3])}),
+                           env={**os.environ, "PYTHONIOENCODING": "utf-8"}, encoding="utf-8", errors="replace", **how)
+        result = json.loads(p.stdout.strip().splitlines()[-1]) if p.returncode == 0 and p.stdout.strip() else None
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+    _use.clear()                                            # one sheet at a time is enough
+    _use[key] = (time.time(), result)
+    return result
+
+
+def content(s: Settings, results_name: str, facts: str = "", count: bool = False) -> dict:
     """What the Listing content tab shows. 'count' is the number of products in the export: the number a person types
     before listings are generated."""
     export, files = export_for(s, results_name), facts_files(s)
     chosen = facts if facts in files else (files[0] if files else "")
     skus = sorted({str(o["sku"]) for o in export["orders"] if o.get("sku")}) if export["mine"] else []
     return {"export": export, "facts_files": files, "facts": chosen, "summary": facts_summary(s, chosen) if chosen else None,
+            "use": facts_use(s, results_name, chosen, count) if chosen and export["mine"] else None,
             "templates": outputs(s, "Uploads", "facts_template_*.csv", 3), "listings": outputs(s, "Walmart Listings", "walmart_listings_*.*", 6),
             "skus": skus, "count": len(skus), "calls_each": MAX_MODEL_CALLS_PER_PRODUCT, "columns": facts_columns(s),
             "missing": [n for n in ("ANTHROPIC_API_KEY", "BRAND_NAME") if not is_set(s, n)]}

@@ -27,14 +27,25 @@
 </form>
 
 <h2>Order sheets</h2>
-{% if view.sheets %}
-<ul class="list card">
-  {% for f in view.sheets %}<li><a href="/files/Order Sheets/{{ f.name }}">{{ f.name }}</a> <span class="muted small">created {{ f.at }}</span></li>{% endfor %}
+{% if view.newest %}
+<ul class="list card" id="newest-sheet">
+  <li><a href="/files/Order Sheets/{{ view.newest.name }}">{{ view.newest.name }}</a> {{ badge('Newest, created after your latest approved list', 'set') }} <span class="muted small">created {{ view.newest.at }}</span></li>
 </ul>
-<p class="muted small">A sheet's name does not say which search it came from. Use one created after the approved list shown above was saved. Downloaded files keep their original wording.</p>
+{% elif view.sheets %}
+<p class="muted">No order sheet has been created since the approved list of this search was saved.</p>
 {% else %}
 <div class="card empty"><p><strong>No order sheet has been created yet.</strong></p></div>
 {% endif %}
+{% if view.older %}
+<details id="older-sheets">
+  <summary>Order sheets created earlier ({{ view.older|length }})</summary>
+  <ul class="list">
+    {% for f in view.older %}<li><a href="/files/Order Sheets/{{ f.name }}">{{ f.name }}</a> <span class="muted small">created {{ f.at }}</span></li>{% endfor %}
+  </ul>
+  <p class="muted small">A sheet's name does not say which search it came from.</p>
+</details>
+{% endif %}
+{% if view.sheets %}<p class="muted small">Downloaded files keep their original wording.</p>{% endif %}
 {% include "_continue.html" %}
 {% endif %}
 {% endblock %}

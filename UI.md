@@ -31,6 +31,15 @@ in the left column only: each with its status and one line read from files on di
 the search chosen there ("Working on the search of"). Each page starts with one "What to do now" box and ends with "Continue
 to step N" (or why that step cannot start yet). Setting names, exit codes, logs and internal file names are under
 "Technical details"; refusals, errors, missing setup that blocks a step and every confirmation line are never collapsed.
+On a phone the left column shows only the current step, with the whole list one tap away.
+
+- Email sellers links each seller's page only when its address is http or https (opened in a new tab, without any user
+  name or password); any other address is shown as plain text.
+- Order sheet marks the newest sheet "Newest, created after your latest approved list" by the same rule the step list
+  uses (written at or after this search's approved list was saved); older sheets are collapsed.
+- Listings counts, after an upload or on request, how many details the listing tool will use: it runs the tool's own
+  `read_approved`, `select_lines`, `read_facts`, `facts_for` and `usable_facts` in a separate process from the project
+  folder (the sheet is only read). Loading the tool takes several seconds, so it is not run on every page view.
 
 Things the UI will not do:
 

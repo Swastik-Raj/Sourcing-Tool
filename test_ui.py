@@ -462,6 +462,12 @@ def has_term(text: str) -> bool:
     return wording.contains_reference_name(text)
 
 
+def wide_strip(html: str) -> str:
+    """The step list's desktop copy, and only that one (a phone's copy of it is inside a details element)."""
+    assert html.count('<section class="strip" data-copy="wide"') == 1, "exactly one desktop copy of the step list"
+    return html.split('<section class="strip" data-copy="wide"')[1].split("</section>")[0]
+
+
 def outside_details(html: str) -> str:
     """What a page shows before anything is expanded: a closed <details> keeps only its summary."""
     def shown(m):
@@ -954,12 +960,13 @@ def cancel_keeps_the_partial_results_file_and_the_run_is_shown_as_partial(env):
         assert out.is_file()
         page = clean(env.client.get(f"/step/search?job={jid}").text, "running")
         assert "Products finished so far are kept in the saved results. The product in progress is lost." in page
-        assert 'id="p-bar" max="3" value="1"' in page and "the search's own figure" in page and "badge-running" in page
+        assert 'id="p-bar" max="3" value="1"' in page and "the search's own figure" in page and "badge-running" in page.split('<main id="main">')[1]
         assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page                         # the hostile description, escaped in the log
         prog = env.client.get(f"/jobs/{jid}/log?offset=0").json()["progress"]
         assert (prog["done"], prog["total"], prog["current"]) == (1, 3, ["FOA-020C"]) and prog["cost"] == 0.0165, prog
         home = env.client.get("/").text
-        assert "A task is running" in home and "View progress or cancel" in home and home.count("badge-running") >= 2   # banner, rail and table
+        assert "A task is running" in home and "View progress or cancel" in home
+        assert wide_strip(home).count("badge-running") == 1 and "badge-running" in home.split('id="continue"')[1].split("</div>")[0]   # the step list and Continue
         assert f"/jobs/{jid}/cancel" not in home, "a search is only cancelled from the page that shows the warning"
         assert env.client.get("/step/search", follow_redirects=False).headers["location"] == f"/step/search?job={jid}"
         child = int(re.search(r"child pid (\d+)", env.jobs.read_log(jid)[0])[1])
@@ -1032,7 +1039,7 @@ def results_table_is_honest_about_recommended_draftable_and_excluded(env):
     assert not has_term(re.search(r"<title>(.*?)</title>", page, re.S)[1])
     assert "Open the search results" in env.client.get(f"/jobs/{jid}").text
     home = env.client.get("/").text
-    assert "Output saved" in home and ">Done<" not in home
+    assert "Output saved" in wide_strip(home) and ">Done<" not in home
     # without the email agent's rules the page says the exclusion list was not applied, and never invents a count
     real, workflows._cache = (workflows.draft_counts, workflows.draft_rows), {}
     workflows.draft_counts = workflows.draft_rows = lambda s, p: None        # the project's email agent cannot be loaded

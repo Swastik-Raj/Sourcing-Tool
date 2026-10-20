@@ -1,6 +1,8 @@
 {# The only progress on the pages: one line per step in the left column, read from files. The links only open a page. #}
+{# Shown twice in the left column: the "wide" copy on a desktop, the "narrow" one inside a details element on a phone (CSS
+   shows one of them). Neither holds an id, so the two never repeat one. #}
 {% from "_macros.html" import badge %}
-<section class="strip" aria-label="Progress">
+<section class="strip" data-copy="{{ copy or 'wide' }}" aria-label="{{ 'Progress, all steps' if copy == 'narrow' else 'Progress' }}">
   <ol class="stepper">
     {% for st in steps %}
     <li>

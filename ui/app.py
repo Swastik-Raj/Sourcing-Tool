@@ -139,7 +139,8 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
         elif chosen and slug == "order-sheet":
             data["view"] = pipeline.order(s, chosen["file"])
         elif chosen and slug == "listing-content":
-            data["view"] = pipeline.content(s, chosen["file"], ctx.pop("facts", "") or request.query_params.get("facts", ""))
+            data["view"] = pipeline.content(s, chosen["file"], ctx.pop("facts", "") or request.query_params.get("facts", ""),
+                                            count=request.method == "GET" and request.query_params.get("count") == "1")
         job = jobs.get(request.query_params.get("job", "")) if request.method == "GET" else None
         if job and job.get("step") == slug:
             data["job"] = job
@@ -332,7 +333,7 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
             name = uploads.save_facts(s, facts_file.filename, facts_file.file.read(MAX_FACTS_BYTES + 1), columns)
         except JobRejected as e:
             return refused(request, "listing-content", wf, f"Nothing was uploaded. {e}")
-        return RedirectResponse(f"/step/listing-content?{urlencode({'wf': wf, 'facts': name})}", 303)
+        return RedirectResponse(f"/step/listing-content?{urlencode({'wf': wf, 'facts': name, 'count': '1'})}", 303)   # count it right away
 
     def generate_plan(wf: str, facts: str) -> tuple:
         file = results_for(wf)

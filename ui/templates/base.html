@@ -47,6 +47,12 @@
       <noscript><button type="submit" class="btn">Show</button></noscript>
     </form>
     {% include "_strip.html" %}
+    {% set here = steps|selectattr('name', 'equalto', step_name)|first if step_name else none %}
+    <details class="steps-narrow">
+      <summary>{% if here %}Step {{ here.number }} of {{ steps|length }}: {{ here.label }} {{ badge(here.status) }}{% else %}The {{ steps|length }} steps of this search{% endif %}
+        <span class="muted small">· show all steps</span></summary>
+      {% with copy = "narrow" %}{% include "_strip.html" %}{% endwith %}
+    </details>
     {% else %}
     <p class="muted small">No searches yet. Each search you run appears here, with its five steps.</p>
     <p class="small"><a href="/step/search">Start with step 1: Find suppliers</a></p>

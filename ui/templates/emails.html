@@ -63,7 +63,9 @@
     <thead><tr><th scope="col">Product</th><th scope="col">Seller</th><th scope="col">Email address</th><th scope="col">Status</th></tr></thead>
     <tbody>
     {% for d in view.drafts %}
-    <tr><th scope="row">{{ d.sku }}</th><td data-label="Seller">{{ d.seller }}</td>
+    <tr><th scope="row">{{ d.sku }}</th><td data-label="Seller">{{ d.seller }}
+      {%- if d.link %}<br><a href="{{ d.link }}" target="_blank" rel="noopener noreferrer">Open their website: {{ d.site }}<span class="sr"> (opens in a new tab)</span></a>
+      {%- elif d.url %}<br><span class="muted small">Website address, not opened from here: {{ d.url }}</span>{% endif %}</td>
       <td data-label="Email address">{% if d.email %}{{ d.email }}{% else %}No email address: use the contact form on the seller's website, then mark it below{% endif %}</td>
       <td data-label="Status">{% if d.sent %}Contacted {{ d.sent }}{% else %}Not contacted yet{% endif %}{% if d.replied %}; replied{% if d.status %} ({{ d.status|replace('_', ' ') }}){% endif %}{% endif %}</td></tr>
     {% endfor %}

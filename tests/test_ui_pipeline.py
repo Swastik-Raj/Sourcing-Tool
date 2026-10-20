@@ -511,9 +511,13 @@ def state_key(sku: str, url: str) -> str:
     return f"{sku.upper()}|{host_path.split('/', 1)[0].lower()}{'/' + host_path.split('/', 1)[1] if '/' in host_path else ''}"
 
 
+WIDE = '<section class="strip" data-copy="wide"'          # the step list's desktop copy (a phone's copy is inside a details element)
+
+
 def strip_of(env, stem, slug="emails") -> str:
     page = env.client.get(f"/step/{slug}?wf={stem}").text
-    return page.split('<section class="strip"')[1].split("</section>")[0]
+    assert page.count(WIDE) == 1, "exactly one desktop copy of the step list"
+    return page.split(WIDE)[1].split("</section>")[0]
 
 
 def continue_of(env, stem) -> str:
@@ -615,7 +619,7 @@ def results_file_choice_is_validated_server_side(env):
     assert label["sourcing_results_20260101_100000"] != label["sourcing_results_20260202_100000"], label
 
     def shows(page, stem):                          # the picker selects that search, and every progress link is for it
-        strip = page.split('<section class="strip"')[1].split("</section>")[0]
+        strip = page.split(WIDE)[1].split("</section>")[0]
         links = re.findall(r'href="/step/[a-z-]+\?wf=([^"]*)"', strip)
         return f'<option value="{stem}" selected' in page and len(links) == 5 and set(links) == {stem}
     for slug in ("emails", "approvals", "order-sheet", "listing-content"):
@@ -962,7 +966,9 @@ def pages_mask_user_info_in_addresses_but_not_email_addresses(env):
             pages = {p: fake.client.get(p).text for p in (f"/step/emails?wf={RES}", f"/step/approvals?wf={RES}", f"/?wf={RES}", "/jobs")}
             review = post(fake, "/emails/send/review", wf=RES).text
             emails = pages[f"/step/emails?wf={RES}"]
-            assert '<td data-label="Seller">Maker http://[REDACTED]@seller.example/item</td>' in emails, "the sellers table"
+            assert ('<td data-label="Seller">Maker http://[REDACTED]@seller.example/item<br><a href="http://seller.example/item/b2" '
+                    'target="_blank" rel="noopener noreferrer">Open their website: seller.example<span class="sr"> (opens in a new tab)</span></a></td>') in emails, \
+                "the sellers table: the name masked, and the link without the user name and password"
             assert 'B2 (Maker http://[REDACTED]@seller.example/item)</option>' in emails, "a drop-down's text"
             for path, html in list(pages.items()) + [("send review", review)]:
                 assert "pageuser" not in html and "FAKE-page-pass" not in html, path
@@ -1287,7 +1293,8 @@ def upload_facts(env, data=FACTS, name="My facts.csv", wf=RES):
 
 def facts_name(r) -> str:
     assert r.status_code == 303 and "facts=facts_" in r.headers["location"], (r.status_code, r.text[-500:])
-    return r.headers["location"].split("facts=")[1]
+    assert r.headers["location"].endswith("&count=1"), "after an upload the page counts the details the listing tool will use"
+    return re.search(r"facts=(facts_[^&]+)", r.headers["location"])[1]
 
 
 def phase3_pages(fake) -> list:
@@ -1717,6 +1724,27 @@ def end_to_end_offline(env):
             assert not (env.project / "Walmart Listings").exists()
             filled = (FIXTURES / "facts_filled.csv").read_bytes()
             facts = facts_name(upload_facts(env, filled, "filled.csv", wf=wf))
+            # the page's count is what the listing tool really uses: its own dry run (no model call) on the same files agrees
+            page = env.client.get(f"/step/listing-content?wf={wf}&facts={facts}").text
+            assert 'id="facts-use"' not in page and f"facts={facts}&amp;count=1" in page, "without asking, nothing is counted: a link offers it"
+            use = env.client.get(f"/step/listing-content?wf={wf}&facts={facts}&count=1").text.split('id="facts-use"')[1].split("</div>")[0]
+            assert "6 details will be used, 3 ignored." in use and "0 rows are still empty." in use and "more detail" not in use, use
+            dry = subprocess.run([sys.executable, "-X", "utf8", "content_agent.py", "generate", "--approved", "approved_orders.csv", "--results", rel,
+                                  "--facts", native("Uploads", facts), "--dry-run"], cwd=env.project, capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", timeout=120)
+            assert dry.returncode == 0 and re.findall(r"===== DRY RUN (\S+): (\d+) usable fact\(s\)", dry.stdout) == [("TST-100", "6")], dry.stdout[-800:] + dry.stderr[-800:]
+            prompt = dry.stdout.split("USER:")[1]
+            assert all(f in prompt for f in ("Cat6 RJ45 inline coupler", "shielded", "pack of 2")) and not any(f in prompt for f in ("panel mount", "RoHS", "brass")), \
+                "the 3 ignored are the listing_title and unverified facts"
+            assert (env.settings.uploads_dir / facts).read_bytes() == filled, "counting changed the facts file"
+            more = filled + b"TST-100,F10,upc,012345678905,page_read,x\nTST-100,F11,color,,,\nZZZ-9,F1,product_type,Other,page_read,x\n"
+            other = facts_name(upload_facts(env, more, "more.csv", wf=wf))       # a UPC (never shown to the AI), an empty row, another product
+            use = env.client.get(f"/step/listing-content?wf={wf}&facts={other}&count=1").text.split('id="facts-use"')[1].split("</div>")[0]
+            assert "6 details will be used, 4 ignored." in use and "1 row is still empty." in use and "1 more detail is for products" in use, use
+            bad = facts_name(upload_facts(env, filled + b"TST-100,F12,color,Blue,SAMPLE_INSPECTED ,typed oddly\n", "bad.csv", wf=wf))
+            page = env.client.get(f"/step/listing-content?wf={wf}&facts={bad}&count=1").text
+            assert "The listing tool would refuse to write listings from this:" in outside_details(page) and "status &#39;SAMPLE_INSPECTED&#39; is not one of" in outside_details(page)
+            assert [(env.settings.uploads_dir / n).read_bytes() for n in (other, bad)] == [more, filled + b"TST-100,F12,color,Blue,SAMPLE_INSPECTED ,typed oddly\n"]
             refused(post(env, "/content/generate", wf=wf, facts=facts, confirm_count="2"), "Nothing was started")
             meta, log = done(post(env, "/content/generate", wf=wf, facts=facts, confirm_count="1"))
             assert meta["args"] == ["generate", "--approved", "approved_orders.csv", "--results", rel, "--facts", native("Uploads", facts)]
@@ -1888,6 +1916,107 @@ def email_sellers_leads_with_websites_when_no_seller_has_an_address(env):
         assert "Your manager decides, not this tool" not in approvals and approvals.count("This tool approves nothing itself.") == 1   # one explanation
     finally:
         cleanup(fake)
+
+
+# ================= Additions: seller links, the newest order sheet, the details the listing tool will use =================
+
+@test
+def seller_website_links_are_http_or_https_only(env):
+    """Condition A: only an http or https address from the results file becomes a link, opened in a new tab with
+    rel="noopener noreferrer" and without any user name or password. Anything else is plain text."""
+    from ui import pipeline
+    fake = fake_env()
+    try:
+        results_file(fake, RES + ".xlsx", [
+            ("H1", "Maker H", "", "https://maker-h.example/item/h1?x=1"),
+            ("J2", "Maker J", "", "javascript://seller.example/%0Aalert(1)"),          # a script that looks like an address with a host
+            ("J3", "Maker J3", "", "JavaScript:alert(2)"),
+            ("D4", "Maker D", "", "data:text/html,<script>alert(3)</script>"),
+            ("U5", "Maker U", "", "https://pageuser:FAKE-page-pass@seller-u.example/item/u5"),
+            ("F6", "Maker F", "", "ftp://files.example/x")])
+        page = fake.client.get(f"/step/emails?wf={RES}").text
+        table = page.split("Sellers the search recommended")[1].split("</table>")[0]
+        for sku in ("H1", "J2", "J3", "D4", "U5", "F6"):
+            assert f'<th scope="row">{sku}</th>' in table, (sku, "every seller is listed")
+        links = re.findall(r'<a href="([^"]*)" target="_blank" rel="noopener noreferrer">', page)
+        assert links == ["https://maker-h.example/item/h1?x=1", "https://seller-u.example/item/u5"], links
+        other = [h for h in re.findall(r'href="([^"]*)"', page) if not h.startswith(("/", "#", "http://", "https://"))]
+        assert other == [], ("no other address is a link", other)
+        assert "Website address, not opened from here: javascript://seller.example/%0Aalert(1)" in table
+        assert "&lt;script&gt;alert(3)&lt;/script&gt;" in table and "<script>alert(3)" not in page
+        assert "pageuser" not in page and "FAKE-page-pass" not in page, "the user name and password never reach the page"
+    finally:
+        cleanup(fake)
+    cases = {"https://a.example/x": "https://a.example/x", " HTTPS://A.Example/x?q=1#f ": "https://a.example/x?q=1#f",
+             "http://user:pw@a.example:8443/p": "http://a.example:8443/p", "http://[::1]:8080/x": "http://[::1]:8080/x",
+             "javascript:alert(1)": "", "javascript://a.example/%0Aalert(1)": "", "JAVASCRIPT://a.example/": "", "data:text/html,x": "",
+             "vbscript:x": "", "file:///C:/x": "", "ftp://a.example/x": "", "https:///nohost": "", "https://a.example:99999/": "",
+             "//a.example/x": "", "a.example/x": "", "": "", None: ""}
+    for given, expected in cases.items():
+        assert pipeline.web_link(given) == expected, (given, pipeline.web_link(given), expected)
+
+
+@test
+def newest_order_sheet_is_labelled_by_the_step_lists_own_rule(env):
+    """Condition C: the newest sheet is labelled only when it was created after this search's approved list was saved,
+    which is exactly when the step list says an order sheet was created; older sheets are collapsed."""
+    fake = fake_env(agents=PHASE3_AGENTS)
+    try:
+        label = "Newest, created after your latest approved list"
+        folder = fake.project / "Order Sheets"
+        folder.mkdir()
+
+        def sheet(name, shift):
+            (folder / name).write_bytes(b"x")
+            os.utime(folder / name, (time.time() + shift, time.time() + shift))
+
+        def state():
+            page = fake.client.get(f"/step/order-sheet?wf={RES}").text
+            built = {st.name: st for st in workflows.steps_for(fake.settings, RES + ".xlsx")}["Order sheet"].done
+            assert (label in page) == built and page.count(label) <= 1, (built, page.count(label))
+            return page, built
+        export(fake)
+        sheet("order_sheet_20260101_000000.xlsx", -3600)                                     # made before the approved list
+        page, built = state()
+        assert not built and "No order sheet has been created since the approved list of this search was saved." in page
+        assert "Order sheets created earlier (1)" in page and "order_sheet_20260101_000000.xlsx" in page.split('id="older-sheets"')[1]
+        sheet("order_sheet_20260303_000000.xlsx", 60)                                        # made after it
+        page, built = state()
+        assert built and "order_sheet_20260303_000000.xlsx" in page.split('id="newest-sheet"')[1].split("</ul>")[0]
+        older = page.split('id="older-sheets"')[1].split("</details>")[0]
+        assert "Order sheets created earlier (1)" in older and "order_sheet_20260101_000000.xlsx" in older and "20260303" not in older
+        export(fake, source="sourcing_results_20250101_000000.xlsx")                         # the saved list is another search's
+        page, built = state()
+        assert not built and "Order sheets created earlier (2)" in page
+        export(fake)
+        os.utime(fake.project / "approved_orders.json", (time.time() + 600, time.time() + 600))   # saved again after both sheets
+        page, built = state()
+        assert not built and "Order sheets created earlier (2)" in page
+    finally:
+        cleanup(fake)
+
+
+@test
+def phone_step_list_is_compact_and_the_two_copies_never_share_an_id(env):
+    """On a phone the left column shows the current step, with the whole list one tap away in a details element; on a
+    desktop it shows the whole list as before. Both copies are in the page (CSS shows one) and no id appears twice."""
+    fake = fake_env()
+    try:
+        for slug, n, label in (("emails", 2, "Email sellers"), ("approvals", 3, "Get approval"), ("listing-content", 5, "Listings")):
+            page = fake.client.get(f"/step/{slug}?wf={RES}").text
+            narrow = page.split('<details class="steps-narrow">')[1].split("</details>")[0]          # closed until opened
+            assert re.match(rf'\s*<summary>Step {n} of 5: {label} <span class="badge', narrow), narrow[:200]
+            assert narrow.count('<section class="strip" data-copy="narrow"') == 1 and len(re.findall(r'href="/step/', narrow)) == 5
+            assert len(re.findall(r'href="/step/', strip_of(fake, RES, slug))) == 5
+            ids = re.findall(r'\bid="([^"]+)"', page)
+            assert len(ids) == len(set(ids)), sorted({i for i in ids if ids.count(i) > 1})
+        assert "<summary>The 5 steps of this search" in fake.client.get(f"/?wf={RES}").text
+    finally:
+        cleanup(fake)
+    css = (REAL / "ui" / "static" / "app.css").read_text(encoding="utf-8")
+    desktop, phone = css.split("@media (max-width: 820px)")[0], css.split("@media (max-width: 820px)")[1].split("@media")[0]
+    assert ".steps-narrow { display: none; }" in desktop and "data-copy" not in desktop, "a desktop shows only the whole list, as before"
+    assert '.rail .strip[data-copy="wide"] { display: none; }' in phone and ".steps-narrow { display: block;" in phone
 
 
 def wait_for(cond, what, timeout=60):

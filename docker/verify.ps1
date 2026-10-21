@@ -19,6 +19,8 @@ Checks the Docker packaging of the sourcing tool, in four stages. For Windows Po
   -Root              stage 1 or -Only: verify the Docker files in another folder; default: this project
   -Keep              with -Only or -Cleanup: leave the objects and the temp folder in place
   -NoLangfuseGet     skip the one read-only GET of the Langfuse health address (V18)
+  -ImageRepo         with -Only: the images' repository name, lcom-<something> (the mutation run uses lcom-mut-<n>); default lcom-ui
+  -FakeEnvWithoutZone  with -Only: the fake .env has no TZ line (mutation 9b)
 
 What it uses: fake keys only; a throwaway data folder and a staged build context under %TEMP% (the real .env is never
 inside a build context); names that start with lcom-verify; the label com.zync.lcom=1.
@@ -33,7 +35,9 @@ param(
     [string]$Root = "",
     [switch]$WriteConstraints,
     [switch]$Keep,
-    [switch]$NoLangfuseGet
+    [switch]$NoLangfuseGet,
+    [ValidatePattern('^lcom-[a-z0-9-]+$')][string]$ImageRepo = "lcom-ui",
+    [switch]$FakeEnvWithoutZone
 )
 Set-StrictMode -Version 2
 $ErrorActionPreference = "Stop"
@@ -226,7 +230,7 @@ function Save-Run { Write-Text $RunFile ($Run | ConvertTo-Json -Depth 6) }
 # ---------- which run, which mode ----------
 
 $Mode = if ($Cleanup) { "cleanup" } elseif ($Stage) { "stage" } elseif ($Only.Count) { "only" } else { "" }
-if (-not $Mode -or ($Stage -and ($Only.Count -or $Cleanup))) {
+if (-not $Mode -or ($Stage -and ($Only.Count -or $Cleanup)) -or (($ImageRepo -ne "lcom-ui" -or $FakeEnvWithoutZone) -and $Mode -ne "only")) {
     Say "Run one stage at a time:  -Stage 1 (add -WriteConstraints the first time), then -Stage 2, -Stage 3, -Stage 4.  -Cleanup removes a run at any point."
     exit 1
 }
@@ -255,7 +259,7 @@ else {
 $Root = $Run.Root; $Id = $Run.Id
 $Work = Join-Path $env:TEMP "lcom-verify-$Id"
 $Ctx = "$Work\ctx"; $Proj = "$Work\compose"; $Data = "$Work\data"
-$Image = "lcom-ui:verify-$Id"; $TestImage = "lcom-ui:verify-test-$Id"; $ProbeImage = "lcom-ui:verify-ctx-$Id"
+$Image = "${ImageRepo}:verify-$Id"; $TestImage = "${ImageRepo}:verify-test-$Id"; $ProbeImage = "${ImageRepo}:verify-ctx-$Id"
 $Needle = "sk-ant-FAKE-verify-PLANTED-$Id"                                  # planted in the build context; must never be in an image
 $StateNeedle = "planted-state-file-$Id"
 $ProxyUser = "fakeproxyuser$Id"; $ProxyPass = "FAKE-proxy-pass-$Id"          # in the fake proxy settings; must appear nowhere
@@ -309,7 +313,7 @@ function Prepare-Context {
                      "docker\planted.txt")) {
         Write-Text "$Ctx\$f" $StateNeedle
     }
-    New-FakeEnv $Proj $Run.Port $Name $Data
+    New-FakeEnv $Proj $Run.Port $Name $Data -NoZone:$FakeEnvWithoutZone
 }
 
 function Build-Images {
@@ -564,7 +568,8 @@ try {
         if ((Prop $svc "user") -ne "10001:10001") { $p += "the user is '$(Prop $svc 'user')'" }
         if ((Prop $svc "init") -ne $true) { $p += "init is off" }
         if ((Prop $svc "restart") -ne "no") { $p += "the restart policy is '$(Prop $svc 'restart')', not 'no'" }
-        if (((Prop $svc "extra_hosts") | ConvertTo-Json -Compress) -notmatch "host\.docker\.internal") { $p += "host.docker.internal is not mapped" }
+        $extraHosts = "$((Prop $svc 'extra_hosts') | ConvertTo-Json -Compress)"    # as text: a list that is missing altogether must fail too
+        if ($extraHosts -notmatch "host\.docker\.internal") { $p += "host.docker.internal is not mapped" }
         if (-not (@(Prop $svc "tmpfs") -join " ").StartsWith("/tmp")) { $p += "/tmp is not a memory folder" }
         $mounts = @(Prop $svc "volumes")
         if ($mounts.Count -ne 1) { $p += "expected exactly one mount (the data folder), found $($mounts.Count)" }
@@ -590,7 +595,16 @@ def writable(path):
         return True
     except OSError:
         return False
+def root_read_only():
+    # the mount options of / as the kernel has them (the last entry for / is the one in use); file rights cannot hide them
+    flags = None
+    for line in open('/proc/self/mountinfo'):
+        parts = line.split()
+        if len(parts) > 5 and parts[4] == '/':
+            flags = parts[5].split(',')
+    return flags is not None and 'ro' in flags
 print(json.dumps({'uid': os.getuid(), 'gid': os.getgid(), 'app': writable('/app/_verify'), 'root': writable('/_verify'), 'tmp': writable('/tmp/_verify'),
+                  'rootro': root_read_only(),
                   'data': writable('/data/_verify_w'), 'nonewprivs': status.get('NoNewPrivs', '').strip(), 'capbnd': status.get('CapBnd', '').strip(),
                   'pid1': open('/proc/1/comm').read().strip(), 'ui_host': os.environ.get('UI_HOST'), 'project': os.environ.get('PROJECT_DIR'),
                   'stub': os.environ.get('UI_ENABLE_STUB')}))
@@ -601,12 +615,13 @@ print(json.dumps({'uid': os.getuid(), 'gid': os.getgid(), 'app': writable('/app/
         $p = @()
         if ($w.uid -ne 10001 -or $w.gid -ne 10001) { $p += "runs as uid $($w.uid) gid $($w.gid), not 10001" }
         if ($w.app -or $w.root) { $p += "the program folder or the root filesystem is writable" }
+        if ($w.rootro -ne $true) { $p += "the root filesystem is not mounted read-only" }
         if (-not $w.tmp -or -not $w.data) { $p += "/tmp or the data folder is not writable" }
         if ($w.nonewprivs -ne "1") { $p += "NoNewPrivs is '$($w.nonewprivs)'" }
         if ($w.capbnd -notmatch "^0+$") { $p += "capabilities are available: $($w.capbnd)" }
         if ($w.pid1 -notmatch "init|tini") { $p += "process 1 is '$($w.pid1)', not an init" }
         if ($w.ui_host -ne "0.0.0.0" -or $w.project -ne "/data" -or $w.stub -ne "0") { $p += "the settings file changed a pinned setting" }
-        Judge $p "healthy; uid and gid 10001; /app and / read-only; /tmp and /data writable; NoNewPrivs 1; no capabilities; an init is process 1"
+        Judge $p "healthy; uid and gid 10001; / mounted read-only, and /app and / not writable; /tmp and /data writable; NoNewPrivs 1; no capabilities; an init is process 1"
     }
 
     Check "V11" "host-port" {
@@ -678,7 +693,7 @@ print(json.dumps({n: (hashlib.sha256(os.environ[n].encode('utf-8')).hexdigest() 
         Start-Ui
         $r = Helper flow $Run.Port $Data $State.Stem
         if (Prop $r "error") { Fail $r.error }
-        elseif ($r.ok) { Pass ("{0} steps through the UI, each file found in {1}: upload, approval request, a refused and an accepted record, export, download, order sheet" -f @($r.steps).Count, $Data) }
+        elseif ($r.ok) { Pass ("{0} steps through the UI, each file found in {1}: upload, approval request, a refused and an accepted record, export, download, order sheet, a product details upload kept byte for byte, and the Listings count made by the listing tool from the data folder (2 used, 2 ignored, 1 empty)" -f @($r.steps).Count, $Data) }
         else { Fail ((@($r.steps) | Where-Object { -not $_.ok } | ForEach-Object { $_.step + " (" + $_.detail + ")" }) -join "; ") }
     }
 
@@ -827,6 +842,24 @@ print(json.dumps(out))
     Check "V18" "tracing-and-proxy" {
         Start-Ui
         $t = In-Container ($TraceCode.Replace("DO_GET", $(if ($NoLangfuseGet) { "False" } else { "True" })))
+        # Information only, never part of the verdict: if the GET from inside failed, the same read-only GET at once from
+        # Windows (no proxy), with how long it took and the memory available on this computer at that moment.
+        $fromWindows = ""
+        if (-not $NoLangfuseGet -and $t.langfuse_get -ne "direct 200") {
+            $clock = [System.Diagnostics.Stopwatch]::StartNew()
+            try {
+                $req = [System.Net.WebRequest]::Create("http://127.0.0.1:3000/api/public/health"); $req.Proxy = $null; $req.Timeout = 30000
+                $resp = $req.GetResponse(); $got = "HTTP $([int]$resp.StatusCode)"; $resp.Close()
+            } catch {
+                $e = if ($_.Exception.InnerException) { $_.Exception.InnerException } else { $_.Exception }
+                $got = if ($e -is [System.Net.WebException] -and $e.Response) { "HTTP $([int]$e.Response.StatusCode)" }
+                       elseif ($e -is [System.Net.WebException]) { "failed ($($e.Status))" } else { "failed ($($e.GetType().Name))" }
+            }
+            $clock.Stop()
+            $free = try { "$([int](Get-Counter '\Memory\Available MBytes').CounterSamples[0].CookedValue) MB" } catch { "unknown" }
+            $fromWindows = " [information only: at once from Windows the same GET of http://127.0.0.1:3000/api/public/health gave " + $got +
+                           " in " + $clock.Elapsed.TotalSeconds.ToString("0.00") + " s; memory available on this computer then: " + $free + "]"
+        }
         $merged = "internal.example,localhost,127.0.0.1,host.docker.internal"
         $p = @()
         if ($t.obs -ne "0") { $p += "OBS_ENABLED is '$($t.obs)' although the settings file says 1 and LCOM_TRACING is not set" }
@@ -840,7 +873,7 @@ print(json.dumps(out))
         foreach ($lib in @("urllib", "httpx", "requests")) { if ((Prop $t.local $lib) -ne "direct 200") { $p += "${lib} to 127.0.0.1: $(Prop $t.local $lib)" } }
         # step 3: Langfuse on this computer, bypassing the proxy (the one read-only GET)
         if (-not $t.langfuse_bypass) { $p += "host.docker.internal would go through the proxy" }
-        if (-not $NoLangfuseGet -and $t.langfuse_get -ne "direct 200") { $p += "the GET of Langfuse's health address: $($t.langfuse_get)" }
+        if (-not $NoLangfuseGet -and $t.langfuse_get -ne "direct 200") { $p += "the GET of Langfuse's health address: $($t.langfuse_get)$fromWindows" }
         # step 4: the control: everything else still goes to the proxy
         if ($t.control_bypass -or $t.control_get -ne "refused by the dead proxy") { $p += "a request to example.invalid did not go to the proxy: $($t.control_get)" }
         # the fake proxy credentials appear nowhere: container log (the entrypoint's lines included), stored job logs, pages
@@ -902,12 +935,18 @@ print(json.dumps(out))
         New-Item -ItemType Directory -Force "$src\.git" | Out-Null
         Write-Text "$src\email_agent.py" "MY OWN WORKING COPY - DO NOT REPLACE"
         $hash = (Get-FileHash -LiteralPath "$src\email_agent.py").Hash
-        & docker.exe run --name lcom-verify-src --label $Label --network none --read-only --tmpfs /tmp -e "TZ=$Zone" -v "${src}:/data" $Image | Out-Null
-        $code = $LASTEXITCODE
+        # Started in the background and given 60 s: a container that does not refuse would otherwise run, and this check wait, for ever.
+        & docker.exe run -d --name lcom-verify-src --label $Label --network none --read-only --tmpfs /tmp -e "TZ=$Zone" -v "${src}:/data" $Image | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "docker run could not create lcom-verify-src (exit code $LASTEXITCODE)" }
+        $end = (Get-Date).AddSeconds(60)
+        while ((Get-Date) -lt $end -and @(& docker.exe inspect --format "{{.State.Status}}" lcom-verify-src)[0] -ne "exited") { Start-Sleep -Seconds 1 }
+        $srcState = @(& docker.exe inspect --format "{{.State.Status}} {{.State.ExitCode}}" lcom-verify-src)[0]
+        $stillRunning = $srcState -notlike "exited *"
+        $code = if ($stillRunning) { "none (still running)" } else { [int]($srcState -split " ")[1] }
         $log = Logs lcom-verify-src
-        Dk rm lcom-verify-src | Out-Null
+        Dk rm -f lcom-verify-src | Out-Null
         $p = @()
-        if ($code -eq 0) { $p += "the container started" }
+        if ($stillRunning) { $p += "the container started and was still running after 60 s" } elseif ($code -eq 0) { $p += "the container started" }
         if ($log -notmatch "looks like the source folder") { $p += "the message does not say why" }
         if ((Get-FileHash -LiteralPath "$src\email_agent.py").Hash -ne $hash -or @(Get-ChildItem $src -Recurse -File).Count -ne 1) { $p += "the folder was changed" }
         Judge $p "a data folder holding .git: exit code $code, the message names the reason, the planted email_agent.py is byte-identical and nothing was added"

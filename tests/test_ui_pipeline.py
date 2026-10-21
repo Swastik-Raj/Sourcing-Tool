@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import zipfile
@@ -152,8 +153,19 @@ def make_env(stub=True, popen=None, agents=("email_agent.py",)):
 def cleanup(env):
     for j in env.jobs.list():
         env.jobs.cancel(j["id"])
-    time.sleep(0.2)
+    end_jobs(env)
     remove_temp(env.root)
+
+
+def end_jobs(env, timeout=30):
+    """Waits until every job this UI is running has ended and written its last record (the folder may go only after that).
+    A job that has not ended in time fails loudly, with its command and status; there is no unbounded wait."""
+    end = time.monotonic() + timeout
+    while env.jobs._procs and time.monotonic() < end:
+        time.sleep(0.05)
+    for jid in list(env.jobs._procs):
+        m = env.jobs.get(jid) or {}
+        raise AssertionError(f"a job did not end within {timeout} s of the test's end: {m.get('command')} ({m.get('status')}), job {jid}")
 
 
 def remove_temp(root: Path) -> None:
@@ -1240,6 +1252,105 @@ def one_job_lock_covers_every_state_changing_command(env):
     env.jobs.cancel(hold["id"])
 
 
+@test
+def cancel_answers_from_the_record_it_read_before_cancelling(env):
+    """On Windows the runner may be replacing a job's record at the very moment a page reads it. The cancel route reads the
+    record once, before cancelling, and answers from that: here the record cannot be read at all once the cancel is in."""
+    gone, real_get, real_cancel = set(), env.jobs.get, env.jobs.cancel
+    env.jobs.get = lambda jid: None if jid in gone else real_get(jid)
+    env.jobs.cancel = lambda jid: gone.add(jid) or real_cancel(jid)
+    try:
+        with env_vars(**FAKE, UI_STUB_SEARCH="slow"):
+            r = post(env, "/search/start", choice="file", input_file=uploaded_value(upload(env)), rows="all", confirm_count="3")
+            jobs = [r.headers["location"].split("job=")[1],
+                    env.jobs.start("stub.read", {"mode": "slow"}, extra={"step": "emails", "wf": RES})["id"],
+                    env.jobs.start("stub.read", {"mode": "slow"})["id"]]
+            wanted = [f"/step/search?job={jobs[0]}", f"/step/emails?wf={RES}&job={jobs[1]}", f"/jobs/{jobs[2]}"]
+            for jid, where in zip(jobs, wanted):
+                r = post(env, f"/jobs/{jid}/cancel")
+                assert r.status_code == 303 and r.headers["location"] == where, (jid, r.status_code, r.headers.get("location"), r.text[-300:])
+                assert jid in gone
+    finally:
+        del env.jobs.get, env.jobs.cancel
+    for jid in jobs:
+        assert env.jobs.wait(jid, timeout=15)["status"] == "cancelled"
+    assert post(env, "/jobs/20260101-000000-abcdef/cancel").status_code == 404
+
+
+@test
+def a_job_record_is_read_through_the_moment_it_is_replaced(env):
+    """Windows refuses to open a file while os.replace swaps it; reading the record waits that moment out, for a bounded time."""
+    m = env.jobs.wait(env.jobs.start("stub.read", {"mode": "ok"})["id"])
+    path = env.jobs._meta_path(m["id"])
+
+    class Busy:
+        def __init__(self, times):
+            self.left = times
+
+        def read_text(self, **kw):
+            if self.left:
+                self.left -= 1
+                raise PermissionError(13, "The process cannot access the file because it is being used by another process")
+            return path.read_text(**kw)
+    busy = Busy(2)
+    env.jobs._meta_path = lambda jid: busy
+    try:
+        assert env.jobs.get(m["id"]) == m and busy.left == 0, "two refused reads, then the record"
+        busy, t0 = Busy(10 ** 6), time.monotonic()
+        assert env.jobs.get(m["id"]) is None and time.monotonic() - t0 < 5, "a record that stays locked gives up, it never hangs"
+    finally:
+        del env.jobs._meta_path
+    assert env.jobs.get("20260101-000000-abcdef") is None                       # no such record
+
+
+@test
+def a_cancel_before_the_process_exists_means_it_is_never_started(env):
+    calls, held = [], []
+
+    def popen(argv, **kw):
+        calls.append(argv)
+        return subprocess.Popen(argv, **kw)
+
+    class Held(threading.Thread):           # the runner waits until the test lets it go: the cancel comes first
+        def start(self):
+            held.append(self)
+    env.jobs._popen, real = popen, threading.Thread
+    threading.Thread = Held
+    try:
+        m = env.jobs.start("stub.state", {"mode": "slow"})
+    finally:
+        threading.Thread = real
+    assert len(held) == 1 and env.jobs.get(m["id"])["status"] == "running" and env.jobs._procs == {m["id"]: None}
+    assert env.jobs.cancel(m["id"]), "a cancel that comes before the process exists must be kept, not dropped"
+    real.start(held[0])
+    held[0].join(15)
+    done = env.jobs.get(m["id"])
+    assert calls == [], f"a job cancelled before it started must never be started: {calls}"
+    assert done["status"] == "cancelled" and done["exit_meaning"] == "Stopped by you." and done["pid"] is None, done
+    assert done["note"] == "It was stopped before it started, so nothing was run." and done["finished_at"], done
+    assert env.jobs._procs == {} and env.jobs.running_state_job() is None and not env.jobs.cancel(m["id"])
+    assert env.jobs.wait(env.jobs.start("stub.state", {"mode": "ok"})["id"])["status"] == "succeeded"        # the slot is free again
+    assert len(calls) == 1
+
+
+@test
+def a_cancel_while_the_process_is_being_started_stops_it_at_once(env):
+    calls, starting = [], threading.Event()
+
+    def popen(argv, **kw):
+        calls.append(argv)
+        starting.set()
+        time.sleep(0.5)                     # the runner has checked for a cancel; the process does not exist yet
+        return subprocess.Popen(argv, **kw)
+    env.jobs._popen = popen
+    m = env.jobs.start("stub.state", {"mode": "slow"})
+    assert starting.wait(15) and env.jobs._procs.get(m["id"], "gone") is None, "the cancel must come while the process is being started"
+    assert env.jobs.cancel(m["id"])
+    done = env.jobs.wait(m["id"], timeout=15)                                       # 'slow' runs for a minute unless it is stopped
+    assert len(calls) == 1 and done["status"] == "cancelled" and done["exit_meaning"] == "Stopped by you." and done["pid"], done
+    assert env.jobs.running_state_job() is None
+
+
 PHASE3_NOT_JOBS = set()
 
 
@@ -1729,6 +1840,8 @@ def end_to_end_offline(env):
             assert 'id="facts-use"' not in page and f"facts={facts}&amp;count=1" in page, "without asking, nothing is counted: a link offers it"
             use = env.client.get(f"/step/listing-content?wf={wf}&facts={facts}&count=1").text.split('id="facts-use"')[1].split("</div>")[0]
             assert "6 details will be used, 3 ignored." in use and "0 rows are still empty." in use and "more detail" not in use, use
+            counted = env.client.get(f"/step/listing-content?wf={wf}&facts={facts}").text      # the count is kept; nothing refused: Next stays open
+            assert 'id="facts-use"' in counted and re.search(r'class="btn-primary" >Next: check and confirm</button>(?!<span class="why">)', counted)
             dry = subprocess.run([sys.executable, "-X", "utf8", "content_agent.py", "generate", "--approved", "approved_orders.csv", "--results", rel,
                                   "--facts", native("Uploads", facts), "--dry-run"], cwd=env.project, capture_output=True, text=True,
                                  encoding="utf-8", errors="replace", timeout=120)
@@ -1997,6 +2110,30 @@ def newest_order_sheet_is_labelled_by_the_step_lists_own_rule(env):
 
 
 @test
+def listings_next_is_greyed_out_when_the_listing_tool_would_refuse(env):
+    """When the count shows the listing tool would refuse the sheet, 'Next: check and confirm' is greyed out with that
+    refusal as its reason. It is only what the page shows: the server's own checks and the agent's refusal are unchanged."""
+    fake = fake_env(agents=PHASE3_AGENTS + ("observability.py", "statefile.py"))
+    try:
+        with env_vars(**FAKE):
+            export(fake)                                    # a stand-in approved list, not a decision-agent export: the tool refuses it
+            name = facts_name(upload_facts(fake))
+            before = fake.client.get(f"/step/listing-content?wf={RES}&facts={name}").text      # not counted yet: nothing to grey out for
+            assert 'id="facts-use"' not in before and re.search(r'class="btn-primary" >Next: check and confirm</button>(?!<span class="why">)', before)
+            page = fake.client.get(f"/step/listing-content?wf={RES}&facts={name}&count=1").text
+            shown = page.split('id="facts-use"')[1].split("</div>")[0]
+            assert "The listing tool would refuse to write listings from this:" in shown and "NOT AN ORDER" in shown, shown
+            assert re.search(r'<button type="submit" class="btn-primary" disabled>Next: check and confirm</button><span class="why">'
+                             r"The listing tool would refuse this sheet: [^<]*NOT AN ORDER", page), page.split("4. Write the listings")[1][:700]
+            review = post(fake, "/content/review", wf=RES, facts=name)                         # the server's routes behave as before
+            assert review.status_code == 200 and "Type the number of products to confirm" in review.text
+            started_job(fake, post(fake, "/content/generate", wf=RES, facts=name, confirm_count="2"))   # and the agent, which refuses itself
+            assert last_argv(fake)[:2] == ["content_agent.py", "generate"]
+    finally:
+        cleanup(fake)
+
+
+@test
 def phone_step_list_is_compact_and_the_two_copies_never_share_an_id(env):
     """On a phone the left column shows the current step, with the whole list one tap away in a details element; on a
     desktop it shows the whole list as before. Both copies are in the page (CSS shows one) and no id appears twice."""
@@ -2034,7 +2171,10 @@ def main():
     for f in chosen:
         env = make_env()
         try:
-            f(env)
+            try:
+                f(env)
+            finally:
+                cleanup(env)                # a job that does not end fails this test, by name
             assert VIOLATIONS == [], VIOLATIONS
             print(f"ok   {f.__name__}")
         except Skip as e:
@@ -2044,8 +2184,6 @@ def main():
             failed.append(f.__name__)
             print(f"FAIL {f.__name__}\n{traceback.format_exc()}")
             VIOLATIONS.clear()
-        finally:
-            cleanup(env)
     print(f"\n{len(chosen) - len(failed) - len(skipped)}/{len(chosen)} passed, {len(skipped)} skipped" + (f": {', '.join(skipped)}" if skipped else "")
           + (f" (of {len(TESTS)} tests; others not run)" if wanted else ""))
     if failed:

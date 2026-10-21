@@ -26,3 +26,7 @@ ui_data/
 Walmart Listings/
 product_facts.csv
 sourcing_report_*.md
+
+data/
+data-restored/
+lcom-data-*.zip

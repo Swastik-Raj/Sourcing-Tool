@@ -23,6 +23,7 @@ ui/search.py
 ui/security.py
 ui/static/app.css
 ui/static/app.js
+ui/templates/_continue.html
 ui/templates/_export.html
 ui/templates/_joblog.html
 ui/templates/_macros.html

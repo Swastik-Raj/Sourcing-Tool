@@ -106,7 +106,8 @@
 
 <h2>4. Write the listings</h2>
 {% if view.missing %}<div class="notice warn"><strong>Writing listings is not set up yet:</strong> {{ view.missing|plain_names }} {{ 'is' if view.missing|length == 1 else 'are' }} not set. Ask whoever set up this tool.</div>{% endif %}
-{% set why_write = why_list or ('Writing listings is not set up yet.' if view.missing else ('The approved list holds no product.' if not view.count else '')) %}
+{% set why_write = why_list or ('Writing listings is not set up yet.' if view.missing else ('The approved list holds no product.' if not view.count else
+                    ('The listing tool would refuse this sheet: ' ~ view.use.error if view.use and view.use.error else ''))) %}
 <form method="post" action="/content/review">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
   <input type="hidden" name="wf" value="{{ wf }}">

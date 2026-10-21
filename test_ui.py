@@ -59,8 +59,19 @@ def make_env(stub=True):
 def cleanup(env):
     for j in env.jobs.list():
         env.jobs.cancel(j["id"])
-    time.sleep(0.3)
+    end_jobs(env)
     shutil.rmtree(env.root, ignore_errors=True)
+
+
+def end_jobs(env, timeout=30):
+    """Waits until every job this UI is running has ended and written its last record (the folder may go only after that).
+    A job that has not ended in time fails loudly, with its command and status; there is no unbounded wait."""
+    end = time.monotonic() + timeout
+    while env.jobs._procs and time.monotonic() < end:
+        time.sleep(0.05)
+    for jid in list(env.jobs._procs):
+        m = env.jobs.get(jid) or {}
+        raise AssertionError(f"a job did not end within {timeout} s of the test's end: {m.get('command')} ({m.get('status')}), job {jid}")
 
 
 def token(env):
@@ -1609,7 +1620,10 @@ def main():
     for f in TESTS:
         env = make_env()
         try:
-            f(env)
+            try:
+                f(env)
+            finally:
+                cleanup(env)                # a job that does not end fails this test, by name
             print(f"ok   {f.__name__}")
         except Skip as e:
             skipped.append(f.__name__)
@@ -1617,8 +1631,6 @@ def main():
         except Exception:  # noqa: BLE001
             failed.append(f.__name__)
             print(f"FAIL {f.__name__}\n{traceback.format_exc()}")
-        finally:
-            cleanup(env)
     print(f"\n{len(TESTS) - len(failed) - len(skipped)}/{len(TESTS)} passed, {len(skipped)} skipped" + (f": {', '.join(skipped)}" if skipped else ""))
     if failed:
         sys.exit(1)

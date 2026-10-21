@@ -1,8 +1,5 @@
 # Running the sourcing tool in Docker
 
-> **Status:** `docker\verify.ps1` stages 1 and 2 pass, and stage 3 up to its proxy check (V14–V17). What it settled is
-> written below; the rest has not been run against an image yet. Remove this note once all four stages have passed.
-
 The container holds the web UI, the agents and the Python they need. Your keys and mail settings stay in a `.env` file on
 your computer, and all your work stays in one folder on your computer (the **data folder**). Removing or rebuilding the
 container never touches either.
@@ -25,8 +22,9 @@ docker compose ps                        # wait until STATUS says "healthy"
 Start-Process "http://127.0.0.1:8010/"
 ```
 
-Open the **Health** page first: it shows which settings are set (never their values), the time zone the pages use, and
-whether any of your reference files differ from the ones that came with this version.
+Open the **Setup** page first (in the top bar): it shows each thing the tool can do as "Set up" or "Not set up" (never a
+setting's value), the time zone the pages use, and whether any of your reference files differ from the ones that came
+with this version. Its Technical details list each setting as Set or Not set.
 
 The UI answers only at `http://127.0.0.1:<port>/` and `http://localhost:<port>/`, and only from this computer. Any other
 address (another name, another port, the computer's network name) gets "Invalid Host header." on purpose.
@@ -46,7 +44,7 @@ The data folder is `data` beside `docker-compose.yml`, unless `LCOM_DATA` in `.e
 The agents keep their state beside their own script, which is why the program files are copied into the data folder.
 Nothing else in the folder is opened, moved or deleted at start-up.
 
-If you edited a reference file, your copy is kept and used, and the Health page lists it as different from this
+If you edited a reference file, your copy is kept and used, and the Setup page lists it as different from this
 version's. (The pages show `lcom_prices.csv` as `reference_prices.csv`.) To take this version's copy instead: stop the
 tool, move your copy out of the data folder, start again.
 
@@ -61,7 +59,7 @@ docker compose logs --tail 100 ui     # the container's own messages
 docker compose down           # remove the container (and its network); the data folder stays
 ```
 
-Each job's log is a file in `data\ui_data\jobs\`, and the **Jobs** page shows it.
+Each job's log is a file in `data\ui_data\jobs\`, and the **Activity** page shows it.
 
 After you change `.env`, run `docker compose up -d`. Compose sees the change and recreates the container with the new
 values; your data folder is not touched. (Tested: an added setting and a changed one both reached the container and the
@@ -95,7 +93,7 @@ docker compose up -d
 
 At the next start the program files in the data folder are replaced with the new version's. State, outputs, job logs
 and your reference files are not touched. If a reference file changed in the new version and you have your own copy, the
-Health page says so.
+Setup page says so.
 
 ## Backing up and restoring
 
@@ -174,7 +172,7 @@ left in the data folder:
 The step then fails with a message that the state file is busy because another command is using it. The tool never
 deletes these files by itself. To clear them:
 
-1. Wait a minute and try once more: a job may really be running. The Jobs page shows it.
+1. Wait a minute and try once more: a job may really be running. The Activity page shows it.
 2. `docker compose stop`, and make sure no other copy of the tool uses this data folder.
 3. Delete only the files named above, for example
    `Remove-Item -LiteralPath .\data\email_state.json.lock`
@@ -214,7 +212,8 @@ What compose reads exactly as the tool's own reader (python-dotenv) does, tested
 | An `export` in front | `export NAME=value` | yes, both ignore the `export` |
 | An unquoted `$` | `NAME=pa$word` | **no**: compose and the tool read different values |
 - Required for the tool to start: `TZ`. Required for the work named in the file: the API keys, the mail settings,
-  `SHIPPING_ADDRESS` and `BRAND_NAME`. The Health page shows which are missing.
+  `SHIPPING_ADDRESS` and `BRAND_NAME`. The Setup page shows what is not set up, and its Technical details name the
+  missing settings.
 - `LCOM_PORT` changes the port (default 8010). The same number is used inside and outside the container.
 - `LCOM_DATA` moves the data folder.
 
@@ -224,7 +223,7 @@ If your network needs a proxy, set `HTTP_PROXY` and `HTTPS_PROXY` in `.env`, and
 must be reached directly.
 
 - **Proxy settings are secrets**: a proxy address can hold a user name and password. The container's start-up lines
-  name the proxy settings that are set and count the entries, never their values; the Health page never shows them; job
+  name the proxy settings that are set and count the entries, never their values; the Setup page never shows them; job
   logs replace the user name and password in any address (`http://[REDACTED]@proxy:3128`) and the proxy settings
   themselves. Every page does the same for any address it shows, also when the address comes from a results file (a
   seller name, a listing address) and also inside form fields and the pages' data requests. Plain email addresses are

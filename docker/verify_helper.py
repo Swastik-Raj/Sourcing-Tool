@@ -264,6 +264,19 @@ def flow(port: int, data: str, stem: str) -> dict:
     status, _, served = ui.request("GET", "/files/project/approved_orders.csv")
     step("the export downloads byte for byte", status == 200 and (root / "approved_orders.csv").is_file() and served == (root / "approved_orders.csv").read_bytes(), f"HTTP {status}")
     run("build the order sheet", "/order/build", ["Order Sheets/order_sheet_*.xlsx"], wf=stem)
+    # Listings: the count is made by the listing tool itself, in a separate process the UI starts from the data folder
+    facts = (b"sku,fact_id,field,value,status,source\nVIC00001,F1,product_type,Verify coupler,page_read,verify\n"
+             b"VIC00001,F2,color,Black,sample_inspected,verify\nVIC00001,F3,material,Brass,unverified,verify\n"
+             b"VIC00001,F4,upc,012345678905,page_read,verify\nVIC00001,F5,mounting,,,\n")
+    status, headers, body = ui.upload("/content/facts", "facts_file", "verify facts.csv", facts)
+    named = re.search(r"facts=(facts_[0-9a-f_]+\.csv)", headers.get("location", ""))
+    saved = root / "Uploads" / named[1] if named else None
+    step("upload a product details sheet", status == 303 and "count=1" in headers.get("location", "") and saved and saved.is_file()
+         and saved.read_bytes() == facts, f"HTTP {status}; location {headers.get('location', '')}")
+    status, page = ui.get(f"/step/listing-content?wf={stem}&facts={named[1] if named else ''}&count=1")
+    use = page.split('id="facts-use"')[1].split("</div>")[0] if 'id="facts-use"' in page else "(no count on the page)"
+    step("the Listings count, made by the listing tool from the data folder", status == 200 and "2 details will be used, 2 ignored." in use
+         and "1 row is still empty." in use and saved and saved.read_bytes() == facts, re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", use))[:400])
     left = sorted(p.name for p in root.iterdir() if p.name.endswith((".tmp", ".lock", ".takeover")))
     step("no temp or lock file is left beside the state files", not left, left)
     return {"ok": all(s["ok"] for s in steps), "steps": steps}
@@ -315,7 +328,8 @@ def pagescan(port: int, stem: str, needles: list) -> dict:
 def pages(port: int, stem: str) -> dict:
     ui, problems = UI(port), []
     for path, wanted in ((f"/?wf={stem}", [stem]), (f"/step/approvals?wf={stem}", ["A-0001", "VIC00001", "Valid"]),
-                         (f"/step/order-sheet?wf={stem}", ["Built: order_sheet_"]), ("/health", ["Times on these pages are shown in"])):
+                         (f"/step/order-sheet?wf={stem}", ['<a href="/files/Order Sheets/order_sheet_', "Newest, created after your latest approved list"]),
+                         ("/health", ["Times on these pages are shown in"])):
         status, html = ui.get(path)
         problems += [f"{path}: HTTP {status}"] if status != 200 else [f"{path}: '{w}' not on the page" for w in wanted if w not in html]
     status, html = ui.get("/health")

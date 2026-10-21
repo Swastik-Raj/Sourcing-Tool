@@ -556,13 +556,14 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
     @app.post("/jobs/{jid}/cancel")
     def job_cancel(request: Request, jid: str, csrf_token: str = Form("")):
         csrf(request, csrf_token)
-        if jobs.get(jid) is None:
+        meta = jobs.get(jid)                    # read once, before cancelling: the runner rewrites this record as the job stops
+        if meta is None:
             raise HTTPException(404, "No such task.")
         jobs.cancel(jid)
-        meta = jobs.get(jid)
         if meta.get("step") in STEP_SLUGS:
             return RedirectResponse(f"/step/{meta['step']}?{urlencode({'wf': meta.get('wf', ''), 'job': jid})}", 303)
-        return RedirectResponse(f"/step/search?job={jid}" if search_job(jid) else f"/jobs/{jid}", 303)
+        searching = meta.get("command") == "search" and isinstance(meta.get("search"), dict)       # search_job()'s own test
+        return RedirectResponse(f"/step/search?job={jid}" if searching else f"/jobs/{jid}", 303)
 
     # ---- files ----
     @app.get("/files/project/{name}")

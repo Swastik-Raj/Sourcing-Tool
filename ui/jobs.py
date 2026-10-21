@@ -89,10 +89,14 @@ class JobManager:
     def get(self, jid: str) -> Optional[dict]:
         if not JOB_ID_RE.fullmatch(jid or ""):
             return None
-        try:
-            return json.loads(self._meta_path(jid).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
+        for _ in range(40):
+            try:
+                return json.loads(self._meta_path(jid).read_text(encoding="utf-8"))
+            except PermissionError:          # Windows: the record is being replaced this moment (write_json_atomic waits out the same)
+                time.sleep(0.025)
+            except (OSError, ValueError):
+                return None
+        return None
 
     def _save(self, meta: dict) -> None:
         write_json_atomic(self._meta_path(meta["id"]), meta)
@@ -158,8 +162,12 @@ class JobManager:
         try:
             self._save(meta)
             self.log_path(jid).write_text("", encoding="utf-8")
+            with self._lock:
+                self._procs[jid] = None                 # starting: a cancel from now on is kept until the runner sees it
             threading.Thread(target=self._run, args=(cmd, argv, meta), daemon=True).start()
         except BaseException:
+            with self._lock:
+                self._procs.pop(jid, None)
             self._release(jid)
             raise
         return meta
@@ -175,13 +183,21 @@ class JobManager:
             with self._lock:
                 if cmd.state_changing and self._state_job != jid:   # checked again at the moment of starting
                     raise JobBusy("lost the state-changing slot")
+                never_started = jid in self._cancelled              # cancelled before it started: it is never started
+            if never_started:
+                meta.update(status=CANCELLED, exit_meaning="Stopped by you.", note="It was stopped before it started, so nothing was run.")
+                return                                               # (the finally below still records the end)
             env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
             flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0
             own_group = {} if os.name == "nt" else {"start_new_session": True}      # not Windows: its own process group, so cancel can stop its children too
             proc = (self._popen or subprocess.Popen)(argv, cwd=self.settings.project, env=env, shell=False, stdin=subprocess.DEVNULL,
                                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=flags,
                                                      encoding="utf-8", errors="replace", **own_group)
-            self._procs[jid] = proc
+            with self._lock:                                         # cancel looks under the same lock, so a cancel is never lost
+                self._procs[jid] = proc
+                stop_now = jid in self._cancelled                    # cancelled while it was being started: the second safeguard
+            if stop_now and proc.poll() is None:                     # never a process that has already ended (its id may be reused)
+                self._kill(proc)
             meta["pid"] = proc.pid
             self._save(meta)
             with open(self.log_path(jid), "a", encoding="utf-8") as log:
@@ -199,13 +215,16 @@ class JobManager:
             with open(self.log_path(jid), "a", encoding="utf-8") as log:
                 log.write(mask_line(f"runner error: {type(e).__name__}: {e}") + "\n")
         finally:
-            self._procs.pop(jid, None)
             self.discard_input(meta.get("input_file"))      # text a person pasted for this command: the agent has read it by now
             meta.update(finished_at=datetime.now().isoformat(timespec="seconds"), duration_s=round(time.monotonic() - t0, 1))
             if meta["status"] in (FAILED,):
                 meta["tail"] = self.tail(jid, 15)
             self._release(jid)          # before the final save, so a viewer who sees 'finished' can already start the next job
-            self._save(meta)
+            try:
+                self._save(meta)
+            finally:
+                with self._lock:
+                    self._procs.pop(jid, None)          # last: a job stays known to this UI until its final record is written
 
     # ---- pasted text ----
     def save_input(self, text: str) -> str:
@@ -225,10 +244,20 @@ class JobManager:
 
     # ---- cancel / log ----
     def cancel(self, jid: str) -> bool:
-        proc = self._procs.get(jid)
-        if proc is None or proc.poll() is not None:
-            return False
-        self._cancelled.add(jid)
+        """Stops a job this UI is running. One that is still starting is never started (or stopped the moment it is)."""
+        with self._lock:
+            if jid not in self._procs:
+                return False                        # not running in this UI
+            proc = self._procs[jid]
+            if proc is not None and proc.poll() is not None:
+                return False                        # it ended in between
+            self._cancelled.add(jid)
+        if proc is not None:                        # None: still starting; the runner sees the cancel before or as it starts it
+            self._kill(proc)
+        return True
+
+    @staticmethod
+    def _kill(proc) -> None:
         if os.name == "nt":
             subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], stdin=subprocess.DEVNULL,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
@@ -241,7 +270,6 @@ class JobManager:
                 os.killpg(proc.pid, signal.SIGKILL) if leads_group else proc.kill()
             except ProcessLookupError:              # it ended in between
                 pass
-        return True
 
     def read_log(self, jid: str, offset: int = 0, whole_lines_only: bool = False) -> tuple:
         """(text from offset, new offset). Offsets are characters of the already-masked log. With whole_lines_only (a job that

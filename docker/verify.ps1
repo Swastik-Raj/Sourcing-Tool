@@ -944,7 +944,7 @@ print(json.dumps(out))
         $stillRunning = $srcState -notlike "exited *"
         $code = if ($stillRunning) { "none (still running)" } else { [int]($srcState -split " ")[1] }
         $log = Logs lcom-verify-src
-        Dk rm -f lcom-verify-src | Out-Null
+        Dk rm -f -v lcom-verify-src | Out-Null              # -v: also this container's own unnamed volumes (mutation 18b)
         $p = @()
         if ($stillRunning) { $p += "the container started and was still running after 60 s" } elseif ($code -eq 0) { $p += "the container started" }
         if ($log -notmatch "looks like the source folder") { $p += "the message does not say why" }
@@ -955,12 +955,17 @@ print(json.dumps(out))
     Check "V21" "refuses-no-mount-no-tz" {
         Build-Images
         $p = @()
-        # (a) no data folder at all
-        & docker.exe run --name lcom-verify-nomount --label $Label --network none --read-only --tmpfs /tmp -e "TZ=$Zone" $Image | Out-Null
-        $code = $LASTEXITCODE
+        # (a) no data folder at all. Started in the background and given 60 s, as in V20.
+        & docker.exe run -d --name lcom-verify-nomount --label $Label --network none --read-only --tmpfs /tmp -e "TZ=$Zone" $Image | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "docker run could not create lcom-verify-nomount (exit code $LASTEXITCODE)" }
+        $end = (Get-Date).AddSeconds(60)
+        while ((Get-Date) -lt $end -and @(& docker.exe inspect --format "{{.State.Status}}" lcom-verify-nomount)[0] -ne "exited") { Start-Sleep -Seconds 1 }
+        $nmState = @(& docker.exe inspect --format "{{.State.Status}} {{.State.ExitCode}}" lcom-verify-nomount)[0]
+        $stillRunning = $nmState -notlike "exited *"
+        $code = if ($stillRunning) { "none (still running after 60 s)" } else { [int]($nmState -split " ")[1] }
         $log = Logs lcom-verify-nomount
-        Dk rm lcom-verify-nomount | Out-Null
-        if ($code -eq 0 -or $log -notmatch "no data folder is mounted") { $p += "without a data folder: exit code $code, message: $log" }
+        Dk rm -f -v lcom-verify-nomount | Out-Null          # -v: also this container's own unnamed volumes (mutation 18b)
+        if ($stillRunning -or $code -eq 0 -or $log -notmatch "no data folder is mounted") { $p += "without a data folder: exit code $code, message: $log" }
         # (b) the compose file with a settings file that has no TZ: every compose command works, the container refuses to start the UI
         $dir = "$Work\compose-notz"; $data = "$Work\data-notz"
         New-Item -ItemType Directory -Force $dir, $data | Out-Null

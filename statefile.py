@@ -92,11 +92,17 @@ def _is_stale(info) -> bool:
         return False
 
 
-def _create(lock: str, nonce: str) -> bool:
+def _create(lock: str, nonce: str):
+    """True: the lock is ours. False: someone holds it. None (Windows only): creating it was refused, which is what a lock
+    another process is deleting this moment gives; it is waited out like a held lock, within the same limit."""
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
         return False
+    except PermissionError:
+        if os.name != "nt":
+            raise
+        return None
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump({"pid": os.getpid(), "at": time.time(), "nonce": nonce}, f)
         f.flush()
@@ -113,11 +119,14 @@ def locked(path: str, wait_s: float = None):
         except ValueError:
             wait_s = DEFAULT_WAIT_S
     deadline = time.monotonic() + wait_s
-    while not _create(lock, nonce):
+    while not (made := _create(lock, nonce)):
         info = _read_lock(lock)
         if _is_stale(info) and _take_over(lock, info, nonce):
             break
         if time.monotonic() >= deadline:
+            if made is None and info is None:            # the last try was refused and no lock file can be read: a real permission problem
+                raise StateBusy(f"{os.path.basename(path)} could not be locked: creating {os.path.basename(lock)} was refused "
+                                f"(permission denied) for {wait_s:g} s. If no other command is running, check that this folder can be written to.")
             who = f" (process {info['pid']}, since {time.strftime('%H:%M:%S', time.localtime(info['at']))})" if isinstance(info, dict) and "pid" in info else ""
             raise StateBusy(f"{os.path.basename(path)} is busy: another command is using it{who}. Wait for it to finish and try again.")
         time.sleep(0.05)

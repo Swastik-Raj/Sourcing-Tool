@@ -61,6 +61,7 @@ from ui.app import create_app                           # noqa: E402
 from ui.commands import JobRejected                     # noqa: E402
 from ui.config import MAX_PRODUCT_ROWS, MAX_UPLOAD_BYTES, Settings   # noqa: E402
 from ui.jobs import JobBusy, JobManager                 # noqa: E402
+from test_ui import has_term, no_response_shows_the_reference_name    # noqa: E402 - also starts checking every response of this run
 
 ORIGIN = {"origin": "http://127.0.0.1:8000"}
 FAKE = {"ANTHROPIC_API_KEY": "sk-ant-FAKE-KEY-pipeline-000111222", "NIMBLE_API_KEY": "nimble-FAKE-secret-333444",
@@ -1372,10 +1373,9 @@ def new_pages_use_neutral_wording_and_escape_what_files_hold(env):
             pages += [post(fake, "/emails/send/review", wf=RES).text, post(fake, "/emails/send/review", wf=RES, test_recipient="me@example.invalid").text,
                       post(fake, "/emails/send", wf=RES, confirm_count="9").text, post(fake, "/approvals/revoke", wf=RES, sku=hostile).text]
             pages += PHASE3_PAGES(fake) if callable(PHASE3_PAGES) else []
-        from ui import wording
         for i, page in enumerate(pages):
             assert hostile not in page, f"page {i}: text from a file was not escaped"
-            assert not wording.contains_reference_name(page), (i, re.findall(r"(?i).{40}l[\s_-]?com.{20}", page)[:2])
+            assert not has_term(page),(i, re.findall(r"(?i).{40}l[\s_-]?com.{20}", page)[:2])
             assert "&lt;script&gt;" in page or i >= 2
     finally:
         cleanup(fake)
@@ -2156,6 +2156,43 @@ def phone_step_list_is_compact_and_the_two_copies_never_share_an_id(env):
     assert '.rail .strip[data-copy="wide"] { display: none; }' in phone and ".steps-narrow { display: block;" in phone
 
 
+@test
+def state_lock_waits_out_a_refused_create_on_windows_and_still_times_out(env):
+    """statefile.py (approved change, 2026-10-26): on Windows a lock another process is deleting cannot be created for a moment
+    (PermissionError). That is waited out like a held lock; a refusal that never ends stops at the wait limit with its own
+    message. Elsewhere a PermissionError still stops at once, as before."""
+    import statefile
+    path = str(env.root / "state.json")
+    real, refused = os.open, []
+
+    def refusing(times):
+        def fake(p, flags, *a, **kw):
+            if os.fspath(p).endswith(".lock") and len(refused) < times:
+                refused.append(p)
+                raise PermissionError(13, "Access is denied", os.fspath(p))
+            return real(p, flags, *a, **kw)
+        return fake
+    try:
+        statefile.os.open = refusing(3)
+        if os.name != "nt":
+            raises(PermissionError, statefile.locked(path, wait_s=1).__enter__)
+            return
+        with statefile.locked(path, wait_s=5):
+            assert os.path.exists(path + ".lock") and len(refused) == 3          # refused three times, then taken
+        assert not os.path.exists(path + ".lock")
+        refused.clear()
+        statefile.os.open = refusing(10 ** 9)
+        start = time.monotonic()
+        e = raises(statefile.StateBusy, statefile.locked(path, wait_s=0.5).__enter__)
+        took = time.monotonic() - start
+        assert 0.5 <= took < 3 and len(refused) > 3, (took, len(refused))
+        assert str(e) == ("state.json could not be locked: creating state.json.lock was refused (permission denied) for 0.5 s. "
+                          "If no other command is running, check that this folder can be written to."), str(e)
+        assert not os.path.exists(path + ".lock")
+    finally:
+        statefile.os.open = real
+
+
 def wait_for(cond, what, timeout=60):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -2163,6 +2200,9 @@ def wait_for(cond, what, timeout=60):
             return
         time.sleep(0.1)
     raise AssertionError(f"timed out waiting for {what}")
+
+
+TESTS.append(no_response_shows_the_reference_name)          # last: it checks every response of this run
 
 
 def main():

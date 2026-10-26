@@ -469,8 +469,50 @@ TERM_VARIANTS = ["L-Com", "LCom", "lcom", "l com", "L-COM", "L_Com", "lcom-"]
 STEM_A, STEM_B = "sourcing_results_20260101_100000", "sourcing_results_20260202_100000"
 
 
+REFERENCE_NAME = re.compile(r"(?i)(?<![a-z])l[\s_-]?com(?![a-z])")     # any case variant of the name (was ui/wording.py's)
+
+
 def has_term(text: str) -> bool:
-    return wording.contains_reference_name(text)
+    return bool(REFERENCE_NAME.search(text or ""))
+
+
+# ---------- every response any test client gets in this process, checked as it arrives (the suite's last test reports) ----------
+REFUSING = ("/emails/drafts", "/emails/mark", "/emails/reply", "/approvals/request", "/approvals/record", "/approvals/export", "/order/build",
+            "/content/template", "/content/facts", "/search/upload", "/search/start", "/jobs/run", "/jobs/{id}/cancel")
+SEEN = {"responses": 0, "downloads": 0, "500": 0, "refused": {}, "leaks": []}
+
+
+def _look(r) -> None:
+    path = r.request.url.path
+    route = re.sub(r"^/jobs/[^/]+/cancel$", "/jobs/{id}/cancel", path)
+    html = r.headers.get("content-type", "").startswith("text/html")
+    download = path.startswith("/files/")           # the stored file itself, verbatim by design: only its headers are checked
+    SEEN["responses"] += 1
+    SEEN["downloads"] += download
+    SEEN["500"] += r.status_code == 500 and html
+    if route in REFUSING and 400 <= r.status_code < 500 and html:
+        SEEN["refused"][route] = SEEN["refused"].get(route, 0) + 1
+    parts = {"Location header": r.headers.get("location", ""), "Content-Disposition header": r.headers.get("content-disposition", "")}
+    if not download:
+        parts["body"] = r.text                      # pages (titles included), JSON and error pages alike
+    for where, text in parts.items():
+        m = REFERENCE_NAME.search(text)
+        if m:
+            SEEN["leaks"].append(f"{r.request.method} {r.request.url} -> {r.status_code}, {where}: ...{text[max(m.start() - 60, 0):m.end() + 40]}...")
+
+
+def _looking(send):
+    def send_and_look(self, request, **kw):
+        r = send(self, request, **kw)
+        for one in (*r.history, r):                 # each redirect on the way, then the answer
+            _look(one)
+        return r
+    send_and_look.looks = True
+    return send_and_look
+
+
+if not getattr(TestClient.send, "looks", False):
+    TestClient.send = _looking(TestClient.send)
 
 
 def wide_strip(html: str) -> str:
@@ -1613,6 +1655,29 @@ def container_start_hands_the_data_folder_to_the_ui(env):
     assert security.allowed_hosts(s) == {"127.0.0.1:8000", "localhost:8000"}, "listening on every interface does not widen the hosts it answers to"
     assert (data / "email_agent.py").read_bytes() == (app / "email_agent.py").read_bytes()         # the agents the UI will run are in the data folder
     assert os.environ.get("PROJECT_DIR") != str(data), "the test's own environment is restored"
+
+
+@test
+def no_response_shows_the_reference_name(env):
+    """Last in both UI suites (tests\\test_ui_pipeline.py runs it too): no response any test client got in this run shows the
+    name, in a page, its title, JSON, an error page, or a Location or Content-Disposition header. First it adds one refusal page
+    of each of the 13 refusing routes and one 500 page, so those are always among the responses checked, and counts them."""
+    before = len(SEEN["refused"]), SEEN["500"]
+    for route in REFUSING:
+        r = post(env, route.replace("{id}", "no-such-task"), wf="no-such-search")
+        assert 400 <= r.status_code < 500 and r.headers["content-type"].startswith("text/html"), (route, r.status_code, r.text[-300:])
+    def boom():
+        raise RuntimeError("a crash on purpose")
+    env.jobs.list = boom
+    try:
+        assert env.client.get("/jobs").status_code == 500
+    finally:
+        del env.jobs.list
+    print(f"     {SEEN['responses']} responses checked ({SEEN['downloads']} downloads: headers only); refusal pages: {SEEN['refused']}; "
+          f"500 pages: {SEEN['500']}; before this test: {before[0]} of the 13 routes refused, {before[1]} 500 page(s)")
+    assert sorted(SEEN["refused"]) == sorted(REFUSING), f"refusal pages not seen: {sorted(set(REFUSING) - set(SEEN['refused']))}"
+    assert SEEN["500"] >= 1, "no 500 page was seen"
+    assert not SEEN["leaks"], f"{len(SEEN['leaks'])} response(s) show the reference name:\n" + "\n".join(SEEN["leaks"][:20])
 
 
 def main():

@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-from .commands import CANCEL_WARNINGS, GENERIC_EXITS, SKU_RE, Command, JobRejected, Param
+from .commands import CANCEL_WARNINGS, GENERIC_EXITS, SKU_RE, Command, JobRejected, Param, switch_rule
 from .config import MAX_PRODUCT_ROWS, UPLOADS_FOLDER, Settings
 from .workflows import upload_time
 
@@ -219,12 +219,6 @@ def limit_rule(v: str) -> str:
     if not isinstance(v, str) or not re.fullmatch(r"[0-9]{1,4}", v) or not 1 <= int(v) <= MAX_LIMIT:
         raise JobRejected(f"The row limit must be a whole number from 1 to {MAX_LIMIT}.")
     return str(int(v))
-
-
-def switch_rule(v: str) -> str:
-    if v != "1":
-        raise JobRejected("That option can only be switched on or left off.")
-    return v
 
 
 def output_rule(s: Settings) -> Callable[[str], str]:

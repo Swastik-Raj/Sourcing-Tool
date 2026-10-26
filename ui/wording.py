@@ -49,11 +49,6 @@ def display_all(value):
     return display(value)
 
 
-def contains_reference_name(text: str) -> bool:
-    """True if any case variant of the name is in the text (used by the tests and as a last check)."""
-    return bool(re.search(r"(?i)(?<![a-z])l[\s_-]?com(?![a-z])", text or ""))
-
-
 def strip_prefix(workflow: str) -> str:
     """Internal workflow id -> the plain stem used in URLs."""
     return workflow[len(INTERNAL_PREFIX):] if (workflow or "").lower().startswith(INTERNAL_PREFIX) else (workflow or "")

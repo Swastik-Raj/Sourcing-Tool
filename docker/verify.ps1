@@ -62,9 +62,11 @@ $Protected = @("sourcing_agent.py", "email_agent.py", "decision_agent.py", "orde
                "test_order_sheet.py", "test_content_agent.py", "test_observability.py",
                "email_state.json", "decision_state.json", "approvals_log.jsonl", "approved_orders.csv", "approved_orders.json", "product_facts.csv")
 $RealFolders = @("Excel Output Sheets", "Reports", "Order Sheets", "Walmart Listings", "Uploads", "ui_data", "data")
-# The single approved change to a protected file (2026-10-14: workflow_id treats \ like /, so a Windows path gives the same
-# id on Linux). V24 accepts this file differing from a run's start only when it now has exactly this hash.
-$ApprovedChanges = @{ "observability.py" = "d0b4b1ee38e0ac52b2f31000c871512c8a989c27f169a54947f2251ad1d2a1b4" }
+# The approved changes to protected files. V24 accepts each file only at exactly this hash, and fails at any other:
+#   observability.py (2026-10-14): workflow_id treats \ like /, so a Windows path gives the same id on Linux.
+#   statefile.py (2026-10-26): a lock Windows refuses to create (one being deleted that moment) is waited out like a held lock.
+$ApprovedChanges = [ordered]@{ "observability.py" = "d0b4b1ee38e0ac52b2f31000c871512c8a989c27f169a54947f2251ad1d2a1b4"
+                               "statefile.py" = "0290d6be0946759c88eb7604ecc0ce4184ff2db9db2305040a52a47ac29aea5a" }
 $Results = New-Object System.Collections.ArrayList
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 $script:Stopped = ""
@@ -358,7 +360,8 @@ function Finish-Run {
     foreach ($name in $ApprovedChanges.Keys) {
         $now = Get-FileSha (Join-Path $Real $name)
         $approvedNote += "$name is " + $(if ($now -eq $ApprovedChanges[$name]) { "the approved version (sha256 $now)" } else { "NOT the approved version (sha256 $now)" })
-        if ($changed -contains $name -and $now -eq $ApprovedChanges[$name]) { $changed = @($changed | Where-Object { $_ -ne $name }) }   # the one approved exception
+        if ($now -ne $ApprovedChanges[$name]) { if ($changed -notcontains $name) { $changed += "$name (not the approved version)" } }
+        elseif ($changed -contains $name) { $changed = @($changed | Where-Object { $_ -ne $name }) }       # an approved exception
     }
     $approvedNote = $approvedNote -join "; "
     $cNow = Get-FileSha (Join-Path $Root "docker\constraints.txt")

@@ -114,6 +114,19 @@ def is_set(s: Settings, name: str) -> bool:
         return False
 
 
+def sender_name(s: Settings) -> str:
+    """SENDER_NAME, the name every inquiry is signed with, so the Email sellers page can show an inquiry exactly as the email
+    agent writes it. The one setting whose value leaves this module: it is in every email a seller receives, so it is not a
+    secret. Read as the agents read it (the environment first, then the project's .env); '' when unset."""
+    if os.environ.get("SENDER_NAME"):
+        return os.environ["SENDER_NAME"]
+    try:
+        from dotenv import dotenv_values
+        return str(dotenv_values(s.project / ".env").get("SENDER_NAME") or "")
+    except Exception:  # noqa: BLE001 - an unreadable .env gives the agent's own default
+        return ""
+
+
 PLAIN_NAMES = {"ANTHROPIC_API_KEY": "the AI service key", "NIMBLE_API_KEY": "the web search key", "SMTP_HOST": "the mail server",
                "SMTP_USER": "the mail login", "SMTP_PASSWORD": "the mail password", "SHIPPING_ADDRESS": "the shipping address",
                "BRAND_NAME": "the brand name"}      # how a page names a missing setting outside its Technical details

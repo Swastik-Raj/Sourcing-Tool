@@ -36,6 +36,24 @@ document.querySelectorAll("[data-autosubmit]").forEach(function (el) {
   count();
 })();
 
+// Email sellers: "Copy the text" beside a read-only box. The button stays hidden without JavaScript (the text can still be
+// selected by hand). Where the clipboard cannot be written (not localhost or https), the text is selected for Ctrl+C.
+document.querySelectorAll("button[data-copy]").forEach(function (btn) {
+  var box = document.getElementById(btn.dataset.copy), said = document.getElementById(btn.dataset.copy + "-status");
+  if (!box) return;
+  btn.hidden = false;
+  btn.addEventListener("click", function () {
+    function say(text) { if (said) { said.textContent = text; } }   // textContent only
+    box.focus();
+    box.select();
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(box.value).then(function () { say("Copied."); }, function () { say("Selected: press Ctrl+C to copy."); });
+    } else {
+      say("Selected: press Ctrl+C to copy.");
+    }
+  });
+});
+
 (function () {
   var pre = document.getElementById("log");
   if (!pre || pre.dataset.running !== "yes") return;

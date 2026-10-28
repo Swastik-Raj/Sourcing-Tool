@@ -65,8 +65,12 @@ $RealFolders = @("Excel Output Sheets", "Reports", "Order Sheets", "Walmart List
 # The approved changes to protected files. V24 accepts each file only at exactly this hash, and fails at any other:
 #   observability.py (2026-10-14): workflow_id treats \ like /, so a Windows path gives the same id on Linux.
 #   statefile.py (2026-10-26): a lock Windows refuses to create (one being deleted that moment) is waited out like a held lock.
+#   decision_agent.py, order_sheet.py (2026-10-28, quote check D6): display only - the email agent's quote check adds two flags
+#     and one line to the approval request, and the order sheet shows those flags as notes. Nothing they decide changes.
 $ApprovedChanges = [ordered]@{ "observability.py" = "d0b4b1ee38e0ac52b2f31000c871512c8a989c27f169a54947f2251ad1d2a1b4"
-                               "statefile.py" = "0290d6be0946759c88eb7604ecc0ce4184ff2db9db2305040a52a47ac29aea5a" }
+                               "statefile.py" = "0290d6be0946759c88eb7604ecc0ce4184ff2db9db2305040a52a47ac29aea5a"
+                               "decision_agent.py" = "1593a3082ae9eb543962fbdb0aa970489b078ca42478bfd456745eea052f8a01"
+                               "order_sheet.py" = "09599f1d0640c5934bcaaa1c877e143f616e0d9bb5e5c1930acffee596799389" }
 $Results = New-Object System.Collections.ArrayList
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 $script:Stopped = ""
@@ -286,6 +290,25 @@ function New-FakeEnv($dir, $port, $container, $data, [switch]$NoZone) {
     Copy-Item -LiteralPath (Join-Path $Root "docker-compose.yml") -Destination "$dir\docker-compose.yml" -Force
 }
 
+function Unlisted-Files($root) {
+    # Every file a commit would hold under the tests' folders must be on docker\image_files_test.txt, and every file under the
+    # pages' folders on docker\image_files.txt: a file left off its list never reaches the image (the suites then fail inside
+    # it, or a page is missing). "A commit would hold" = git ls-files --cached --others --exclude-standard: tracked files plus
+    # new ones git does not ignore, so a file not committed yet counts too. Returns the problems, or none.
+    $runtime = @(Get-Content (Join-Path $root "docker\image_files.txt") | Where-Object { $_ })
+    $test = @(Get-Content (Join-Path $root "docker\image_files_test.txt") | Where-Object { $_ })
+    $was = $ErrorActionPreference; $ErrorActionPreference = "Continue"                 # git's own messages must not stop the script
+    try { $files = @(& git -c core.quotepath=off -C $root ls-files --cached --others --exclude-standard -- test_fixtures tests ui/templates ui/static 2>$null); $code = $LASTEXITCODE }
+    finally { $ErrorActionPreference = $was }
+    if ($code -ne 0) { return @("$root is not a git work tree, so the image file lists could not be compared with git ls-files") }
+    $p = @()
+    $t = @($files | Where-Object { $_ -match '^(test_fixtures|tests)/' -and $test -notcontains $_ })
+    $r = @($files | Where-Object { $_ -match '^ui/(templates|static)/' -and $runtime -notcontains $_ })
+    if ($t.Count) { $p += "in the repository but missing from docker\image_files_test.txt: " + ($t -join ", ") }
+    if ($r.Count) { $p += "in the repository but missing from docker\image_files.txt: " + ($r -join ", ") }
+    return $p
+}
+
 function Prepare-Context {
     if (Test-Path -LiteralPath "$Ctx\Dockerfile") { return }
     foreach ($need in @("scratch\pre_gates\decision_agent.py", "scratch\pre_gates\email_agent.py")) {
@@ -467,7 +490,8 @@ try {
         if (Test-Path -LiteralPath (Join-Path $Real ".env")) {
             if ((Get-FileHash -LiteralPath (Join-Path $Real ".env")).Hash -eq (Get-FileHash -LiteralPath "$Ctx\.env").Hash) { $p += "the staged .env is the real one" }
         }
-        Judge $p ("{0} files staged under {1}; a fake .env, a fake key file and 24 decoy files planted; the real .env is not in it" -f @(Get-ChildItem $Ctx -Recurse -File).Count, $Ctx)
+        $p += @(Unlisted-Files $Root)
+        Judge $p ("{0} files staged under {1}; a fake .env, a fake key file and 24 decoy files planted; the real .env is not in it; every file git has under test_fixtures, tests, ui/templates and ui/static is on its image list" -f @(Get-ChildItem $Ctx -Recurse -File).Count, $Ctx)
     }
 
     Check "V04" "context-exact" {

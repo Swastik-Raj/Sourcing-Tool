@@ -9,7 +9,7 @@ person decides at each gate. Nothing sends email, places an order or publishes a
 Pipeline order (run from the project folder, in PowerShell):
 
 1. **Search** - `python sourcing_agent.py --sku HDFF FOA-020C` (or `--input <products.xlsx>`) writes `sourcing_results_<timestamp>.xlsx`.
-2. **Emails** - `python email_agent.py drafts <results.xlsx>`, then `send`, `mark`, `reply`, `report` (same results file).
+2. **Emails** - `python email_agent.py drafts <results.xlsx>`, then `send`, `mark`, `reply`, `compare`, `report` (same results file).
 3. **Approvals** - `python decision_agent.py request <results.xlsx>`, then `record --results <results.xlsx> --request A-000N`, `export --results <results.xlsx>`.
 4. **Order sheet** - `python order_sheet.py build --approved approved_orders.csv --results <results.xlsx>`.
 5. **Listing content** - `python content_agent.py facts-template --approved approved_orders.csv --results <results.xlsx>`, fill `product_facts.csv`, then `generate ... --facts product_facts.csv`, then `check <walmart_listings_*.xlsx>`.
@@ -35,7 +35,7 @@ listings and replies from crashing redirected output). If script activation is b
 | Needed for | Variables in `.env` |
 |---|---|
 | Search (`sourcing_agent.py`) | `ANTHROPIC_API_KEY`, `NIMBLE_API_KEY` |
-| Emails (`email_agent.py`) | `drafts`, `report`, `mark`: none. `reply`: `ANTHROPIC_API_KEY`. `send`: `SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD`, `SHIPPING_ADDRESS` (`SMTP_PORT`, `SMTP_FROM`, `SENDER_NAME` optional) |
+| Emails (`email_agent.py`) | `drafts`, `report`, `mark`, `compare`: none. `reply`: `ANTHROPIC_API_KEY`. `send`: `SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD`, `SHIPPING_ADDRESS` (`SMTP_PORT`, `SMTP_FROM`, `SENDER_NAME` optional) |
 | Approvals (`decision_agent.py`) | none |
 | Order sheet (`order_sheet.py`) | none (`ORDER_SHEET_RECALC_PY` optional) |
 | Listing content (`content_agent.py`) | `generate`: `ANTHROPIC_API_KEY`, `BRAND_NAME` |
@@ -48,7 +48,11 @@ listings and replies from crashing redirected output). If script activation is b
 - **Search**: you choose the products and read the results; it only reads public pages and writes files.
 - **Emails**: `drafts` only shows text. `send` shows each email and asks `y` per email, or you type `yes` once for the batch;
   it refuses while `SHIPPING_ADDRESS` is unset. Use `--test-recipient you@example.com` to send test copies to yourself only.
-  Seller replies are pasted in by a person with `reply`. With no terminal (a program running it), `send --confirm-count N`
+  The first message is a quotation request (price for 200 and 500 pieces, MOQ, lead time, shipping to the USA, how to
+  order and pay), not an order. Seller replies are pasted in by a person with `reply`: one AI call reads the quote, every
+  number is checked against the reply, and code then compares it with the listing as the search captured it (with that
+  date) and drafts follow-up questions. Nothing is sent; `mark <SKU> --results <file> --followup` records questions sent by
+  hand, and `compare` checks a stored reply again without an AI call. With no terminal (a program running it), `send --confirm-count N`
   sends without asking, but only if exactly N emails would go out after every check; any other number sends nothing. It does
   not skip any other check. Without a terminal and without that flag, `send` stops with exit code 1 and sends nothing.
 - **Approvals**: the request is a text file for a manager. A person pastes the manager's reply into `record`, then types the
@@ -75,7 +79,7 @@ The pages use neutral wording (all display wording lives in `ui/wording.py`; job
 ## State files, locks and exit codes
 
 `email_state.json`, `decision_state.json`, `approved_orders.json` and `approved_orders.csv` are written atomically (temp file,
-then rename). Commands that change `email_state.json` or `decision_state.json` (`send`, `mark`, `reply`, `request`, `record`,
+then rename). Commands that change `email_state.json` or `decision_state.json` (`send`, `mark`, `reply`, `compare`, `request`, `record`,
 `revoke`, `export`) take a lock file next to it (`<state file>.lock`) and wait up to 10 seconds (`STATE_LOCK_WAIT_SECONDS`
 changes that); a lock left by a stopped program is taken over after 15 minutes. `drafts`, `report` and `status` never lock.
 

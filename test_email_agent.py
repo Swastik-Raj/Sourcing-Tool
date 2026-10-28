@@ -180,7 +180,7 @@ def test_load_and_drafts():
     assert [(s["sku"], s["kind"]) for s in skipped] == [("C3", "none"), ("D4", "none"), ("E5", "error")]
     a, b = drafts
     assert a["moq"] == "100" and "Hello Acme team," in a["body"] and "your listing (http://b)" in a["body"]
-    assert "Plano, TX" in a["body"] and "branding/engraving" in a["body"] and "Zync Technologies" in a["body"]
+    assert "Plano, TX" not in a["body"] and "shipping to the USA" in a["body"] and "branding/engraving" in a["body"] and "Zync Technologies" in a["body"]
     assert "A1" in a["subject"]
     assert a["label"] == "" and b["label"] == "NO EMAIL - submit via the inquiry form at http://only-url"
     assert "NO EMAIL" not in b["body"] and "inquiry form" not in b["body"]  # the label never rides inside the pasted text
@@ -300,7 +300,7 @@ def test_near_miss_is_opt_in_and_default_output_is_unchanged():
         assert with_file.rstrip().endswith("Nothing sent.") and "NM1" not in with_file
         # the default layout of a draft header is pinned exactly (this is what `drafts` printed before the flag existed)
         first = with_file.split("=" * 70 + "\n", 1)[1]
-        assert first.startswith("REC1 | Acme | To: sales@acme.com\nSubject: Sample order inquiry - REC1 keyword (REC1)\n\nHello Acme team,\n")
+        assert first.startswith("REC1 | Acme | To: sales@acme.com\nSubject: Quotation request - REC1 keyword (REC1)\n\nHello Acme team,\n")
         second = with_file.split("=" * 70 + "\n")[2]
         assert second.startswith("REC2 | Beta Ltd | To: NO EMAIL - inquiry form\nNO EMAIL - submit via the inquiry form at http://listing/REC2\nSubject: ")
         # the same three drafts through the old code path (make_draft) render exactly as the printed text says
@@ -327,7 +327,7 @@ def test_near_miss_flag_adds_labelled_drafts_after_the_normal_ones():
         for sku, url, concern, question in NM_ROWS:
             block = extra.split(f"{sku} | ")[1].split("=" * 70)[0]
             assert f"NEEDS HUMAN CHECK: {concern}\n" in block                 # the concern, in the header
-            assert f"NO EMAIL - submit via the inquiry form at {url}\n" in block and f"4. {question}" in block
+            assert f"NO EMAIL - submit via the inquiry form at {url}\n" in block and f"8. {question}" in block
             assert block.index("NEEDS HUMAN CHECK") < block.index("Subject:") < block.index("Hello")
         assert "NM1 Maker Ltd" in extra and "Other Co" not in extra                # the block the CSV row names (block 2), not block 1
         assert not state_file_exists() and FakeSMTP.created == 0                   # read only: nothing stored, nothing sent
@@ -345,13 +345,13 @@ def test_near_miss_label_stays_out_of_the_seller_text_and_asks_one_question():
             assert d["check"] == concern and d["questions"] == [question]
             assert "NEEDS HUMAN CHECK" not in text and concern not in text and "near-miss" not in text.lower() and "human" not in text.lower()
             items = re.findall(r"^(\d+)\. (.*)$", d["body"], re.M)
-            assert [n for n, _ in items] == ["1", "2", "3", "4"] and items[3][1] == question      # one added question, nothing else
+            assert [n for n, _ in items] == ["1", "2", "3", "4", "5", "6", "7", "8"] and items[7][1] == question      # one added question, nothing else
             # reuses the existing generator: the body is exactly make_draft's body for the same candidate, plus that one question
             plain = ea.make_draft({k: v for k, v in d.items() if k not in ("check", "questions", "subject", "body", "label")})
-            assert d["body"] == plain["body"].replace("3. The estimated lead time for samples?",
-                                                      f"3. The estimated lead time for samples?\n4. {question}")
+            assert d["body"] == plain["body"].replace("7. Whether custom branding/engraving is possible.",
+                                                      f"7. Whether custom branding/engraving is possible.\n8. {question}")
             assert d["subject"] == plain["subject"] and d["label"] == plain["label"] and d["key"] == plain["key"]
-            assert d["body"].startswith(f"Hello {d['manufacturer']} team,") and "100 Test Way" in d["body"]
+            assert d["body"].startswith(f"Hello {d['manufacturer']} team,") and "100 Test Way" not in d["body"]
 
 
 def test_near_miss_drafts_pass_the_same_leak_scan():
@@ -430,7 +430,7 @@ def test_config_values_are_used():
     with sandbox():
         os.environ["SENDER_NAME"] = "Test Sender"
         d = drafts_from([row("A1", email="a@x.com")])[0][0]
-    assert "100 Test Way\nPlano, TX 75024" in d["body"] and d["body"].count("Test Sender") == 2
+    assert "100 Test Way" not in d["body"] and d["body"].count("Test Sender") == 2
 
 
 # ---------- SHIPPING_ADDRESS: warn on the default, refuse to send ----------
@@ -534,8 +534,8 @@ def test_notes_become_polite_questions():
     ours = [n for n in REAL_NOTES if "model:" not in n]       # in real notes the model's caveat is always last
     assert len(ea.confirmation_questions("; ".join(ours))) == ea.MAX_QUESTIONS and len(ours) > ea.MAX_QUESTIONS
     d = drafts_from([row("A1", email="a@x.com", note=REAL_NOTES[4] + "; " + REAL_NOTES[5])])[0][0]
-    assert "\n4. Your listing title mentions \"VGA\"" in d["body"]
-    assert "\n5. Your listing covers several models (MC-6BP, MC-6BR)" in d["body"]
+    assert "\n8. Your listing title mentions \"VGA\"" in d["body"]
+    assert "\n9. Your listing covers several models (MC-6BP, MC-6BR)" in d["body"]
 
 
 # ---------- reviewer exclusions: skip rows, say how many ----------
@@ -874,6 +874,7 @@ def test_reply_statuses_include_auto_reply_or_spam():
         raise AssertionError("an unknown status was accepted")
     except ValueError:
         pass
+    assert {"quote_total_price", "quote_total_quantity"} <= set(ea.QUOTE_KEYS) & set(ea.QUOTE_EVIDENCE_FIELDS)   # verified like the rest
 
 
 def test_contact_method_column():
@@ -1166,6 +1167,503 @@ def test_parse_summary_and_report_rows():
     d = ea.make_draft(cand("B", "", maker=""))
     r = ea.build_report([d], {d["key"]: {"sent": "t", "reply": "x", **ok}})[0]
     assert r[5] == "yes (inquiry form, t)" and r[6] == "yes" and r[7] == "needs_info" and r[4] == "inquiry form submitted"
+
+
+# ---------- the inquiry asks for a quotation; the quote check compares the verified quote with the listing ----------
+
+def test_inquiry_asks_for_a_quotation_not_an_order():
+    d = drafts_from([row("A1", email="a@x.com", title="Cat6 Coupler")], TITLE_HEADER)[0][0]
+    body = d["body"]
+    assert d["subject"] == "Quotation request - A1 keyword (A1)" and "This is an inquiry, not an order." in body
+    for ask in ("1. The unit price for 200 and 500 pieces, in US dollars, and whether the price is per piece or per pack.",
+                "2. Your minimum order quantity for this item.", "3. The lead time for that quantity",
+                "4. The cost and method of shipping to the USA", "5. How we would place the order and pay.",
+                "6. How long your quotation is valid.", "7. Whether custom branding/engraving is possible."):
+        assert ask in body, ask
+    assert ea.QUOTE_QTYS == (200, 500) and ea.qty_list((200, 500, 1000)) == "200, 500 and 1,000"
+    assert not re.search(r"would like to (?:order|start with a sample order)|place an order with you|please (?:ship|send the goods)", body, re.I)
+    assert "100 Test Way" not in body and "SHIPPING" not in body                     # no street address: shown unmasked for copying
+
+
+def test_extra_questions_number_after_the_template():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "t.txt")
+        open(path, "w", encoding="utf-8").write("Subject: S {sku}\n{greeting}\n1. one?\n2. two?{note_line}\n")
+        _, body = ea.render_email({**cand("A1", note=REAL_NOTES[6]), "questions": ["Extra?"]}, path)
+    assert body.endswith("1. one?\n2. two?\n3. Could you confirm the standard price for this item?\n4. Extra?\n"), body
+
+
+QC_RESULTS = "sourcing_results_20261004_161054.xlsx"           # the name carries the search's start time
+QC_LISTED = "US $1.25 (100-499 pieces); $1.10 (500-999 pieces)"
+QC_TITLE = "Cat6 RJ45 Inline Coupler VC-6 Shielded"
+
+
+def qc_draft(listed=QC_LISTED, unit=1.25, moq="100 pieces", confidence="stated"):
+    url = "http://shop/qc1"
+    return ea.make_draft({**cand("QC1", "", maker="Acme", url=url), "title": QC_TITLE, "listed": listed, "unit_price": unit,
+                          "moq": moq, "confidence": confidence, "description": "Cat6 inline coupler"})
+
+
+def tier(qty, price, ev):
+    return {"min_qty": qty, "unit_price": price, "evidence": ev}
+
+
+QC_CASES = {  # fixture: (status, what the stub AI returns, the exact set of (code, severity) the check must give)
+    "qc_clean.txt": ("pricing_provided", {
+        "bulk_tiers": [tier(200, "1.25", "200 pcs: USD 1.25 per piece"), tier(500, "1.10", "500 pcs: USD 1.10 per piece")],
+        "moq": 100, "production_lead_time_days": 7, "quote_total_price": "550.00", "quote_total_quantity": 500, "shipping_terms": "DDP",
+        "currency": "USD", "evidence": {"moq": "MOQ is 100 pcs", "production_lead_time_days": "Lead time is 7 days for 500 pcs",
+                                        "quote_total_price": "500 pcs: USD 1.10 per piece, total USD 550.00",
+                                        "quote_total_quantity": "500 pcs: USD 1.10 per piece, total USD 550.00"}},
+        {("price_matches_listing", "note")}),
+    "qc_price_higher.txt": ("pricing_provided", {
+        "bulk_tiers": [tier(200, "1.45", "For 200 pcs the price is USD 1.45 per piece"), tier(500, "1.30", "for 500 pcs USD 1.30 per piece")],
+        "moq": 100, "production_lead_time_days": 10, "evidence": {"moq": "MOQ 100 pcs", "production_lead_time_days": "Lead time 10 days"}},
+        {("price_above_listing", "blocking"), ("total_missing", "needs confirmation")}),
+    "qc_price_lower.txt": ("pricing_provided", {
+        "bulk_tiers": [tier(200, "0.95", "200 pcs USD 0.95 per piece"), tier(500, "0.90", "500 pcs USD 0.90 per piece, total USD 450.00")],
+        "moq": 100, "lead_time_days": 5, "quote_total_price": "450.00", "quote_total_quantity": 500,
+        "evidence": {"moq": "MOQ 100 pcs", "lead_time_days": "lead time 5 days", "quote_total_price": "500 pcs USD 0.90 per piece, total USD 450.00",
+                     "quote_total_quantity": "500 pcs USD 0.90 per piece, total USD 450.00"}},
+        {("price_below_listing", "needs confirmation")}),
+    "qc_moq.txt": ("pricing_provided", {
+        "bulk_tiers": [tier(1000, "1.05", "1000 pcs at USD 1.05 per piece")], "moq": 1000, "production_lead_time_days": 15,
+        "quote_total_price": "1050.00", "quote_total_quantity": 1000,
+        "evidence": {"moq": "MOQ is 1000 pcs", "production_lead_time_days": "Lead time 15 days",
+                     "quote_total_price": "1000 pcs at USD 1.05 per piece, total USD 1050.00",
+                     "quote_total_quantity": "1000 pcs at USD 1.05 per piece, total USD 1050.00"}},
+        {("moq_differs", "needs confirmation"), ("moq_above_our_qty", "blocking"), ("qty_not_quoted", "needs confirmation")}),
+    "qc_per_pack.txt": ("pricing_provided", {
+        "bulk_tiers": [tier(200, "11.00", "200 pcs or 500 pcs: USD 11.00 per pack of 10 pcs"),
+                       tier(500, "11.00", "200 pcs or 500 pcs: USD 11.00 per pack of 10 pcs")],
+        "moq": 100, "evidence": {"moq": "MOQ 100 pcs"}},
+        {("unit_per_pack", "blocking")}),                     # a pack price is never compared with the per-piece listing or multiplied
+    "qc_rmb_exw.txt": ("pricing_provided", {
+        "bulk_tiers": [tier(500, "8.50", "Unit price RMB 8.50 per piece for 500 pcs")], "lead_time_days": 7,
+        "evidence": {"lead_time_days": "Lead time 7 days"}},
+        {("currency_not_usd", "blocking"), ("charges_excluded", "needs confirmation"), ("qty_not_quoted", "needs confirmation"),
+         ("not_answered", "needs confirmation")}),
+    "qc_other_qty.txt": ("pricing_provided", {
+        "bulk_tiers": [tier(5000, "0.95", "For 5,000 pcs the price is USD 0.95 per piece")], "moq": 100, "evidence": {"moq": "MOQ 100 pcs"}},
+        {("qty_not_quoted", "needs confirmation")}),
+    "qc_sample_only.txt": ("pricing_provided", {
+        "sample_unit_price": "5.00", "sample_quantity": 3, "price_basis": "per_unit", "moq": 100,
+        "evidence": {"sample_unit_price": "Sample price is USD 5.00 per piece", "sample_quantity": "3 pcs available", "moq": "MOQ 100 pcs"}},
+        {("sample_price_only", "needs confirmation")}),
+    "qc_other_model.txt": ("pricing_provided", {
+        "bulk_tiers": [tier(200, "1.25", "200 pcs USD 1.25/pc"), tier(500, "1.10", "500 pcs USD 1.10/pc, total USD 550.00")],
+        "quote_total_price": "550.00", "quote_total_quantity": 500, "moq": 100,
+        "evidence": {"quote_total_price": "500 pcs USD 1.10/pc, total USD 550.00", "quote_total_quantity": "500 pcs USD 1.10/pc, total USD 550.00",
+                     "moq": "MOQ 100 pcs"}},
+        {("product_differs", "needs confirmation"), ("price_matches_listing", "note")}),
+    "qc_vague.txt": ("needs_info", {},
+        {("vague_wording", "needs confirmation"), ("no_price", "needs confirmation"), ("not_answered", "needs confirmation")}),
+    "qc_total_wrong.txt": ("pricing_provided", {
+        "bulk_tiers": [tier(500, "1.10", "500 pcs at USD 1.10 per piece")], "quote_total_price": "600.00", "quote_total_quantity": 500,
+        "moq": 100, "evidence": {"quote_total_price": "500 pcs at USD 1.10 per piece, total USD 600.00",
+                                 "quote_total_quantity": "500 pcs at USD 1.10 per piece, total USD 600.00", "moq": "MOQ 100 pcs"}},
+        {("total_mismatch", "blocking"), ("price_matches_listing", "note"), ("qty_not_quoted", "needs confirmation")}),
+    "qc_mixed_language.txt": ("pricing_provided", {
+        "bulk_tiers": [tier(200, "1.25", "200个单价1.25美元/个"), tier(500, "1.10", "500 pcs 每个1.10美元左右")],
+        "moq": 100, "production_lead_time_days": 7, "evidence": {"moq": "MOQ 100 pcs", "production_lead_time_days": "交期7天"}},
+        {("price_matches_listing", "note"), ("vague_wording", "needs confirmation"), ("charges_excluded", "needs confirmation"),
+         ("total_missing", "needs confirmation")}),
+}
+
+
+def qc_run(fixture, status, raw, state=None, draft=None):
+    """The real record_reply (stub AI, real verify_quote), then the real compare_entry against QC_RESULTS."""
+    state = {} if state is None else state
+    d = draft or qc_draft()
+    ea.record_reply(state, d, read_fixture(fixture), summarize=lambda text: {"status": status, "summary": "stub", **raw})
+    ea.compare_entry(state, d, QC_RESULTS)
+    return state[d["key"]]
+
+
+def codes(entry):
+    return {(f["code"], f["severity"]) for f in entry["comparison"]["flags"]}
+
+
+def test_quote_check_table():
+    with sandbox():
+        for fixture, (status, raw, want) in QC_CASES.items():
+            entry = qc_run(fixture, status, raw)
+            assert codes(entry) == want, (fixture, codes(entry) ^ want, [f["text"] for f in entry["comparison"]["flags"]])
+            assert not entry["quote_warnings"], (fixture, entry["quote_warnings"])          # every stub value is proven in the fixture
+            comp = entry["comparison"]
+            assert comp["counts"] == {k: sum(f["severity"] == s for f in comp["flags"]) for s, k in ea.COUNT_KEYS.items()}
+            asks = [f for f in comp["flags"] if f["severity"] != "note"]
+            assert all(f["question"] for f in asks), fixture                               # every non-note becomes a question
+            assert all(f["text"] and f["why"] for f in comp["flags"]), fixture
+            fu = entry["followup"]
+            assert (fu is None) == (not asks), fixture
+            if fu:
+                assert [l for l in fu["body"].splitlines() if re.match(r"\d+\. ", l)] == [f"{i}. {f['question']}" for i, f in enumerate(asks, 1)]
+                blocking = [i for i, f in enumerate(asks) if f["severity"] == "blocking"]
+                assert blocking == list(range(len(blocking))), fixture                      # blocking questions come first
+                assert fu["sent"] is None and fu["subject"] == "Re: Quotation request - Cat6 inline coupler (QC1)"
+
+
+def test_clean_quote_asks_nothing():
+    with sandbox():
+        entry = qc_run("qc_clean.txt", *QC_CASES["qc_clean.txt"][:2])
+        assert entry["followup"] is None and entry["comparison"]["counts"] == {"blocking": 0, "needs_confirmation": 0, "note": 2}
+        assert "No follow-up: nothing to ask the seller." in ea.check_lines(entry)
+        texts = [f["text"] for f in entry["comparison"]["flags"]]
+        assert any("US$1.25 per piece for 200 pieces matches the listing's US$1.25 for 100-499 pieces (difference US$0.00)" in t for t in texts), texts
+
+
+def test_a_pack_price_is_asked_about_never_compared():
+    with sandbox():
+        entry = qc_run("qc_per_pack.txt", *QC_CASES["qc_per_pack.txt"][:2])
+        body = entry["followup"]["body"]
+        assert "1. Your price of US$11.00 seems to be per pack. How many pieces are in one pack, and what is the price per single piece?" in body
+        assert "2." not in body and "2,200" not in body and "US$1.25" not in body             # no comparison, no total from a pack price
+    d = qc_draft()                                                                          # a stated total on a pack price is not checked either
+    entry = qc_entry([(500, "11.00")], "500 pcs USD 11.00 per pack, total USD 600.00", quote_total_price="600.00", quote_total_quantity=500)
+    entry["bulk_tiers"][0]["evidence"] = "500 pcs USD 11.00 per pack"
+    comp, _ = ea.check_quote(entry, d, ea.listing_terms(d, QC_RESULTS), [500], "test")
+    assert not {f["code"] for f in comp["flags"]} & {"total_mismatch", "total_missing", "price_above_listing", "price_below_listing"}
+
+
+def test_a_price_without_a_unit_is_asked_about():
+    d = qc_draft()
+    entry = qc_entry([(200, "1.25"), (500, "1.10")], "200 pcs: USD 1.25. 500 pcs: USD 1.10. MOQ 100 pcs, lead time 7 days, DDP shipping "
+                                                     "included, payment by PayPal, valid 30 days, total USD 550.00",
+                     moq=100, quote_total_price="550.00", quote_total_quantity=500)
+    entry["bulk_tiers"][0]["evidence"], entry["bulk_tiers"][1]["evidence"] = "200 pcs: USD 1.25", "500 pcs: USD 1.10"
+    comp, fu = ea.check_quote(entry, d, ea.listing_terms(d, QC_RESULTS), [200, 500], "test")
+    assert {(f["code"], f["severity"]) for f in comp["flags"]} == {("unit_not_stated", "needs confirmation"), ("price_matches_listing", "note")}
+    assert "1. Is the price of US$1.25 per single piece?" in fu["body"] and "2." not in fu["body"]
+
+
+def test_notes_for_us_stay_out_of_the_seller_text():
+    reply = ("200 pcs USD 1.98 per piece, 500 pcs USD 1.90 per piece. Lead time 7 days, DDP shipping included, payment by PayPal, "
+             "valid 30 days. Please send us a drawing.")
+    d = qc_draft(listed="$1.98 (10-499 pieces)", unit=1.98, moq="10,000 pieces", confidence="inferred")
+    entry = qc_entry([(200, "1.98"), (500, "1.90")], reply, needs_from_us=["a drawing"])
+    comp, fu = ea.check_quote(entry, d, ea.listing_terms(d, QC_RESULTS), [200, 500], "test")
+    notes = {f["code"]: f["text"] for f in comp["flags"] if f["severity"] == "note"}
+    assert [f["code"] for f in comp["flags"] if f["code"] == "listing_price_not_firm"] == ["listing_price_not_firm"] * 2
+    assert any("no price for 500 pieces (its tiers: US$1.98 for 10-499 pieces)" in f["text"] for f in comp["flags"])
+    assert any("'inferred'" in f["text"] for f in comp["flags"] if f["code"] == "listing_price_not_firm")
+    assert "The listing's minimum order (10,000, seen 2026-10-04 16:10) is above every quantity" in notes["moq_above_our_qty"]
+    assert notes["seller_asks_us"].startswith("The seller asked us for: a drawing.") and fu["for_us"][0] == notes["seller_asks_us"]
+    assert "drawing" not in fu["body"] and "10,000" not in fu["body"]
+
+
+def test_quoted_inquiry_lines_are_not_the_sellers_words():
+    d = qc_draft()
+    pasted = "\n".join(["Price USD 1.25 per piece for 200 pcs."] + [f"> {line}" for line in d["body"].splitlines()]
+                       + d["body"].splitlines())                    # our own inquiry, quoted and pasted back under the answer
+    entry = qc_entry([(200, "1.25")], pasted)
+    entry["bulk_tiers"][0]["evidence"] = "Price USD 1.25 per piece for 200 pcs"
+    comp, _ = ea.check_quote(entry, d, ea.listing_terms(d, QC_RESULTS), [200], "test")
+    missing = [f["text"] for f in comp["flags"] if f["code"] == "not_answered"]
+    assert missing == ["The reply does not say your minimum order quantity, the lead time, the shipping cost to the USA, how we would "
+                       "place the order and pay and how long the quotation is valid."], missing
+
+
+def test_seller_text_with_a_phone_or_email_is_never_quoted():
+    d = qc_draft()
+    entry = qc_entry([], "Price about $1.20 call me on +86 138 0013 8000 or mail sales@seller.example, negotiable")
+    comp, fu = ea.check_quote(entry, d, ea.listing_terms(d, QC_RESULTS), [200], "test")
+    vague = [f for f in comp["flags"] if f["code"] == "vague_wording"]
+    assert vague and vague[0]["question"] == 'You wrote "negotiable". Could you give exact figures?', vague
+    assert "138" not in json.dumps(comp) + fu["body"] and "@" not in json.dumps(comp) + fu["body"]
+
+
+def test_cheaper_quote_is_still_flagged():
+    with sandbox():
+        entry = qc_run("qc_price_lower.txt", *QC_CASES["qc_price_lower.txt"][:2])
+        low = [f for f in entry["comparison"]["flags"] if f["code"] == "price_below_listing"]
+        assert len(low) == 2 and all(f["severity"] == "needs confirmation" for f in low)
+        assert "Your quote of US$0.95 per piece for 200 pieces is lower than the US$1.25 for 100-499 pieces on your listing" in low[0]["question"]
+        assert "same item, per single piece" in low[0]["question"] and "US$0.30 (24.0%) below" in low[0]["text"]
+
+
+def qc_entry(tiers, text, currency="USD", **more):
+    """A recorded entry without the AI step, for threshold tests (the comparison reads only these verified fields)."""
+    return {"sku": "QC1", "status": "pricing_provided", "reply": text, "replies": [{"at": "t", "text": text}], "currency": currency,
+            "bulk_tiers": [tier(q, p, f"{q} pcs USD {p} per piece") for q, p in tiers], "evidence": {}, "quote_warnings": [], **more}
+
+
+def qc_check(listed, unit, quoted, qty=500):
+    d = qc_draft(listed=listed, unit=unit)
+    entry = qc_entry([(qty, quoted)], f"{qty} pcs USD {quoted} per piece, total later. MOQ 100 pcs, lead time 7 days, shipping DDP, "
+                                      "payment PayPal, valid 30 days.", moq=100)
+    comp, _ = ea.check_quote(entry, d, ea.listing_terms(d, QC_RESULTS), [qty], "test")
+    return {f["code"] for f in comp["flags"] if f["code"].startswith("price_")}
+
+
+def test_tolerance_edges():
+    assert ea.TOLERANCE_PCT == ea.Decimal("0.02") and ea.TOLERANCE_MIN == ea.Decimal("0.01")
+    # a $0.50 listing: the US$0.01 floor applies (2% would be one cent too)
+    assert qc_check("$0.50", 0.5, "0.51") == {"price_matches_listing"} and qc_check("$0.50", 0.5, "0.52") == {"price_above_listing"}
+    assert qc_check("$0.50", 0.5, "0.49") == {"price_matches_listing"} and qc_check("$0.50", 0.5, "0.48") == {"price_below_listing"}
+    # FOA-020C at US$0.25: 2% is half a cent, so the US$0.01 floor is what makes a one-cent rounding equal
+    assert qc_check("US$0.25", 0.25, "0.26") == {"price_matches_listing"} and qc_check("US$0.25", 0.25, "0.27") == {"price_above_listing"}
+    # a $5.00 listing: 2% = US$0.10
+    assert qc_check("$5.00", 5.0, "5.10") == {"price_matches_listing"} and qc_check("$5.00", 5.0, "5.11") == {"price_above_listing"}
+    assert qc_check("$5.00", 5.0, "4.90") == {"price_matches_listing"} and qc_check("$5.00", 5.0, "4.89") == {"price_below_listing"}
+    # C&P9M: a pack price the search divided ($1.13 / 5 = $0.226); the seller's $0.23 is the same price, $0.24 is not
+    assert qc_check("$1.07 $1.13 -5%", 0.226, "0.23") == {"price_matches_listing"}
+    assert qc_check("$1.07 $1.13 -5%", 0.226, "0.24") == {"price_above_listing"}
+    # TDG1026KS-C6's tier: $0.57 against $0.55 is flagged (at 10,000 pieces that is $200)
+    assert qc_check("$0.55 (10,000-49,999 pieces); $0.50 (≥50,000 pieces)", 0.55, "0.57", qty=10000) == {"price_above_listing"}
+    # a range: inside is a note, above the top is blocking, below the bottom needs confirmation
+    assert qc_check("US$3.82-5.22", 5.22, "4.50") == {"price_matches_listing"}
+    assert qc_check("US$3.82-5.22", 5.22, "5.40") == {"price_above_listing"} and qc_check("US$3.82-5.22", 5.22, "3.70") == {"price_below_listing"}
+
+
+def test_listing_prices_from_the_results_file():
+    import sourcing_agent as sa
+    D = ea.Decimal
+    real = {  # the 7 recommended listings of the newest real results file (2026-10-04 161054): listed text, the search's figure
+        "$1.98 (10-499 pieces)": (1.98, [(10, 499, D("1.98"))], None),
+        "$0.55 (10,000-49,999 pieces); $0.50 (≥50,000 pieces)": (0.55, [(10000, 49999, D("0.55")), (50000, None, D("0.50"))], None),
+        "US $1.25 (100-499 pieces)": (1.25, [(100, 499, D("1.25"))], None),
+        "$0.48": (0.48, [], None),
+        "$1.07 $1.13 -5%": (0.226, [], None),
+        "US$0.25": (0.25, [], None),
+        "US$3.82-5.22": (5.22, [], (D("3.82"), D("5.22"))),
+    }
+    for listed, (unit, tiers, rng) in real.items():
+        terms = ea.listing_terms({"listed": listed, "unit_price": unit, "moq": "10 pieces"}, QC_RESULTS)
+        assert terms["tiers"] == tiers and terms["range"] == rng and terms["moq"] == 10, (listed, terms)
+        assert [D(p) for p, _ in sa.PRICE_TIER.findall(listed)] == [p for _, _, p in tiers], listed   # the search's own tier rule agrees
+        if not tiers:
+            assert bool(sa.PRICE_RANGE.search(listed)) == (rng is not None), listed               # and its range rule
+    t = ea.listing_terms({"listed": "$1.98 (10-499 pieces)", "unit_price": 1.98, "moq": None}, QC_RESULTS)
+    assert ea.listing_price_at(t, 200) == (D("1.98"), " for 10-499 pieces") and ea.listing_price_at(t, 500)[0] is None
+    assert "US$1.98 for 10-499 pieces" in ea.listing_price_at(t, 500)[1] and t["moq"] is None
+    t = ea.listing_terms({"listed": "$0.55 (10,000-49,999 pieces); $0.50 (≥50,000 pieces)", "unit_price": 0.55, "moq": "10,000 pieces"}, QC_RESULTS)
+    assert ea.listing_price_at(t, 60000) == (D("0.50"), " for 50,000+ pieces") and ea.listing_price_at(t, 200)[0] is None and t["moq"] == 10000
+    t = ea.listing_terms({"listed": "$1.07 $1.13 -5%", "unit_price": 0.226}, QC_RESULTS)
+    assert ea.listing_price_at(t, 500) == (D("0.226"), "")                                  # no tier, no range: the search's per-piece figure
+    t = ea.listing_terms({"listed": "", "unit_price": "UNDETERMINED"}, QC_RESULTS)
+    assert ea.listing_price_at(t, 500) == (None, "the results file has no usable price for it")
+
+
+def test_listing_capture_time():
+    when, how = ea.capture_time(os.path.join("Excel Output Sheets", QC_RESULTS))
+    assert when == ea.datetime(2026, 10, 4, 16, 10, 54) and "name" in how
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "renamed.xlsx")
+        open(path, "wb").close()
+        os.utime(path, (1790000000, 1790000000))
+        when, how = ea.capture_time(path)
+        assert when == ea.datetime.fromtimestamp(1790000000) and "last-modified" in how
+
+
+def test_non_usd_and_unknown_currency_are_never_compared():
+    with sandbox():
+        entry = qc_run("qc_rmb_exw.txt", *QC_CASES["qc_rmb_exw.txt"][:2])
+        assert entry["currency"] == "CNY" and not {c for c, _ in codes(entry)} & {"price_above_listing", "price_below_listing",
+                                                                                   "price_matches_listing", "total_missing", "total_mismatch"}
+        assert not re.search(r"US\$\d", entry["followup"]["body"])                       # a non-USD amount is never turned into dollars
+        assert "Could you give your prices in US dollars?" in entry["followup"]["body"]
+    d = qc_draft()
+    entry = qc_entry([(500, "1.10")], "500 pcs 1.10 per piece. MOQ 100, lead time 7 days, DDP, PayPal, valid 30 days.", currency="unknown", moq=100)
+    comp, fu = ea.check_quote(entry, d, ea.listing_terms(d, QC_RESULTS), [200, 500], "test")
+    assert {(f["code"], f["severity"]) for f in comp["flags"]} == {("currency_not_stated", "needs confirmation"), ("qty_not_quoted", "needs confirmation")}
+    assert "Could you confirm that your prices are in US dollars?" in fu["body"] and "US$" not in fu["body"]
+
+
+def followup_numbers_are_ours(entry, d, reply):
+    """Independent of build_followup's own guard: every number in a follow-up is in the seller's own reply, the results file's
+    listing, our own title/URL/SKU/description, the quantities asked, the capture date, the list numbering, or a total the
+    code worked out from a quoted price."""
+    fu, comp = entry["followup"], entry["comparison"]
+    L = comp["listing"]
+    ok = ea._numbers(reply) | ea._numbers(f"{L['listed']} {L['unit_price']} {L['moq']} {L['title']} {L['url']}")
+    ok |= ea._numbers(f"{d['sku']} {d['description']} {d['url']}") | {ea.Decimal(q) for q in comp["asked_qty"]} | ea._numbers("4 October 2026")
+    ok |= {ea.Decimal(i) for i in range(1, 20)}
+    for t in entry.get("bulk_tiers") or []:
+        ok |= {ea._cents(q * ea.Decimal(t["unit_price"])) for q in comp["asked_qty"]}
+    extra = ea._numbers(fu["subject"] + "\n" + fu["body"]) - ok
+    assert not extra, (extra, fu["body"])
+
+
+def test_followup_numbers_come_from_code():
+    with sandbox():
+        for fixture, (status, raw, _) in QC_CASES.items():
+            entry = qc_run(fixture, status, raw)
+            if entry["followup"]:
+                followup_numbers_are_ours(entry, qc_draft(), read_fixture(fixture))
+        # the AI invents a cheaper tier the reply never states: verify_quote drops it, so it reaches no comparison and no follow-up
+        status, raw, _ = QC_CASES["qc_price_higher.txt"]
+        bogus = {**raw, "bulk_tiers": raw["bulk_tiers"] + [tier(500, "0.70", "for 500 pcs USD 0.70 per piece")]}
+        entry = qc_run("qc_price_higher.txt", status, bogus)
+        assert entry["bulk_tiers"] == [{"min_qty": 200, "unit_price": "1.45", "evidence": raw["bulk_tiers"][0]["evidence"]},
+                                       {"min_qty": 500, "unit_price": "1.30", "evidence": raw["bulk_tiers"][1]["evidence"]}]
+        assert "0.70" not in json.dumps(entry["comparison"]) and "0.70" not in entry["followup"]["body"]
+        assert ("ai_value_dropped", "note") in codes(entry) and "US$1.30 per piece for 500 pieces" in entry["followup"]["body"]
+        # a question template that carries a number of its own: the guard refuses to draft it
+        saved = ea.QUESTIONS["total_missing"]
+        try:
+            ea.QUESTIONS["total_missing"] = saved + " We need the goods within 10 days."
+            entry = qc_run("qc_price_higher.txt", *QC_CASES["qc_price_higher.txt"][:2])
+        finally:
+            ea.QUESTIONS["total_missing"] = saved
+        assert entry["followup"] is None
+        refused = [f for f in entry["comparison"]["flags"] if f["code"] == "followup_not_drafted"]
+        assert refused and "(10)" in refused[0]["text"] and refused[0]["severity"] == "note"
+
+
+def test_followup_passes_the_leak_scan():
+    with sandbox():
+        for fixture, (status, raw, _) in QC_CASES.items():
+            fu = qc_run(fixture, status, raw)["followup"]
+            if not fu:
+                continue
+            text = fu["subject"] + "\n" + fu["body"]
+            found = INTERNAL.search(text)
+            assert not found, (fixture, found[0], text)
+            assert "100 Test Way" not in text and "@" not in text and "Plano" not in text, fixture
+            assert not any(x in text for x in fu["for_us"]), fixture                     # notes for us never ride in the seller text
+            assert "not an order" in text and "Zync Technologies" in text
+
+
+def test_every_comparison_shows_the_capture_date():
+    with sandbox():
+        for fixture, (status, raw, _) in QC_CASES.items():
+            entry = qc_run(fixture, status, raw)
+            comp = entry["comparison"]
+            assert comp["listing"]["captured"] == "2026-10-04 16:10" and "name" in comp["listing"]["captured_from"], fixture
+            assert comp["results_file"] == QC_RESULTS and comp["asked_qty"] == [200, 500]
+            assert "2026-10-04 16:10" in ea.check_lines(entry)[0] and "not re-read" in ea.check_lines(entry)[0]
+            for f in comp["flags"]:
+                if f["code"] in ("price_above_listing", "price_below_listing", "price_matches_listing", "moq_differs"):
+                    assert "2026-10-04 16:10" in f["text"], (fixture, f)
+                if f["code"] in ("price_above_listing", "price_below_listing", "moq_differs"):
+                    assert "4 October 2026" in f["question"], (fixture, f)
+            if entry["followup"]:
+                assert any("2026-10-04 16:10" in x and "Open the listing" in x for x in entry["followup"]["for_us"]), fixture
+
+
+def test_reply_makes_one_ai_call_and_sends_nothing():
+    calls = []
+    with sandbox() as tmp:
+        path = os.path.join(tmp, QC_RESULTS)
+        header = HEADER + ["Manufacturer 1 Listed Price", "Manufacturer 1 Unit Price Confidence", "Manufacturer 1 Listing Title"]
+        make_xlsx(path, [row("QC1", maker="Acme", email="a@x.com", url="http://shop/qc1", price=1.25, moq="100 pieces")
+                         + [QC_LISTED, "stated", QC_TITLE]], header)
+        status, raw, _ = QC_CASES["qc_price_higher.txt"]
+        ea.summarize_reply = lambda text: calls.append(text) or {"status": status, "summary": "stub", **raw}
+        out = run_cli(["reply", "QC1", "--results", path, "--file", os.path.join(FIXTURES, "qc_price_higher.txt")])
+        assert len(calls) == 1 and FakeSMTP.created == 0                                   # one AI call, nothing sent
+        assert "Quote check against the listing as seen by the search on 2026-10-04 16:10" in out and "BLOCKING: Quoted US$1.45" in out
+        assert "FOLLOW-UP DRAFT - not sent." in out and "Your quote is US$1.45 per piece for 200 pieces." in out
+        entry = read_state()["QC1|shop/qc1"]
+        assert entry["followup"]["sent"] is None and entry["comparison"]["counts"]["blocking"] == 2 and "sent" not in entry
+        out = run_cli(["compare", "QC1", "--results", path])                               # the same check again: no AI call
+        assert len(calls) == 1 and FakeSMTP.created == 0 and "FOLLOW-UP DRAFT" in out
+
+
+def test_compare_uses_no_ai_and_reads_old_entries():
+    with sandbox() as tmp:
+        path = os.path.join(tmp, QC_RESULTS)
+        make_xlsx(path, [row("A1", email="a@x.com", url="http://shop/a1", price=1.25, moq="100"), row("B2", url="http://shop/b2")])
+        old = {"sku": "A1", "seller": "Acme", "sent": "2026-10-05 09:00", "reply": "Price USD 1.60 per piece for 500 pcs.",
+               "replies": [{"at": "2026-10-06 10:00", "text": "Price USD 1.60 per piece for 500 pcs."}], "status": "pricing_provided",
+               "summary": "s", "bulk_tiers": [tier(500, "1.60", "Price USD 1.60 per piece for 500 pcs")], "currency": "USD",
+               "evidence": {}, "quote_warnings": []}                                     # recorded before the quote check existed
+        ea.save_state({"A1|shop/a1": old})
+        out = run_cli(["compare", "A1", "--results", path])                                # sandbox: the real AI raises if called
+        entry = read_state()["A1|shop/a1"]
+        assert entry["comparison"]["asked_from"].startswith("not recorded") and entry["comparison"]["asked_qty"] == [200, 500]
+        assert ("price_above_listing", "blocking") in codes(entry) and "BLOCKING" in out
+        assert {k: v for k, v in entry.items() if k not in ("comparison", "followup")} == old  # nothing else in the entry changed
+        assert cli_exit(["compare", "B2", "--results", path]).endswith("no reply is recorded for this seller, so there is nothing to compare. Nothing stored.")
+        assert list(read_state()) == ["A1|shop/a1"]
+
+
+def test_refusal_unrelated_and_auto_reply_get_no_followup():
+    with sandbox():
+        for fixture, status in (("declined.txt", "dead_end"), ("qc_unrelated.txt", "auto_reply_or_spam"), ("spam.txt", "auto_reply_or_spam")):
+            entry = qc_run(fixture, status, {})
+            assert entry["followup"] is None and entry["comparison"]["flags"] == [] and entry["comparison"]["not_checked"].startswith("Not compared")
+            assert ea.check_summary(entry) == entry["comparison"]["not_checked"]
+        # the same unrelated advert read as a quote: the other model and the missing price are flagged, never a match
+        entry = qc_run("qc_unrelated.txt", "pricing_provided", {})
+        assert codes(entry) == {("product_differs", "needs confirmation"), ("no_price", "needs confirmation"), ("not_answered", "needs confirmation")}
+        assert '"LS-5050"' in entry["followup"]["body"]
+
+
+def test_mixed_language_reply():
+    with sandbox():
+        entry = qc_run("qc_mixed_language.txt", *QC_CASES["qc_mixed_language.txt"][:2])
+        assert entry["currency"] == "USD"                                                   # 美元 is read as USD, never as the 元 of CNY
+        by_code = {f["code"]: f for f in entry["comparison"]["flags"]}
+        assert by_code["vague_wording"]["question"] == 'You wrote "500 pcs 每个1.10美元左右". Could you give exact figures?'
+        assert by_code["charges_excluded"]["question"].startswith('You wrote "不含运费". What would shipping to the USA cost for 200 and 500 pieces')
+        for snippet in ("500 pcs 每个1.10美元左右", "不含运费"):
+            assert snippet in read_fixture("qc_mixed_language.txt")                         # quoted verbatim from the seller
+
+
+def test_mark_followup_records_and_keeps_history():
+    with sandbox() as tmp:
+        path = os.path.join(tmp, QC_RESULTS)
+        header = HEADER + ["Manufacturer 1 Listed Price", "Manufacturer 1 Unit Price Confidence", "Manufacturer 1 Listing Title"]
+        make_xlsx(path, [row("QC1", maker="Acme", url="http://shop/qc1", price=1.25, moq="100 pieces") + [QC_LISTED, "stated", QC_TITLE]], header)
+        assert cli_exit(["mark", "QC1", "--results", path, "--followup"]).endswith("no follow-up has been drafted for this seller. Nothing stored.")
+        assert not state_file_exists()
+        run_cli(["mark", "QC1", "--results", path])                                         # the inquiry, by hand
+        assert read_state()["QC1|shop/qc1"]["asked_qty"] == [200, 500]
+        status, raw, _ = QC_CASES["qc_price_higher.txt"]
+        ea.summarize_reply = lambda text: {"status": status, "summary": "stub", **raw}
+        run_cli(["reply", "QC1", "--results", path, "--file", os.path.join(FIXTURES, "qc_price_higher.txt")])
+        assert read_state()["QC1|shop/qc1"]["comparison"]["asked_from"] == "recorded when this seller was contacted"
+        assert "follow-up questions marked as sent by hand" in run_cli(["mark", "QC1", "--results", path, "--followup"])
+        sent = read_state()["QC1|shop/qc1"]["followup"]
+        assert sent["sent"] and FakeSMTP.created == 0
+        run_cli(["compare", "QC1", "--results", path])                                      # same questions: still marked sent
+        assert read_state()["QC1|shop/qc1"]["followup"] == sent and "followup_history" not in read_state()["QC1|shop/qc1"]
+        status, raw, _ = QC_CASES["qc_clean.txt"]                                          # the seller answers: nothing left to ask
+        ea.summarize_reply = lambda text: {"status": status, "summary": "stub", **raw}
+        run_cli(["reply", "QC1", "--results", path, "--file", os.path.join(FIXTURES, "qc_clean.txt")])
+        entry = read_state()["QC1|shop/qc1"]
+        assert entry["followup"] is None and entry["followup_history"] == [sent]
+
+
+def test_send_records_the_quantities_asked():
+    with sandbox() as tmp:
+        path = os.path.join(tmp, "r.xlsx")
+        make_xlsx(path, [row("A1", email="a@x.com")])
+        run_cli(["send", path, "--confirm-count", "1"])
+        assert read_state()[key("A1")]["asked_qty"] == [200, 500] and len(FakeSMTP.sent) == 1
+
+
+def test_new_keys_do_not_change_decision_or_order_sheet():
+    import decision_agent as da
+    import order_sheet as osh
+    with sandbox():
+        for fixture, (status, raw, _) in QC_CASES.items():
+            entry = qc_run(fixture, status, raw)
+            plain = {k: v for k, v in entry.items() if k not in ("comparison", "followup", "quote_total_price", "quote_total_quantity")}
+            assert da.entry_quote(entry) == da.entry_quote(plain), fixture
+            assert (osh.quote_of(entry) is None) == (osh.quote_of(plain) is None), fixture
+            if osh.quote_of(plain):
+                for qty in (200, 500, 1000):
+                    assert osh.quote_price_for(osh.quote_of(entry), qty) == osh.quote_price_for(osh.quote_of(plain), qty), (fixture, qty)
+                assert osh.quote_summary(osh.quote_of(entry)) == osh.quote_summary(osh.quote_of(plain)), fixture
+
+
+def test_report_has_a_quote_check_column():
+    with sandbox() as tmp:
+        path = os.path.join(tmp, QC_RESULTS)
+        header = HEADER + ["Manufacturer 1 Listed Price", "Manufacturer 1 Unit Price Confidence", "Manufacturer 1 Listing Title"]
+        make_xlsx(path, [row("QC1", maker="Acme", url="http://shop/qc1", price=1.25, moq="100 pieces") + [QC_LISTED, "stated", QC_TITLE],
+                         row("NR", rec=NO_REC, maker=None, url="")], header)
+        status, raw, _ = QC_CASES["qc_price_higher.txt"]
+        ea.summarize_reply = lambda text: {"status": status, "summary": "stub", **raw}
+        run_cli(["reply", "QC1", "--results", path, "--file", os.path.join(FIXTURES, "qc_price_higher.txt")])
+        md, rows = report_rows(path)
+        assert ea.REPORT_HEADER[-1] == "Quote check" and ea.REPORT_HEADER[:9] == ["SKU", "Product", "Manufacturer", "Contact", "Contact method",
+                                                                                 "Sent", "Reply received", "Reply status", "Summary"]
+        assert rows["QC1"][9] == "2 blocking, 1 to confirm, 0 note(s) (listing seen 2026-10-04 16:10)" and rows["QC1"][7] == "pricing_provided"
+        assert ea.check_summary({"reply": "x"}) == "not checked yet" and ea.check_summary({}) == ""
 
 
 if __name__ == "__main__":

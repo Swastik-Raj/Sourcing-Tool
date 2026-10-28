@@ -1195,6 +1195,55 @@ def test_audit_log_is_append_only_and_complete():
         assert len(open(da.LOG_PATH, "rb").read()) == sizes[-1]
 
 
+def test_quote_check_is_shown_in_the_request_and_never_decides():
+    """The email agent's quote check (built here by the real email agent: stub LLM, real verification and comparison) adds
+    two flags and one line to the request. Every quantity, total, section and other field stays exactly as without it."""
+    import email_agent as ea
+    import test_email_agent as te
+    with sandbox(email_state="{}") as tmp:
+        path = os.path.join(tmp, "sourcing_results_20261004_161054.xlsx")
+        make_results(path, [res_row("VIC00001", "Pricey Co", unit=1.25, lcom=28.19, moq="40"), res_row("FOA-020C", "Robot Co", unit=0.25, lcom=72.99, moq="10"),
+                            res_row("HDFF", "Quiet Co", unit=0.48, moq="40")])
+        drafts = {c["sku"]: ea.make_draft(c) for c in ea.load_results(path, [])[0]}
+        status, raw, _ = te.QC_CASES["qc_price_higher.txt"]
+        replies = {}
+        ea.record_reply(replies, drafts["VIC00001"], te.read_fixture("qc_price_higher.txt"), summarize=lambda text: {"status": status, "summary": "stub", **raw})
+        ea.record_reply(replies, drafts["FOA-020C"], te.read_fixture("autoreply.txt"), summarize=lambda text: {"status": "auto_reply_or_spam", "summary": "auto"})
+        checked = json.loads(json.dumps(replies))
+        for sku in ("VIC00001", "FOA-020C"):
+            ea.compare_entry(checked, drafts[sku], path)
+        open(da.EMAIL_STATE_PATH, "w", encoding="utf-8").write(json.dumps(replies))
+        without = da.cmd_request(path)
+        open(da.EMAIL_STATE_PATH, "w", encoding="utf-8").write(json.dumps(checked))
+        with_check = da.cmd_request(path)
+        before, after = ({l["sku"]: l for l in r["lines"]} for r in (without, with_check))
+        counts = checked[key_for("VIC00001", "Pricey Co")]["comparison"]["counts"]
+        v = after["VIC00001"]
+        assert counts["blocking"] == 2 and counts["needs_confirmation"] >= 1
+        assert v["quote_check"] == (f"Quote check (listing price seen 2026-10-04 16:10): 2 blocking, {counts['needs_confirmation']} to confirm, "
+                                    f"{counts['note']} note(s) - details on the Email sellers step")
+        assert [f for f in v["flags"] if f.startswith("quote_check_")] == ["quote_check_blocking", "quote_check_needs_confirmation"]
+        assert after["FOA-020C"]["quote_check"] == "Quote check: Not compared: the reply is automated or spam."
+        assert not [f for f in after["FOA-020C"]["flags"] if f.startswith("quote_check_")]
+        assert "quote_check" not in before["VIC00001"] and "quote_check" not in after["HDFF"]   # no check stored: no key, no line
+        text = open(os.path.join(da.REPORTS_DIR, f"approval_request_{with_check['id']}.txt"), encoding="utf-8").read()
+        assert "   " + v["quote_check"] + "\n" in text and "   Quote check: Not compared: the reply is automated or spam.\n" in text
+        assert "quote_check_blocking, quote_check_needs_confirmation" in text
+        old_text = open(os.path.join(da.REPORTS_DIR, f"approval_request_{without['id']}.txt"), encoding="utf-8").read()
+        assert "Quote check" not in old_text and "quote_check_" not in old_text
+        for sku in before:                                                                    # display only: nothing else moves
+            assert {k: x for k, x in before[sku].items() if k != "flags"} == {k: x for k, x in after[sku].items() if k not in ("flags", "quote_check")}, sku
+            assert [f for f in after[sku]["flags"] if not f.startswith("quote_check_")] == before[sku]["flags"], sku
+            assert da.line_section(before[sku]) == da.line_section(after[sku])
+        for field in ("subtotal", "lines_without_total", "no_total_reasons", "waiting", "margin_failed", "left_out", "left_out_moq_total", "skipped"):
+            assert without[field] == with_check[field], field
+        # the flags travel with an approval into the export, as every flag does, for the order sheet to show
+        record(path, "approve VIC00001 qty 40 max 1.50\ncap 100", typed_id=with_check["id"], request_id=with_check["id"])
+        da.cmd_export(path)
+        exported = {o["sku"]: o for o in json.load(open(da.EXPORT_JSON, encoding="utf-8"))["orders"]}
+        assert {"quote_check_blocking", "quote_check_needs_confirmation"} <= set(exported["VIC00001"]["flags"])
+
+
 def test_read_only_inputs_and_status_writes_nothing():
     email = {key_for("VIC00001", "Eternalstar"): {"status": "pricing_provided", "summary": "ok"}}
     with sandbox(exclusions=[("X", "nobody", "r")], email_state=email) as tmp:

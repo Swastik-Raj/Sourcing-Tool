@@ -215,16 +215,20 @@ def create_app(settings: Optional[Settings] = None, popen=None) -> FastAPI:
         return sku.strip()
 
     @app.post("/emails/mark")
-    def emails_mark(request: Request, csrf_token: str = Form(""), wf: str = Form(""), sku: str = Form(""), confirm: str = Form("")):
+    def emails_mark(request: Request, csrf_token: str = Form(""), wf: str = Form(""), sku: str = Form(""), confirm: str = Form(""),
+                    followup: str = Form("")):
+        """Marks the inquiry as sent through the seller's website, or (followup=1) the drafted follow-up questions as sent by
+        hand. Either needs the person's own tick."""
         csrf(request, csrf_token)
         try:
             file = results_for(wf)
             sku = known_sku(file, sku)
             if confirm != "1":
-                raise JobRejected("Tick the box to confirm you contacted the seller through their website yourself. Nothing was stored.")
+                raise JobRejected("Tick the box to confirm you sent the questions to the seller yourself. Nothing was stored." if followup else
+                                  "Tick the box to confirm you contacted the seller through their website yourself. Nothing was stored.")
         except JobRejected as e:
             return refused(request, "emails", wf, e)
-        return act(request, "emails", wf, "emails.mark", {"sku": sku, "results": file})
+        return act(request, "emails", wf, "emails.mark", {"sku": sku, "results": file, **({"followup": followup} if followup else {})})
 
     def pasted(text: str, what: str) -> str:
         if not text.strip():

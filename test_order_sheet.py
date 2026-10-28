@@ -277,6 +277,22 @@ def test_price_ranges_say_range_high_end():
     assert any(w.startswith("PRICE OVER APPROVED MAX: AAA") for w in b["warnings"])
 
 
+def test_quote_check_flags_become_notes_and_change_nothing_else():
+    """The two flags the decision agent adds from the email agent's quote check are shown as notes. Display only: every other
+    cell of the Order List, the totals and the warnings are exactly those of the same approval without the flags."""
+    plain = Box(basic_rows(), [{}])
+    flagged = Box(basic_rows(), [{"flags": "quote_check_blocking;quote_check_needs_confirmation"}])
+    a, b = plain.build(), flagged.build()
+    note_b = flagged.sheet(b)["Order List"]["P8"].value
+    assert os_.FLAG_TEXT["quote_check_blocking"] in note_b and os_.FLAG_TEXT["quote_check_needs_confirmation"] in note_b
+    assert "blocking point" in os_.FLAG_TEXT["quote_check_blocking"] and "to confirm" in os_.FLAG_TEXT["quote_check_needs_confirmation"]
+    assert note_b == plain.sheet(a)["Order List"]["P8"].value + " " + os_.FLAG_TEXT["quote_check_blocking"] + " " + os_.FLAG_TEXT["quote_check_needs_confirmation"]
+    ws_a, ws_b = plain.sheet(a)["Order List"], flagged.sheet(b)["Order List"]
+    diff = [c.coordinate for row in ws_a.iter_rows() for c in row if c.value != ws_b[c.coordinate].value]
+    assert diff == ["P8"], diff
+    assert a["totals"] == b["totals"] and a["warnings"] == b["warnings"]
+
+
 def test_platform_table_and_unknown_platform():
     assert os_.platform_of("https://www.alibaba.com/x")[1] == "add-to-cart when logged in"
     assert os_.platform_of("https://www.aliexpress.us/x") == ("AliExpress", "add-to-cart when logged in")

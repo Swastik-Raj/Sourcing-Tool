@@ -15,7 +15,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from . import workflows
 from .commands import FACTS_RE, REQUEST_ID, JobRejected
-from .config import Settings, is_set
+from .config import Settings, is_set, sender_name
 
 SMTP_SETTINGS = ("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD")
 MAX_MODEL_CALLS_PER_PRODUCT = 3      # content_agent.py MAX_CALLS_PER_SKU: first try, one invalid-JSON retry, one repair
@@ -49,6 +49,40 @@ def web_link(url) -> str:
     return urlunsplit((p.scheme.lower(), host + (f":{port}" if port else ""), p.path, p.query, p.fragment))
 
 
+SEVERITY_LABELS = {"blocking": "Blocking", "needs confirmation": "Needs confirmation", "note": "Note"}
+
+
+def quote_check(comp):
+    """The comparison the email agent stored for a seller, shaped for the page (display only: nothing here judges a quote).
+    None when there is none or it is not in the expected shape."""
+    if not isinstance(comp, dict):
+        return None
+    listing = comp.get("listing") if isinstance(comp.get("listing"), dict) else {}
+    flags = [{"label": SEVERITY_LABELS.get(str(f.get("severity")), str(f.get("severity"))), "kind": str(f.get("severity") or "note").replace(" ", "-"),
+              "text": str(f.get("text") or ""), "why": str(f.get("why") or "")} for f in comp.get("flags") or [] if isinstance(f, dict)]
+    count = lambda kind: sum(f["kind"] == kind for f in flags)
+    return {"captured": str(listing.get("captured") or "an unknown time"), "not_checked": str(comp.get("not_checked") or ""), "flags": flags,
+            "blocking": count("blocking"), "confirm": count("needs-confirmation"), "notes": count("note")}
+
+
+def followup(fu):
+    """The follow-up questions the email agent drafted for a seller, or None."""
+    if not isinstance(fu, dict) or not isinstance(fu.get("body"), str):
+        return None
+    return {"subject": str(fu.get("subject") or ""), "body": fu["body"], "sent": str(fu["sent"]) if fu.get("sent") else "",
+            "for_us": [str(x) for x in fu.get("for_us") or [] if isinstance(x, str)]}
+
+
+def inquiry(s: Settings, row: dict):
+    """The inquiry exactly as the email agent writes it (its own make_draft, signed with SENDER_NAME), for the copy box.
+    It holds no shipping address. None if the agent cannot build it."""
+    try:
+        d = workflows.agent_module(s).make_draft(row, sender_name=sender_name(s) or None)
+        return {"subject": str(d["subject"]), "body": str(d["body"])}
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def emails(s: Settings, results_name: str) -> dict:
     """What the Emails tab shows for one results file. 'drafts' are the rows the email agent would draft, each with what
     email_state.json records under its key; 'to_send' is what a real send would send (the agent's rule: has an address,
@@ -62,9 +96,11 @@ def emails(s: Settings, results_name: str) -> dict:
         link = web_link(d["url"])
         drafts.append({"sku": str(d["sku"]), "seller": str(d["manufacturer"] or ""), "email": str(d["email"] or "").strip(), "url": str(d["url"] or ""),
                        "link": link, "site": urlsplit(link).hostname if link else "",
-                       "sent": entry.get("sent"), "status": entry.get("status"), "summary": entry.get("summary"), "replied": "reply" in entry})
+                       "sent": entry.get("sent"), "status": entry.get("status"), "summary": entry.get("summary"), "replied": "reply" in entry,
+                       "check": quote_check(entry.get("comparison")), "followup": followup(entry.get("followup")), "inquiry": inquiry(s, d)})
     need = [n for n in SMTP_SETTINGS + ("SHIPPING_ADDRESS",) if not is_set(s, n)]
     return {"known": rows is not None, "drafts": drafts, "skipped": (rows or {}).get("skipped", []), "problem": problem,
+            "followups_waiting": [d["sku"] for d in drafts if d["followup"] and not d["followup"]["sent"]],
             "to_send": [d for d in drafts if d["email"] and not d["sent"]], "send_missing": need,
             "settings": [(n, is_set(s, n)) for n in SMTP_SETTINGS + ("SHIPPING_ADDRESS",)],      # what sending needs, and only that
             "reply_ready": is_set(s, "ANTHROPIC_API_KEY"),                                          # reading a reply needs the AI service

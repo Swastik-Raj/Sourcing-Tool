@@ -20,7 +20,7 @@ folders it uses, the name in the header and how long job logs are kept. A host o
 | Tab | What it runs | What a person must do before it runs |
 |---|---|---|
 | 1. Find suppliers | `sourcing_agent.py --input <sheet> [--limit N] [--sku ...] [--add-builtin] --output <results>` | Upload or pick a sheet, read the cost estimate, type the number of products |
-| 2. Email sellers | `email_agent.py drafts`, `send --confirm-count N [--test-recipient ADDR]`, `mark`, `reply --file` | Read the list of recipients and type how many emails; tick a box to record a form submission; paste a seller's reply |
+| 2. Email sellers | `email_agent.py drafts`, `send --confirm-count N [--test-recipient ADDR]`, `mark [--followup]`, `reply --file` | Read the list of recipients and type how many emails; tick a box to record a form submission; paste a seller's reply; read its quote check and copy the questions for the seller (read-only box), then tick a box to mark them sent |
 | 3. Get approval | `decision_agent.py request`, `record --confirm-request --channel --approver --file`, `revoke`, `export` | Paste the manager's reply and type the request number, how it reached you and who approved (never filled in for you); type a SKU to withdraw an approval |
 | 4. Order sheet | `order_sheet.py build --approved approved_orders.csv --results <results>` | Nothing typed: it only creates a file. Ordering and payment stay manual |
 | 5. Listings | `content_agent.py facts-template`, `generate --facts <uploaded file>` | Fill in the product details sheet (the facts file) yourself and upload it; type the number of products |

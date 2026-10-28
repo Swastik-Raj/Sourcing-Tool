@@ -44,6 +44,7 @@
 {% call todo() %}
 {% if not view.known %}<p>Close the results spreadsheet if it is open in Excel, then reload this page.</p>
 {% elif not view.drafts %}<p>No product in this search has a seller to contact. <a href="/step/search">Start another search</a></p>
+{% elif view.followups_waiting %}<p><strong>A seller's quote raised questions for the seller.</strong> Copy them from "Quote checks" below into the seller's website form or your own email, then mark them as sent.</p>
 {% elif no_email %}<p><strong>Contact these sellers through their websites, then mark them as contacted.</strong> None of them has an email address, so nothing can be emailed from here.</p>
 {% elif view.send_missing %}<p>Preview the emails. Sending needs email to be set up first (see Send); in the meantime you can contact sellers through their websites.</p>
 {% elif view.to_send %}<p>Preview the emails, send yourself a test copy, then send them to the {{ view.to_send|length }} seller{{ 's' if view.to_send|length != 1 }} with an email address.</p>
@@ -67,7 +68,8 @@
       {%- if d.link %}<br><a href="{{ d.link }}" target="_blank" rel="noopener noreferrer">Open their website: {{ d.site }}<span class="sr"> (opens in a new tab)</span></a>
       {%- elif d.url %}<br><span class="muted small">Website address, not opened from here: {{ d.url }}</span>{% endif %}</td>
       <td data-label="Email address">{% if d.email %}{{ d.email }}{% else %}No email address: use the contact form on the seller's website, then mark it below{% endif %}</td>
-      <td data-label="Status">{% if d.sent %}Contacted {{ d.sent }}{% else %}Not contacted yet{% endif %}{% if d.replied %}; replied{% if d.status %} ({{ d.status|replace('_', ' ') }}){% endif %}{% endif %}</td></tr>
+      <td data-label="Status">{% if d.sent %}Contacted {{ d.sent }}{% else %}Not contacted yet{% endif %}{% if d.replied %}; replied{% if d.status %} ({{ d.status|replace('_', ' ') }}){% endif %}{% endif %}
+        {%- if d.check %}; <a href="#check-{{ d.sku }}">quote check</a>: {% if d.check.not_checked %}not compared{% else %}{{ d.check.blocking }} blocking, {{ d.check.confirm }} to confirm{% endif %}{% endif %}</td></tr>
     {% endfor %}
     </tbody>
   </table>
@@ -93,6 +95,21 @@
   <button type="submit" class="btn-primary" {{ 'disabled' if why_preview }}>Preview the emails</button>{{ why(why_preview) }}
   <p class="muted small">Sends nothing and saves nothing. The emails are shown on this page{{ ", to copy into a seller's contact form" if no_email }}.</p>
 </form>
+{% set inquiries = view.drafts|selectattr('inquiry')|list %}
+{% if inquiries %}
+<details class="copies" {{ 'open' if no_email }}>
+  <summary>Copy an inquiry to paste into a seller's website form ({{ inquiries|length }})</summary>
+  <p class="muted small">The same text the tool would email. It asks for a quotation, not an order, and holds no shipping address.</p>
+  {% for d in inquiries %}
+  <div class="copybox">
+    <p><strong>{{ d.sku }}</strong> {{ d.seller }}<br><span class="muted small">Subject: {{ d.inquiry.subject }}</span></p>
+    <label for="inq-{{ loop.index }}">Inquiry for {{ d.sku }}</label>
+    <textarea id="inq-{{ loop.index }}" readonly rows="12">{{ d.inquiry.body }}</textarea>
+    <div class="inline-fields"><button type="button" class="btn" data-copy="inq-{{ loop.index }}" hidden>Copy the text</button><span id="inq-{{ loop.index }}-status" role="status" class="muted small"></span></div>
+  </div>
+  {% endfor %}
+</details>
+{% endif %}
 
 {% elif part == 'send' %}
 <h2>{{ loop.index }}. Send</h2>
@@ -150,7 +167,7 @@
   <select id="reply_sku" name="sku" required><option value="">Choose a product</option>{% for d in view.drafts %}<option value="{{ d.sku }}">{{ d.sku }} ({{ d.seller }})</option>{% endfor %}</select>
   <label for="reply" class="gap">Paste the seller's reply</label>
   <textarea id="reply" name="reply" rows="8" required autocomplete="off"></textarea>
-  <p class="muted small">The tool sends this text to the AI service to pull out prices and quantities, checks every number against your text, and saves the result. This costs a little money.</p>
+  <p class="muted small">The tool sends this text to the AI service to pull out prices and quantities, checks every number against your text, and saves the result. This costs a little money. It then compares the quote with the listing the search saw and drafts questions for the seller, under "Quote checks". Nothing is sent.</p>
   <button type="submit" class="btn" {{ 'disabled' if why_reply }}>Record the reply</button>{{ why(why_reply) }}
 </form>
 {% else %}
@@ -158,6 +175,50 @@
 {% endif %}
 {% endif %}
 {% endfor %}
+{% set checked = view.drafts|selectattr('check')|list %}
+{% if checked %}
+<h2 id="quote-checks">Quote checks</h2>
+<p class="muted">Each reply is compared with the listing as the search saw it. The check only flags what differs or is unclear: you and your manager decide. Nothing here is sent.</p>
+{% for d in checked %}{% set c = d.check %}{% set fu = d.followup %}{% set n = loop.index %}
+<details class="quote-check" id="check-{{ d.sku }}" {{ 'open' if c.blocking or (fu and not fu.sent) }}>
+  <summary>{{ d.sku }} ({{ d.seller or 'seller not named' }}): {% if c.not_checked %}not compared{% else %}{{ c.blocking }} blocking, {{ c.confirm }} to confirm, {{ c.notes }} note{{ 's' if c.notes != 1 }}{% endif %}</summary>
+  <p>Listing price as seen by the search on <strong>{{ c.captured }}</strong>. The listing page may have changed since: this tool did not read it again.
+    {%- if d.link %} <a href="{{ d.link }}" target="_blank" rel="noopener noreferrer">Open their website: {{ d.site }}<span class="sr"> (opens in a new tab)</span></a>{% endif %}</p>
+  {% if c.not_checked %}<p>{{ c.not_checked }}</p>
+  {% elif c.flags %}
+  <div class="table-wrap">
+    <table class="stack words">
+      <caption class="sr">What the quote check found for {{ d.sku }}</caption>
+      <thead><tr><th scope="col">Severity</th><th scope="col">What we found</th><th scope="col">Why it matters</th></tr></thead>
+      <tbody>{% for f in c.flags %}<tr><td data-label="Severity">{{ badge(f.label, f.kind) }}</td><td data-label="What we found">{{ f.text }}</td><td data-label="Why it matters">{{ f.why }}</td></tr>{% endfor %}</tbody>
+    </table>
+  </div>
+  {% endif %}
+  {% if fu %}
+  <h3>Questions for the seller</h3>
+  <p class="small">Subject: {{ fu.subject }}</p>
+  <label for="fu-{{ n }}">The text to send{% if fu.sent %} (marked as sent {{ fu.sent }}){% else %} (not sent yet){% endif %}</label>
+  <textarea id="fu-{{ n }}" readonly rows="14">{{ fu.body }}</textarea>
+  <div class="inline-fields"><button type="button" class="btn" data-copy="fu-{{ n }}" hidden>Copy the text</button><span id="fu-{{ n }}-status" role="status" class="muted small"></span></div>
+  <p class="muted small">Paste it into the seller's website form, or send it from your own email. Nothing is sent from here.</p>
+  {% if fu.for_us %}<p><strong>For you, not for the seller:</strong></p><ul>{% for x in fu.for_us %}<li>{{ x }}</li>{% endfor %}</ul>{% endif %}
+  {% if not fu.sent %}
+  <form method="post" action="/emails/mark" class="confirm gap">
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <input type="hidden" name="wf" value="{{ wf }}">
+    <input type="hidden" name="sku" value="{{ d.sku }}">
+    <input type="hidden" name="followup" value="1">
+    <div class="inline-fields">
+      <label class="plain"><input type="checkbox" name="confirm" value="1" required> I sent these questions to the seller myself</label>
+      <button type="submit" class="btn" {{ 'disabled' if running }}>Mark the questions as sent</button>{{ why('Another task is running.' if running else '') }}
+    </div>
+  </form>
+  {% endif %}
+  {% elif not c.not_checked %}<p>Nothing to ask the seller.</p>
+  {% endif %}
+</details>
+{% endfor %}
+{% endif %}
 {% endif %}
 {% include "_continue.html" %}
 {% endif %}

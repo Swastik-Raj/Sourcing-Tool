@@ -313,6 +313,8 @@ FLAG_TEXT = {
     "seller_needs_info": "The seller had asked for more information.",
     "waiting_on_us": "The seller was waiting on us when this was approved.",
     "no_seller_reply": "No seller reply was recorded when this was approved.",
+    "quote_check_blocking": "The email agent's quote check had a blocking point when this was approved (see Email sellers).",
+    "quote_check_needs_confirmation": "The email agent's quote check had points to confirm with the seller when this was approved.",
     "listed_price_above_approved_max": "The listed price was above the approved max when exported.",
 }
 

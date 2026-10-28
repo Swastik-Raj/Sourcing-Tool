@@ -340,6 +340,12 @@ def make_line(r: dict, sku: str, maker: str, url: str, key: str, unit: Decimal, 
         flags.append("quote_price_basis_unclear")
     if quote and quote["quote_warnings"]:
         flags.append("quote_has_warnings")
+    check = entry.get("comparison") if isinstance(entry.get("comparison"), dict) else None   # the email agent's quote check: shown, never decides
+    counts = check.get("counts") if check and isinstance(check.get("counts"), dict) else {}
+    if counts.get("blocking"):
+        flags.append("quote_check_blocking")
+    if counts.get("needs_confirmation"):
+        flags.append("quote_check_needs_confirmation")
     if not confidence.startswith("stated"):
         flags.append("unit_price_" + re.split(r"[\s(]", confidence)[0])
     if price_source and re.search(r"unverified|unconfirmed", price_source, re.I):
@@ -362,7 +368,18 @@ def make_line(r: dict, sku: str, maker: str, url: str, key: str, unit: Decimal, 
         "seller_reply": reply, "flags": flags,
         "quote": quote, "quote_currency": currency, "margin": margin, "quote_comparisons": comparisons,
         "waiting_on_us": waiting, "margin_fail": margin_fail,
+        **({"quote_check": quote_check_text(check)} if check else {}),
     }
+
+
+def quote_check_text(check: dict) -> str:
+    """One line for the request: what the email agent's quote check found, and when the listing price was seen."""
+    if check.get("not_checked"):
+        return f"Quote check: {check['not_checked']}"
+    n = check.get("counts") if isinstance(check.get("counts"), dict) else {}
+    seen = check["listing"].get("captured") if isinstance(check.get("listing"), dict) else None
+    return (f"Quote check (listing price seen {seen or 'at an unknown time'}): {n.get('blocking', 0)} blocking, "
+            f"{n.get('needs_confirmation', 0)} to confirm, {n.get('note', 0)} note(s) - details on the Email sellers step")
 
 
 def skip_summary(skipped: list) -> str:
@@ -533,6 +550,8 @@ def line_text(i: int, l: dict) -> list:
         out.append(f"   Ordering note: {l['note']}")
     out.append(f"   Seller reply: {l['seller_reply']}")
     out += quote_block(l)
+    if l.get("quote_check"):
+        out.append(f"   {l['quote_check']}")
     if l["waiting_on_us"]:
         out.append(f"   Seller asked us for: {'; '.join(l['waiting_on_us'])}")
     if l["quote_comparisons"]:

@@ -88,6 +88,14 @@ main { min-width: 0; max-width: 880px; }
 .badge-interrupted { color: var(--warning); border-color: var(--warning); border-style: dotted; border-width: 2px; } .badge-interrupted::before { content: "\2016"; }
 .badge-not-set { color: var(--warning); border-color: var(--warning); } .badge-not-set::before { content: "\25A0"; }
 .badge-unverified { color: var(--warning); border-color: var(--warning); border-style: dashed; } .badge-unverified::before { content: "?"; }
+.badge-blocking { color: var(--danger); border-color: var(--danger); border-width: 2px; } .badge-blocking::before { content: "\2715"; }
+.badge-needs-confirmation { color: var(--warning); border-color: var(--warning); } .badge-needs-confirmation::before { content: "?"; }
+.badge-note { border-style: dashed; } .badge-note::before { content: "i"; }
+textarea[readonly] { background: color-mix(in srgb, var(--text) 3%, var(--surface)); }
+.copybox { padding: var(--space-3) 0; border-top: 1px solid var(--divider); }
+.copybox:first-of-type { border-top: 0; }
+.copybox label, .quote-check label { display: block; font-weight: 600; margin-bottom: var(--space-1); }
+.quote-check h3 { margin: var(--space-4) 0 var(--space-1); }
 
 /* tables */
 .table-wrap { background: var(--surface); border: 1px solid var(--divider); border-radius: var(--radius); overflow-x: auto; box-shadow: var(--shadow); }

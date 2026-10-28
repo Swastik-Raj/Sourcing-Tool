@@ -1,17 +1,18 @@
-Subject: Sample order inquiry - {product} ({sku})
+Subject: Quotation request - {product} ({sku})
 
 {greeting}
 
-My name is {sender_name} from Zync Technologies. We came across {listing_ref} and it looks like a good fit for what we need.
+My name is {sender_name} from Zync Technologies. We came across {listing_ref} and are considering it for a purchase.
 
-Before placing a larger purchase, we would like to start with a sample order. Could you please let us know:
+This is an inquiry, not an order. Could you please send us a quotation with:
 
-1. Whether samples are available, in what quantity, and at what cost?
-2. Whether custom branding/engraving is possible at sample quantities?
-3. The estimated lead time for samples?{note_line}
-
-Sample shipping destination:
-{shipping_address}
+1. The unit price for {quantities} pieces, in US dollars, and whether the price is per piece or per pack.
+2. Your minimum order quantity for this item.
+3. The lead time for that quantity, and whether a sample is available first (and its cost).
+4. The cost and method of shipping to the USA, and whether your price includes shipping, taxes or other fees.
+5. How we would place the order and pay.
+6. How long your quotation is valid.
+7. Whether custom branding/engraving is possible.{note_line}
 
 Thank you, and we look forward to your reply.
 

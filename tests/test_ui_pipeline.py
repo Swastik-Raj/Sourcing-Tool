@@ -1060,6 +1060,130 @@ def drafts_mark_and_reply_run_the_agents_own_commands(env):
         cleanup(fake)
 
 
+QC_FLAGS = [
+    {"code": "price_above_listing", "severity": "blocking", "why": "We would pay more than the listing showed.", "question": "q1",
+     "text": "Quoted US$1.45 per piece for 200 pieces is above the L-Com listing <script>alert(1)</script> http://pu:FAKE-pp@x.example/a"},
+    {"code": "total_missing", "severity": "needs confirmation", "text": "The reply states no total.", "why": "A total avoids surprises.", "question": "q2"},
+    {"code": "price_matches_listing", "severity": "note", "text": "Quoted US$1.10 matches the listing.", "why": "It agrees.", "question": None}]
+QC_BODY = "Hello Maker B team,\n\nThank you for your quotation.\n\n1. Your listing showed US$1.25 per piece.\n2. <b>Could</b> you confirm the total?\n"
+
+
+def quote_state(sent=None) -> dict:
+    """email_state.json as the email agent writes it after a reply: B2 with flags and a follow-up, C3 a refusal (not compared)."""
+    return {state_key("B2", SELLERS[0][3]): {
+                "sku": "B2", "seller": "Maker B", "reply": "x", "status": "pricing_provided",
+                "comparison": {"listing": {"captured": "2026-02-02 10:00"}, "not_checked": None, "flags": QC_FLAGS,
+                               "counts": {"blocking": 1, "needs_confirmation": 1, "note": 1}},
+                "followup": {"subject": "Re: Quotation request - Keyword B2 (B2)", "body": QC_BODY, "sent": sent,
+                             "for_us": ["The seller asked us for: a drawing. Answer this yourself."]}},
+            state_key("C3", SELLERS[1][3]): {
+                "sku": "C3", "reply": "no thanks", "status": "dead_end", "followup": None,
+                "comparison": {"listing": {"captured": "2026-02-02 10:00"}, "not_checked": "Not compared: the seller declined.", "flags": []}}}
+
+
+def textarea(page: str, box: str) -> str:
+    return page.split(f'<textarea id="{box}" readonly')[1].split(">", 1)[1].split("</textarea>")[0]
+
+
+@test
+def quote_checks_show_the_flags_the_capture_date_and_a_read_only_copy_box(env):
+    """The email agent's stored quote check, shown as it is: each flag's severity, text and reason, when the listing price was
+    seen, the follow-up in a read-only box with a copy button (shown by JavaScript), notes for us outside it, and the mark form."""
+    fake = fake_env()
+    try:
+        (fake.project / "email_state.json").write_text(json.dumps(quote_state()), encoding="utf-8")
+        with env_vars(**FAKE):
+            page = fake.client.get(f"/step/emails?wf={RES}").text
+        todo = page.split('class="todo"')[1].split("</section>")[0]
+        assert "A seller's quote raised questions for the seller." in todo
+        table = page.split("Sellers the search recommended")[1].split("</table>")[0]
+        assert '<a href="#check-B2">quote check</a>: 1 blocking, 1 to confirm' in table and '<a href="#check-C3">quote check</a>: not compared' in table
+        b2 = page.split('id="check-B2" open>')[1].split("</details>")[0]               # open: it has a blocking flag
+        assert "B2 (Maker B): 1 blocking, 1 to confirm, 1 note</summary>" in b2
+        assert "Listing price as seen by the search on <strong>2026-02-02 10:00</strong>. The listing page may have changed since" in b2
+        rows = re.findall(r'<span class="badge badge-([a-z-]+)">([^<]+)</span></td><td data-label="What we found">([^<]*)', b2)
+        assert [(k, label) for k, label, _ in rows] == [("blocking", "Blocking"), ("needs-confirmation", "Needs confirmation"), ("note", "Note")], rows
+        assert "We would pay more than the listing showed." in b2 and "A total avoids surprises." in b2
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in b2 and "<script>alert(1)" not in page                 # seller-derived text is escaped
+        assert "http://[REDACTED]@x.example/a" in b2 and "FAKE-pp" not in page                                 # and addresses masked
+        assert "L-Com" not in page and "the reference listing" in b2                                           # and the reference name rule holds
+        assert textarea(b2, "fu-1") == QC_BODY.replace("<b>", "&lt;b&gt;").replace("</b>", "&lt;/b&gt;")      # the stored text, exactly
+        assert "(not sent yet)" in b2 and "Subject: Re: Quotation request - Keyword B2 (B2)" in b2
+        assert '<button type="button" class="btn" data-copy="fu-1" hidden>Copy the text</button><span id="fu-1-status" role="status"' in b2
+        assert "The seller asked us for: a drawing." in b2 and "drawing" not in textarea(b2, "fu-1")           # notes for us stay outside
+        form = b2.split('<form method="post" action="/emails/mark"')[1].split("</form>")[0]
+        for field in ('name="sku" value="B2"', 'name="followup" value="1"', 'name="confirm" value="1" required', "I sent these questions to the seller myself"):
+            assert field in form, field
+        c3 = page.split('id="check-C3" >')[1].split("</details>")[0]                    # closed: nothing to ask
+        assert "Not compared: the seller declined." in c3 and "<textarea" not in c3 and "<form" not in c3
+        assert page.count('name="followup" value="1"') == 1
+        # marked as sent: the box stays for reference, the form goes
+        (fake.project / "email_state.json").write_text(json.dumps(quote_state(sent="2026-02-04 10:00")), encoding="utf-8")
+        page = fake.client.get(f"/step/emails?wf={RES}").text
+        assert "(marked as sent 2026-02-04 10:00)" in page and 'name="followup"' not in page and "raised questions for the seller" not in page
+        # a state file in another shape is shown without a quote check, never as an error page
+        (fake.project / "email_state.json").write_text(json.dumps({state_key("B2", SELLERS[0][3]): {"comparison": "x", "followup": 5}}), encoding="utf-8")
+        r = fake.client.get(f"/step/emails?wf={RES}")
+        assert r.status_code == 200 and 'id="quote-checks"' not in r.text
+    finally:
+        cleanup(fake)
+
+
+@test
+def inquiry_copy_boxes_hold_the_agents_own_text_without_the_address(env):
+    fake = fake_env()
+    shutil.copy(REAL / "email_template.txt", fake.project)
+    try:
+        with env_vars(**FAKE):
+            page = fake.client.get(f"/step/emails?wf={RES}").text
+        box = page.split('<details class="copies" >')[1].split("</details>")[0]          # closed: these sellers have email addresses
+        assert "Copy an inquiry to paste into a seller's website form (3)" in box
+        body = textarea(box, "inq-1")
+        assert body.startswith("Hello Maker B team,") and "Test Sender" in body and "This is an inquiry, not an order." in body
+        assert "Subject: Quotation request - Keyword B2 (B2)" in box and "1 Test Street" not in page and "Testville" not in page
+        assert '<button type="button" class="btn" data-copy="inq-3" hidden>Copy the text</button>' in box
+        import email_agent as ea                                                             # the same text as the agent's own drafts
+        from markupsafe import escape
+        row = next(r for r in ea.load_results(str(fake.project / "Excel Output Sheets" / f"{RES}.xlsx"), [])[0] if r["sku"] == "B2")
+        with env_vars(SENDER_NAME="Test Sender"):
+            assert body == str(escape(ea.make_draft(row)["body"]))
+        (fake.project / ".env").write_text("SENDER_NAME=Name From Dotenv\n", encoding="utf-8")   # read as the agent reads it
+        with env_vars(SENDER_NAME=None):
+            assert "Name From Dotenv" in textarea(fake.client.get(f"/step/emails?wf={RES}").text, "inq-1")
+        results_file(fake, "sourcing_results_20260303_100000.xlsx", [("W1", "Maker W", "", "https://w.example/1")])
+        page = fake.client.get("/step/emails?wf=sourcing_results_20260303_100000").text
+        assert '<details class="copies" open>' in page, "open when no seller has an email address"
+    finally:
+        cleanup(fake)
+
+
+@test
+def copy_button_script_writes_text_only(env):
+    js = (REAL / "ui" / "static" / "app.js").read_text(encoding="utf-8")
+    part = js.split('document.querySelectorAll("button[data-copy]")')[1].split("\n});")[0]
+    assert "navigator.clipboard.writeText(box.value)" in part and "window.isSecureContext" in part and "btn.hidden = false" in part
+    assert "said.textContent = text" in part and "innerHTML" not in js and "insertAdjacentHTML" not in js and "eval(" not in js
+
+
+@test
+def followup_mark_needs_its_own_tick_and_passes_only_the_switch(env):
+    fake = fake_env()
+    try:
+        rel = native("Excel Output Sheets", RES + ".xlsx")
+        n = len(FakePopen.calls)
+        refused(post(fake, "/emails/mark", wf=RES, sku="B2", followup="1"), "Tick the box to confirm you sent the questions to the seller yourself")
+        refused(post(fake, "/emails/mark", wf=RES, sku="NOPE", followup="1", confirm="1"), "Choose a product")
+        refused(post(fake, "/emails/mark", wf=RES, sku="B2", followup="yes", confirm="1"), "can only be switched on or left off")
+        refused(post(fake, "/emails/mark", wf=RES, sku="B2", followup="--yes", confirm="1"), "can only be switched on or left off")
+        assert len(FakePopen.calls) == n
+        started_job(fake, post(fake, "/emails/mark", wf=RES, sku="B2", followup="1", confirm="1"))
+        assert last_argv(fake) == ["email_agent.py", "mark", "B2", "--results", rel, "--followup"]
+        started_job(fake, post(fake, "/emails/mark", wf=RES, sku="B2", confirm="1"))
+        assert last_argv(fake) == ["email_agent.py", "mark", "B2", "--results", rel], "without the switch it is the inquiry mark, as before"
+    finally:
+        cleanup(fake)
+
+
 @test
 def approvals_needs_a_tick_without_an_email_record(env):
     fake = fake_env(agents=("email_agent.py", "decision_agent.py"))
@@ -1767,7 +1891,7 @@ def end_to_end_offline(env):
             meta, log = done(post(env, "/emails/send", wf=wf, confirm_count="1"))
             assert meta["args"] == ["send", rel, "--confirm-count", "1"] and "Sent 1 email(s)." in log
             sink = [json.loads(line) for line in (out / "smtp_sink.jsonl").read_text(encoding="utf-8").splitlines()]
-            assert [m["to"] for m in sink] == [SELLER_ADDRESS] and sink[0]["host"] == "smtp.example.invalid" and "1 Test Street" in sink[0]["body"]
+            assert [m["to"] for m in sink] == [SELLER_ADDRESS] and sink[0]["host"] == "smtp.example.invalid" and "1 Test Street" not in sink[0]["body"] and "shipping to the USA" in sink[0]["body"]
             state = json.loads((env.project / "email_state.json").read_text(encoding="utf-8"))
             key = "TST-100|www.alibaba.com/product-detail/zyxtek-coupler_111.html"
             assert list(state) == [key] and "sent" in state[key]
@@ -1784,6 +1908,23 @@ def end_to_end_offline(env):
             assert "pricing_provided" in log and not list((env.settings.data / "inputs").glob("*"))
             strip = strip_of(env, wf)
             assert "2 sellers to contact" in strip and "2 contacted" in strip and "1 reply recorded" in strip, strip
+            # the quote check the real agent stored, on the page: the capture date from the results file's name, the flags, the
+            # follow-up in a read-only box, then the follow-up marked as sent through the UI (the agent's own mark --followup)
+            stamp = results[len("sourcing_results_"):-5]
+            seen_at = f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]} {stamp[9:11]}:{stamp[11:13]}"
+            assert "Quote check against the listing as seen by the search on " + seen_at in log and "FOLLOW-UP DRAFT - not sent." in log
+            comp, fu = state[key]["comparison"], state[key]["followup"]
+            assert comp["listing"]["captured"] == seen_at and fu["sent"] is None and comp["counts"]["needs_confirmation"] >= 1, comp
+            assert ("sample_price_only", "needs confirmation") in {(f["code"], f["severity"]) for f in comp["flags"]}, comp["flags"]
+            page = env.client.get(f"/step/emails?wf={wf}").text
+            card = page.split('id="check-TST-100"')[1].split("</details>")[0]
+            assert f"Listing price as seen by the search on <strong>{seen_at}</strong>" in card and "Needs confirmation</span>" in card
+            assert '<textarea id="fu-1" readonly rows="14">' in card and "The price you gave (US$1.10) is for samples." in card
+            assert "1 Test Street" not in fu["body"] and "Test Sender" in fu["body"]
+            meta, log = done(post(env, "/emails/mark", wf=wf, sku="TST-100", followup="1", confirm="1"))
+            assert meta["args"] == ["mark", "TST-100", "--results", rel, "--followup"] and "follow-up questions marked as sent by hand" in log
+            assert json.loads((env.project / "email_state.json").read_text(encoding="utf-8"))[key]["followup"]["sent"]
+            assert 'name="followup" value="1"' not in env.client.get(f"/step/emails?wf={wf}").text, "no mark form once it is marked"
 
             # 3. approvals: request, a refused and an accepted record, export
             assert "seller replies are unavailable" not in env.client.get(f"/step/approvals?wf={wf}").text
@@ -1871,8 +2012,9 @@ def end_to_end_offline(env):
             assert "Every step has produced its output." in strip and "Listings written" in strip and "Order sheet created" in strip, strip
 
             # every step's input was the previous step's real output, nothing left this computer, and nothing was started twice
-            assert [m["command"] for m in jobs_run] == ["search", "emails.drafts", "emails.send", "emails.send", "emails.mark", "emails.reply", "approvals.request",
-                                                        "approvals.record", "approvals.export", "order.build", "content.template", "content.generate"]
+            assert [m["command"] for m in jobs_run] == ["search", "emails.drafts", "emails.send", "emails.send", "emails.mark", "emails.reply", "emails.mark",
+                                                        "approvals.request", "approvals.record", "approvals.export", "order.build", "content.template",
+                                                        "content.generate"]
             assert all(rel in m["args"] for m in jobs_run[1:]) and len(env.jobs.list()) == len(jobs_run)
             assert not (out / "net.log").exists(), (out / "net.log").read_text()
             assert not (out / "realroot.log").exists(), (out / "realroot.log").read_text()

@@ -637,15 +637,26 @@ def test_the_script_never_touches_walmart_the_inputs_or_other_agents():
 
 
 def test_the_real_approved_orders_file_if_there_is_one():
+    from datetime import datetime, timezone
     path = os.path.join(HERE, "approved_orders.csv")
     if not os.path.exists(path):
         print("  (no real approved_orders.csv here; covered by the sandbox dry run)")
-        return
-    results = sorted(p for p in os.listdir(os.path.join(HERE, "Excel Output Sheets")) if p.startswith("sourcing_results_"))
-    assert results and ca.read_approved(path)[0]
+        return "no real approved_orders.csv"
+    approved = ca.read_approved(path)[0]
+    sources = sorted({a["source_results_file"] for a in approved})          # the search the approvals were made from, not the newest
+    assert approved and len(sources) == 1, sources
+    results = os.path.join(HERE, "Excel Output Sheets", sources[0])
+    assert os.path.isfile(results), results
+    now = datetime.now(timezone.utc)                                  # one instant for this check and for facts_template
+    if all(now >= ca.approval_expiry(a) for a in approved):           # the agent refuses expired approvals: nothing real to check
+        saved = datetime.fromtimestamp(os.path.getmtime(path), timezone.utc)
+        why = (f"every approval in the real approved_orders.csv has expired (file saved {saved:%Y-%m-%d}, {(now - saved).days} days ago; "
+               f"last one expired {max(ca.approval_expiry(a) for a in approved):%Y-%m-%d})")
+        print(f"  SKIP: {why}")
+        return why
     tmp = tempfile.mkdtemp()
-    got, n, _ = ca.facts_template(path, os.path.join(HERE, "Excel Output Sheets", results[-1]), os.path.join(tmp, "facts.csv"))
-    assert n >= 1
+    got, n, notes = ca.facts_template(path, results, os.path.join(tmp, "facts.csv"), at=now)
+    assert n >= 1, notes
 
 
 def test_a_run_whose_worst_case_cost_is_over_the_limit_warns_before_calling():
@@ -731,7 +742,8 @@ def test_title_brand_check_is_skipped_when_brand_is_unset():
 
 
 if __name__ == "__main__":
+    skipped = []
     for name, fn in sorted(globals().items()):
-        if name.startswith("test_"):
-            fn()
-    print("content agent tests passed")
+        if name.startswith("test_") and fn():                         # a test returns a reason only when it skipped
+            skipped.append(name)
+    print("content agent tests passed" + (f", {len(skipped)} skipped: {', '.join(skipped)}" if skipped else ""))

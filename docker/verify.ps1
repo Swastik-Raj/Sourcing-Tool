@@ -67,10 +67,13 @@ $RealFolders = @("Excel Output Sheets", "Reports", "Order Sheets", "Walmart List
 #   statefile.py (2026-10-26): a lock Windows refuses to create (one being deleted that moment) is waited out like a held lock.
 #   decision_agent.py, order_sheet.py (2026-10-28, quote check D6): display only - the email agent's quote check adds two flags
 #     and one line to the approval request, and the order sheet shows those flags as notes. Nothing they decide changes.
+#   test_content_agent.py (2026-11-06): the real approved_orders.csv is checked against the results file its export names,
+#     and only while an approval is still valid; otherwise a visible, counted skip with the file's age. No assertion loosened.
 $ApprovedChanges = [ordered]@{ "observability.py" = "d0b4b1ee38e0ac52b2f31000c871512c8a989c27f169a54947f2251ad1d2a1b4"
                                "statefile.py" = "0290d6be0946759c88eb7604ecc0ce4184ff2db9db2305040a52a47ac29aea5a"
                                "decision_agent.py" = "1593a3082ae9eb543962fbdb0aa970489b078ca42478bfd456745eea052f8a01"
-                               "order_sheet.py" = "09599f1d0640c5934bcaaa1c877e143f616e0d9bb5e5c1930acffee596799389" }
+                               "order_sheet.py" = "09599f1d0640c5934bcaaa1c877e143f616e0d9bb5e5c1930acffee596799389"
+                               "test_content_agent.py" = "2e2ea7b74e9a6cef208aea7d7d405b6a24df2210e0f8d02852da4ec4fea6f6ba" }
 $Results = New-Object System.Collections.ArrayList
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 $script:Stopped = ""
